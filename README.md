@@ -6,6 +6,10 @@
 
 Instead of relying on a central orchestrator (like Kubernetes or Cloud Run), Falak introduces an **orbit-based execution model**. Nodes self-elect to execute workloads based on proximity, available resources, and gravity-like affinity — resulting in faster, more resilient, and highly available container startup.
 
+
+<video src="https://raw.githubusercontent.com/tareksalem/falak/main/assets/Falak-workflow.webm" controls width="640">
+  Your browser does not support the video tag.
+</video>
 ---
 
 ## 🧩 Core Components & Concepts
