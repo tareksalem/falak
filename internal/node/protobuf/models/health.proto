@@ -1,0 +1,112 @@
+syntax = "proto3";
+package falak.health;
+
+option go_package = "github.com/tareksalem/falak/internal/node/protobuf/models";
+
+// Heartbeat message
+message Heartbeat {
+  string cluster_id = 1;
+  string node_id = 2;
+  uint64 incarnation = 3;
+  uint64 hlc = 4;            // Hybrid logical clock
+  uint64 seq = 5;            // Sequence number
+  uint32 peers_connected = 6;
+  Load load = 7;
+  bytes digest = 8;          // Phonebook hash for anti-entropy
+  bytes signature = 9;       // Signature using libp2p identity
+}
+
+message Load {
+  float cpu = 1;             // 0.0-1.0 CPU utilization
+  float memory = 2;          // 0.0-1.0 memory utilization
+  uint32 conns = 3;          // Number of active connections
+}
+
+// Suspicion message
+message Suspicion {
+  string cluster_id = 1;
+  string target_node_id = 2;
+  string accuser_node_id = 3;
+  uint64 accuser_incarnation = 4;
+  uint64 hlc = 5;
+  float phi = 6;             // Current suspicion level
+  repeated Witness witnesses = 7; // Optional indirect probe results
+  bytes signature = 8;       // Signature using libp2p identity
+}
+
+message Witness {
+  string node_id = 1;
+  uint64 hlc = 2;
+  bool probe_result = 3;
+  bytes signature = 4;
+}
+
+// Refutation message
+message Refutation {
+  string cluster_id = 1;
+  string target_node_id = 2;
+  string refuter_node_id = 3;
+  uint64 target_incarnation = 4;
+  uint64 hlc = 5;
+  bytes recent_ack = 6;      // Proof of communication
+  bytes signature = 7;       // Signature using libp2p identity
+}
+
+// Quorum verdict message
+message QuorumVerdict {
+  string cluster_id = 1;
+  string target_node_id = 2;
+  string verdict = 3;        // "failed", etc.
+  uint64 hlc = 4;
+  uint64 target_incarnation = 5;
+  repeated string accuser_ids = 6;
+  repeated string accuser_zones = 7;
+  repeated bytes accuser_sigs = 8;
+  bytes quorum_agg_sig = 9;  // Aggregate signature
+}
+
+// Failure announcement message
+message FailureAnnouncement {
+  string cluster_id = 1;
+  string target_node_id = 2;
+  uint64 hlc = 3;
+  uint64 target_incarnation = 4;
+  bytes quorum_ref = 5;      // Hash/pointer to QuorumVerdict
+  bytes announcer_sig = 6;   // Signature using libp2p identity
+}
+
+// Ping request and response for SWIM probing
+message PingRequest {
+  string cluster_id = 1;
+  string node_id = 2;
+  bytes nonce = 3;
+  uint64 hlc = 4;
+  bytes signature = 5;
+}
+
+message PingResponse {
+  string cluster_id = 1;
+  string node_id = 2;
+  bytes nonce = 3;           // Echo of request nonce
+  uint64 hlc = 4;
+  bytes signature = 5;
+}
+
+// Indirect probe request
+message IndirectProbeRequest {
+  string cluster_id = 1;
+  string requester_node_id = 2;
+  string target_node_id = 3;
+  bytes nonce = 4;
+  uint64 hlc = 5;
+  bytes signature = 6;
+}
+
+message IndirectProbeResponse {
+  string cluster_id = 1;
+  string prober_node_id = 2;
+  string target_node_id = 3;
+  bool probe_result = 4;
+  uint64 hlc = 5;
+  bytes signature = 6;
+}

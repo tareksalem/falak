@@ -1,0 +1,115 @@
+syntax = "proto3";
+package falak.auth;
+
+option go_package = "github.com/tareksalem/falak/internal/node/protobuf/models";
+
+// Authentication stream messages
+message ClientHello {
+  string cluster_id = 1;           // ID of the cluster to join
+  string node_id = 2;              // Node's libp2p ID
+  bytes certificate = 3;           // Node's certificate (PEM encoded)
+  map<string, string> metadata = 4; // Additional metadata (version, capabilities, etc.)
+  int64 timestamp = 5;             // Client timestamp for freshness verification
+}
+
+message ServerChallenge {
+  bytes nonce = 1;                 // Random challenge data
+  int64 timestamp = 2;             // Server timestamp
+  bool cluster_id_valid = 3;       // Whether the requested cluster ID is valid
+  string error_message = 4;        // Error message if cluster_id_valid is false
+}
+
+message ClientResponse {
+  bytes signature = 1;             // Signature of nonce+timestamp using node's private key
+  string node_id = 2;              // Node ID (redundant, for verification)
+}
+
+message ServerAck {
+  bool auth_success = 1;           // Authentication result
+  string error_message = 2;        // Error message if auth failed
+  PhonebookDelta phonebook = 3;    // Partial phonebook update
+  map<string, bytes> cluster_state = 4; // Relevant cluster state information
+  int64 timestamp = 5;             // Server timestamp
+}
+
+// Phonebook-related messages
+message PhonebookDelta {
+  uint64 version = 1;              // Synchronization version
+  string datacenter = 2;           // Source datacenter
+  repeated PeerInfo added = 3;     // Added peers
+  repeated PeerInfo updated = 4;   // Updated peers
+  repeated string removed = 5;     // Removed peer IDs
+  uint64 timestamp = 6;            // Delta generation timestamp
+  repeated DataCenterUpdate data_centers = 7;
+}
+
+message DataCenterUpdate {
+  string dc_id = 1;                // Data center identifier
+  repeated PeerInfo peers = 2;     // Peers in this data center
+  bool is_authoritative = 3;       // Whether sender is authoritative for this DC
+}
+
+message PeerInfo {
+  string node_id = 1;              // Node ID (libp2p PeerId)
+  string address = 2;              // Peer address information
+  string datacenter = 3;           // Peer datacenter
+  float trust_score = 4;           // Trust score (0.0-1.0)
+  uint64 last_seen = 5;            // Last seen timestamp (milliseconds)
+  map<string, string> tags = 6;    // Node tags/labels
+  string status = 7;               // Current node status
+  repeated string multiaddrs = 8;  // libp2p multiaddresses for connection
+  map<string, string> labels = 9;  // Node labels/tags (redundant with tags)
+  NodeStatus node_status = 10;     // Current node status enum
+}
+
+// Phonebook synchronization messages
+message PhonebookDigestRequest {
+  string node_id = 1;              // Requesting node ID
+  string cluster_id = 2;           // Cluster ID
+  bytes digest = 3;                // Local phonebook digest
+  uint64 version = 4;              // Local version
+  string datacenter = 5;           // Requesting node's datacenter
+  uint32 peer_count = 6;           // Local peer count
+  uint64 timestamp = 7;            // Request timestamp
+  bytes signature = 8;             // Request signature
+}
+
+message PhonebookDigestResponse {
+  string node_id = 1;              // Responding node ID
+  string cluster_id = 2;           // Cluster ID
+  bytes digest = 3;                // Remote phonebook digest
+  uint64 version = 4;              // Remote version
+  string datacenter = 5;           // Responding node's datacenter
+  uint32 peer_count = 6;           // Remote peer count
+  bool needs_delta = 7;            // Whether a delta exchange is needed
+  uint64 timestamp = 8;            // Response timestamp
+  bytes signature = 9;             // Response signature
+}
+
+message PhonebookDeltaRequest {
+  string node_id = 1;              // Requesting node ID
+  string cluster_id = 2;           // Cluster ID
+  uint64 version = 3;              // Local version
+  PhonebookDelta delta = 4;        // Delta to send
+  uint64 timestamp = 5;            // Request timestamp
+  bytes signature = 6;             // Request signature
+}
+
+message PhonebookDeltaResponse {
+  string node_id = 1;              // Responding node ID
+  string cluster_id = 2;           // Cluster ID
+  uint64 version = 3;              // Remote version
+  PhonebookDelta delta = 4;        // Delta response (if any)
+  bool applied = 5;                // Whether the received delta was applied
+  uint64 timestamp = 6;            // Response timestamp
+  bytes signature = 7;             // Response signature
+}
+
+enum NodeStatus {
+  UNKNOWN = 0;
+  ACTIVE = 1;
+  JOINING = 2;
+  LEAVING = 3;
+  UNREACHABLE = 4;
+  AUTHENTICATED = 5;
+}

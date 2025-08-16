@@ -1,0 +1,42 @@
+syntax = "proto3";
+package falak.membership;
+
+option go_package = "github.com/tareksalem/falak/internal/node/protobuf/models";
+
+// Import the auth package for PeerInfo and NodeStatus
+import "auth.proto";
+
+// Envelope for all membership messages with verification data
+message MembershipMessage {
+  string node_id = 1;              // Sender node ID
+  int64 timestamp = 2;             // Message timestamp
+  bytes signature = 3;             // Signature of the serialized event
+  oneof event {
+    NodeJoined node_joined = 4;
+    NodeLeft node_left = 5;
+    NodeUpdate node_update = 6;
+  }
+}
+
+// Event when a node successfully joins the cluster
+message NodeJoined {
+  falak.auth.PeerInfo peer = 1;               // Information about the joining peer
+  repeated string connected_to = 2;           // Node IDs this node is connected to
+  uint64 incarnation = 3;                     // Node incarnation number
+}
+
+// Event when a node gracefully leaves the cluster
+message NodeLeft {
+  string node_id = 1;              // ID of the leaving node
+  string reason = 2;               // Reason for leaving (shutdown, maintenance, etc.)
+  uint64 incarnation = 3;          // Node incarnation number
+}
+
+// Event when a node's status or capabilities change
+message NodeUpdate {
+  string node_id = 1;              // ID of the updated node
+  map<string, string> updated_labels = 2; // New or changed labels
+  repeated string removed_labels = 3;     // Labels that were removed
+  falak.auth.NodeStatus status = 4;       // Updated status if changed
+  uint64 incarnation = 5;          // Node incarnation number
+}
