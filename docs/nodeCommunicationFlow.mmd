@@ -1,0 +1,107 @@
+flowchart TD
+    subgraph "Node Discovery & Communication"
+        Start([Start]) --> BootNode["New Node Boots"]
+        BootNode --> InitLib["Initialize libp2p"]
+        InitLib --> PBInit["Initialize Phonebook"]
+        
+        PBInit --> LoadPhonebook["Load Phonebook\n(Cached or Pre-provisioned)"]
+        LoadPhonebook --> GroupByDC["Group Peers by\nData Center"]
+        GroupByDC --> ParallelConnect["Initiate Parallel Connection\nAttempts Per Data Center"]
+        
+        ParallelConnect --> AttemptConn["Attempt Connection to Peer\nwith Exponential Backoff"]
+        AttemptConn --> ConnSuccess{"Connection\nSuccessful?"}
+        ConnSuccess -->|No| NextPeer["Try Next Peer in\nSame Data Center"]
+        NextPeer --> PeerAvailable{"More Peers\nAvailable?"}
+        PeerAvailable -->|Yes| AttemptConn
+        PeerAvailable -->|No| MarkDCFailed["Mark Data Center\nas Unreachable"]
+        
+        ConnSuccess -->|Yes| PSInit["Initialize PubSub\n(GossipSub)"]
+    end
+    
+    subgraph "Node Authentication"
+        PSInit --> TLSHandshake["TLS Handshake with\nMutual Certificate Verification"]
+        TLSHandshake --> VerifyCerts["Verify Peer Certificate\nAgainst Root CA"]
+        VerifyCerts --> JoinAuthStream["Open Authentication Stream\n(/falak/join/1.0)"]
+        JoinAuthStream --> SendClientHello["Send ClientHello\n(clusterId, nodeId, metadata)"]
+        SendClientHello --> RecvChallenge["Receive ServerChallenge\n(nonce, timestamp)"]
+        RecvChallenge --> SignChallenge["Sign Challenge with\nEd25519 Private Key"]
+        SignChallenge --> SendResponse["Send ClientResponse\n(signature of challenge)"]
+        SendResponse --> AuthCheck{"Authentication\nSuccessful?"}
+        AuthCheck -->|No| AuthFail["Authentication Failed\nConnection Dropped"]
+        AuthCheck -->|Yes| RecvPhonebook["Receive Phonebook Delta\nin ServerAck"]
+        RecvPhonebook --> PreserveInitial["Preserve Copy of\nInitial Phonebook"]
+        PreserveInitial --> UpdatePhonebook["Update Data Center-Specific\nSections of Phonebook"]
+    end
+    
+    subgraph "Cluster PubSub Integration"
+        UpdatePhonebook --> SubMembership["Subscribe to Membership Topic\n(falak/<clusterId>/membership)"]
+        SubMembership --> SubHeartbeat["Subscribe to Heartbeat Topic\n(falak/<clusterId>/heartbeat)"]
+        SubHeartbeat --> InitHealthRegistry["Initialize Health Registry"]
+        InitHealthRegistry --> AnnounceJoin["Publish NodeJoined\nto Membership Topic"]
+        AnnounceJoin --> StartHeartbeat["Start Heartbeat\nPublisher"]
+        StartHeartbeat --> ListenMembership["Listen for Membership Events\n(NodeJoined, NodeLeft, NodeUpdate)"]
+        
+        ListenMembership --> ReadyForOps["Node Ready\nfor Operations"]
+    end
+    
+    subgraph "Failure Detection"
+        ReadyForOps --> MonitorHeartbeats["Monitor Peer Heartbeats"]
+        MonitorHeartbeats --> CalcPhi["Calculate Phi Score\nfor Each Peer"]
+        CalcPhi --> PhiCheck{"Phi ≥ Threshold?"}
+        PhiCheck -->|No| ContinueMonitoring["Continue\nMonitoring"]
+        ContinueMonitoring --> MonitorHeartbeats
+        
+        PhiCheck -->|Yes| DirectPing["Perform Direct Ping\nto Suspected Peer"]
+        DirectPing --> PingSuccess{"Ping\nSuccessful?"}
+        PingSuccess -->|Yes| ResetPhi["Reset Phi\nfor Peer"]
+        ResetPhi --> MonitorHeartbeats
+        
+        PingSuccess -->|No| IndirectProbe["Perform Indirect Probes\nvia K Other Peers"]
+        IndirectProbe --> IndirectSuccess{"Any Probe\nSuccessful?"}
+        IndirectSuccess -->|Yes| ResetPhi
+        
+        IndirectSuccess -->|No| PublishSuspicion["Publish Suspicion\nto Suspicion Topic"]
+        PublishSuspicion --> WaitForRefutation["Wait for Refutation\nor Quorum"]
+        WaitForRefutation --> RefutationReceived{"Refutation\nReceived?"}
+        
+        RefutationReceived -->|Yes| ResetPhi
+        RefutationReceived -->|No| QuorumReached{"Quorum\nReached?"}
+        
+        QuorumReached -->|No| ContinueMonitoring
+        QuorumReached -->|Yes| MarkFailed["Mark Peer as Failed"]
+        MarkFailed --> PublishQuorum["Publish Quorum Verdict"]
+    end
+    
+    subgraph "Self-Healing"
+        MonitorQuorum["Monitor Quorum Topic\nfor Self Failures"] --> SelfFailed{"Self\nMarked Failed?"}
+        SelfFailed -->|No| ContinueSelfMonitor["Continue\nSelf-Monitoring"]
+        ContinueSelfMonitor --> MonitorQuorum
+        
+        SelfFailed -->|Yes| IncrementIncarnation["Increment Incarnation\nNumber"]
+        IncrementIncarnation --> ReauthFlow["Re-run Authentication\nFlow"]
+        ReauthFlow --> PublishHeartbeat["Publish Immediate\nHeartbeat"]
+        PublishHeartbeat --> CoolOffPeriod["Observe Cool-off\nPeriod"]
+        CoolOffPeriod --> ResumeFull["Resume Full\nCluster Participation"]
+    end
+    
+    %% Connect the subgraphs
+    AuthFail -.-> BootNode
+    MarkDCFailed -.-> ParallelConnect
+    ReadyForOps -.-> MonitorQuorum
+    
+    %% Dark Mode Styling with Better Text Contrast
+    classDef primary fill:#0f172a,stroke:#475569,stroke-width:2px,color:#e2e8f0;
+    classDef secondary fill:#172554,stroke:#475569,stroke-width:2px,color:#e2e8f0;
+    classDef success fill:#022c22,stroke:#475569,stroke-width:2px,color:#e2e8f0;
+    classDef error fill:#450a0a,stroke:#475569,stroke-width:2px,color:#e2e8f0;
+    classDef neutral fill:#1f2937,stroke:#475569,stroke-width:2px,color:#e2e8f0;
+    classDef decision fill:#2e1065,stroke:#475569,stroke-width:2px,color:#e2e8f0;
+    classDef warning fill:#2d1c04,stroke:#475569,stroke-width:2px,color:#f8fafc;
+    
+    class Start,BootNode,InitLib,PBInit,LoadPhonebook,GroupByDC,ParallelConnect primary;
+    class PSInit,JoinAuthStream,SendClientHello,RecvChallenge,SendResponse,SubHeartbeat,InitHealthRegistry,StartHeartbeat,TLSHandshake,VerifyCerts,SignChallenge,PreserveInitial secondary;
+    class UpdatePhonebook,SubMembership,AnnounceJoin,ListenMembership,ReadyForOps,ResumeFull success;
+    class AuthFail,MarkDCFailed,MarkFailed error;
+    class AttemptConn,NextPeer,DirectPing,IndirectProbe,ContinueMonitoring,WaitForRefutation,PublishQuorum neutral;
+    class ConnSuccess,AuthCheck,PeerAvailable,PhiCheck,PingSuccess,IndirectSuccess,RefutationReceived,QuorumReached,SelfFailed decision;
+    class MonitorHeartbeats,CalcPhi,ResetPhi,PublishSuspicion,MonitorQuorum,IncrementIncarnation,ReauthFlow,PublishHeartbeat,CoolOffPeriod warning;

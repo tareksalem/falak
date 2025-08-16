@@ -1,0 +1,6 @@
+.vagrant
+tmp/
+.claude/
+.vscode/
+certs
+CLAUDE.md

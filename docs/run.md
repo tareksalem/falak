@@ -1,0 +1,1 @@
+air -- --name=node2 --address=/ip4/127.0.0.1/tcp/4002 --peers=/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWLvpdqYGS7kv5R8qAitapnVCGZfvQZTdvWm86omX2HoZW/

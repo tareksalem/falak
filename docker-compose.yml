@@ -1,0 +1,157 @@
+version: '3.8'
+
+services:
+  # Bootstrap node - the first node in the network
+  bootstrap:
+    build: 
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: falak-bootstrap
+    ports:
+      - "4001:4001"
+    environment:
+      - NODE_NAME=bootstrap
+      - NODE_ADDRESS=/ip4/0.0.0.0/tcp/4001
+      - DATA_CENTER=us-west-1
+    networks:
+      - falak-network
+    volumes:
+      - ./logs:/app/logs
+    command: >
+      /app/falak 
+      --name bootstrap 
+      --address "/ip4/0.0.0.0/tcp/4001"
+      --data-center "us-west-1"
+    healthcheck:
+      test: ["CMD", "pgrep", "falak"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Node 2 - connects to bootstrap
+  node2:
+    build: 
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: falak-node2
+    ports:
+      - "4002:4002"
+    environment:
+      - NODE_NAME=node2
+      - NODE_ADDRESS=/ip4/0.0.0.0/tcp/4002
+      - DATA_CENTER=us-east-1
+      - BOOTSTRAP_PEER=/ip4/bootstrap/tcp/4001
+    networks:
+      - falak-network
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      bootstrap:
+        condition: service_healthy
+    command: >
+      sh -c "
+      sleep 5 &&
+      /app/falak 
+      --name node2 
+      --address \"/ip4/0.0.0.0/tcp/4002\"
+      --data-center \"us-east-1\"
+      --peers \"/ip4/bootstrap/tcp/4001/p2p/\$$(cat /tmp/bootstrap_peer_id 2>/dev/null || echo 'PLACEHOLDER')\"
+      "
+
+  # Node 3 - connects to bootstrap  
+  node3:
+    build: 
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: falak-node3
+    ports:
+      - "4003:4003"
+    environment:
+      - NODE_NAME=node3
+      - NODE_ADDRESS=/ip4/0.0.0.0/tcp/4003
+      - DATA_CENTER=eu-west-1
+      - BOOTSTRAP_PEER=/ip4/bootstrap/tcp/4001
+    networks:
+      - falak-network
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      bootstrap:
+        condition: service_healthy
+    command: >
+      sh -c "
+      sleep 7 &&
+      /app/falak 
+      --name node3 
+      --address \"/ip4/0.0.0.0/tcp/4003\"
+      --data-center \"eu-west-1\"
+      --peers \"/ip4/bootstrap/tcp/4001/p2p/\$$(cat /tmp/bootstrap_peer_id 2>/dev/null || echo 'PLACEHOLDER')\"
+      "
+
+  # Node 4 - connects to multiple peers
+  node4:
+    build: 
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: falak-node4
+    ports:
+      - "4004:4004"
+    environment:
+      - NODE_NAME=node4
+      - NODE_ADDRESS=/ip4/0.0.0.0/tcp/4004
+      - DATA_CENTER=us-west-2
+    networks:
+      - falak-network
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      bootstrap:
+        condition: service_healthy
+      node2:
+        condition: service_started
+    command: >
+      sh -c "
+      sleep 10 &&
+      /app/falak 
+      --name node4 
+      --address \"/ip4/0.0.0.0/tcp/4004\"
+      --data-center \"us-west-2\"
+      --peers \"/ip4/bootstrap/tcp/4001/p2p/\$$(cat /tmp/bootstrap_peer_id 2>/dev/null || echo 'PLACEHOLDER')\"
+      "
+
+  # Test runner service
+  test-runner:
+    build: 
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: falak-test-runner
+    networks:
+      - falak-network
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    depends_on:
+      - bootstrap
+      - node2
+      - node3
+    command: >
+      sh -c "
+      echo 'Waiting for network to stabilize...' &&
+      sleep 15 &&
+      echo 'Running integration tests...' &&
+      cd /app/internal/node &&
+      go test ./tests/ -v -timeout=60s
+      "
+    profiles:
+      - testing
+
+networks:
+  falak-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  logs:
+    driver: local

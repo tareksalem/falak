@@ -1,0 +1,44 @@
+# Development Dockerfile for Falak
+FROM golang:1.23-alpine AS builder
+
+# Install dependencies
+RUN apk add --no-cache git ca-certificates
+
+# Set working directory
+WORKDIR /app
+
+# Copy go workspace files
+COPY go.work go.work.sum ./
+
+# Copy all modules
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+COPY pkg/ ./pkg/
+
+# Sync workspace and build
+RUN go work sync
+RUN cd cmd && go build -o ../falak .
+
+# Final stage
+FROM alpine:latest
+
+# Install runtime dependencies
+RUN apk add --no-cache ca-certificates procps
+
+# Create app directory
+WORKDIR /app
+
+# Copy binary
+COPY --from=builder /app/falak .
+
+# Create logs directory
+RUN mkdir -p /app/logs
+
+# Make binary executable
+RUN chmod +x /app/falak
+
+# Expose default port
+EXPOSE 4001
+
+# Default command
+CMD ["/app/falak", "--help"]
