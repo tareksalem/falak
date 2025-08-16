@@ -1,0 +1,19 @@
+{
+  "id": "capsule-uuid",
+  "name": "my-app",
+  "version": "1.0.0",
+  "tags": ["gpu", "us-east", "api"],
+  "snapshot": {
+    "type": "oci",
+    "image": "registry.falak.io/my-app:1.0.0-snap",
+    "checksum": "sha256:abc123"
+  },
+  "resources": {
+    "cpu": "500m",
+    "memory": "512Mi"
+  },
+  "meta": {
+    "owner": "team-xyz",
+    "env": "production"
+  }
+}

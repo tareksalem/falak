@@ -4,3 +4,7 @@ tmp/
 .vscode/
 certs
 CLAUDE.md
+logs
+*.log
+bin/
+falak

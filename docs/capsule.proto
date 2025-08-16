@@ -1,0 +1,168 @@
+syntax = "proto3";
+
+package falak.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/falak/internal/types";
+
+// Capsule represents a deployable application specification
+message Capsule {
+  string id = 1;
+  string name = 2;
+  string version = 3;
+  string orbit = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp expires_at = 6;
+  
+  Container container = 7;
+  Deployment deployment = 8;
+  Placement placement = 9;
+  repeated Snapshot snapshots = 10;
+  Gravity gravity = 11;
+  Momentum momentum = 12;
+}
+
+// Container defines the container specification
+message Container {
+  string image = 1;
+  string digest = 2;
+  repeated Port ports = 3;
+  map<string, string> env = 4;
+  repeated Mount mounts = 5;
+  Resources resources = 6;
+}
+
+// Port mapping specification
+message Port {
+  int32 container = 1;
+  string host_range = 2; // e.g., "8080-8090"
+}
+
+// Mount specification for volumes and bind mounts
+message Mount {
+  string source = 1;
+  string target = 2;
+  string type = 3; // "bind", "volume", "tmpfs"
+  bool read_only = 4;
+}
+
+// Resource requirements and limits
+message Resources {
+  int32 min_cpu_millicores = 1;
+  int32 max_cpu_millicores = 2;
+  int32 min_memory_mb = 3;
+  int32 max_memory_mb = 4;
+  int32 min_storage_mb = 5;
+  int32 max_storage_mb = 6;
+  bool requires_filesystem = 7;
+}
+
+// Deployment configuration for scaling and instances
+message Deployment {
+  int32 min_instances = 1;
+  int32 max_instances = 2;
+  int32 target_instances = 3;
+  Scaling scaling = 4;
+}
+
+// Auto-scaling configuration
+message Scaling {
+  int32 cpu_threshold = 1;         // CPU percentage
+  int32 memory_threshold = 2;      // Memory percentage
+  int32 request_rate_threshold = 3; // Requests per second
+  int32 scale_up_cooldown = 4;     // Seconds
+  int32 scale_down_cooldown = 5;   // Seconds
+}
+
+// Placement constraints for datacenters and clusters
+message Placement {
+  repeated string datacenters = 1;
+  repeated string clusters = 2;
+}
+
+// Snapshot reference for fast container startup
+message Snapshot {
+  string node_id = 1;
+  google.protobuf.Timestamp created_at = 2;
+  int64 size_compressed = 3;
+  int64 size_uncompressed = 4;
+  string compression = 5;
+  string checksum = 6;
+  string transfer_protocol = 7;
+}
+
+// Gravity configuration for node election
+message Gravity {
+  double cpu_weight = 1;
+  double memory_weight = 2;
+  double latency_weight = 3;
+  double affinity_weight = 4;
+  repeated string required_labels = 5;
+  repeated string preferred_labels = 6;
+}
+
+// Momentum configuration for capsule lifecycle
+message Momentum {
+  double energy = 1;
+  double decay = 2;
+  double threshold = 3;
+  int32 ttl = 4;
+}
+
+// PubSub message for capsule announcements
+message CapsuleAnnouncement {
+  string type = 1;                            // "capsule.announced"
+  google.protobuf.Timestamp timestamp = 2;
+  string orbit = 3;
+  string capsule_id = 4;
+  double momentum = 5;
+  string source_node = 6;
+  Capsule capsule_metadata = 7;
+}
+
+// PubSub message for node election votes
+message ElectionVote {
+  string type = 1;                            // "election.vote"
+  google.protobuf.Timestamp timestamp = 2;
+  string capsule_id = 3;
+  string voter_node = 4;
+  double gravity_score = 5;
+  int32 vote_ttl = 6;
+  NodeCapabilities capabilities = 7;
+}
+
+// Node capabilities for election voting
+message NodeCapabilities {
+  int32 cpu_available = 1;
+  int32 memory_available = 2;
+  bool has_snapshots = 3;
+  double estimated_startup = 4;
+}
+
+// PubSub message for execution events
+message ExecutionEvent {
+  string type = 1;                            // "execution.started", "execution.ready", "execution.failed"
+  google.protobuf.Timestamp timestamp = 2;
+  string capsule_id = 3;
+  string executor_node = 4;
+  string method = 5;                          // "snapshot", "image"
+  string snapshot_source = 6;
+  google.protobuf.Timestamp estimated_ready = 7;
+  string error_message = 8;                   // For failed executions
+}
+
+// Snapshot transfer request
+message SnapshotTransferRequest {
+  string capsule_id = 1;
+  string requesting_node = 2;
+  string snapshot_checksum = 3;
+}
+
+// Snapshot transfer response
+message SnapshotTransferResponse {
+  bool available = 1;
+  int64 size_bytes = 2;
+  string compression = 3;
+  string error_message = 4;
+}
