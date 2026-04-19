@@ -1,0 +1,234 @@
+package phonebook
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/tareksalem/falak/node/internal/events"
+	"github.com/tareksalem/falak/shared"
+)
+
+// Subscriber handles event subscriptions for the phonebook.
+type Subscriber struct {
+	phonebook IPhonebook
+	eventBus  events.Bus
+	logger    *zap.Logger
+	parentCtx context.Context // Set via WithContext option
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+}
+
+// SubscriberOption configures a Subscriber.
+type SubscriberOption func(*Subscriber)
+
+// WithContext sets the parent context for the subscriber.
+// The subscriber will derive its internal context from this parent,
+// enabling proper cancellation propagation from the parent component.
+func WithContext(ctx context.Context) SubscriberOption {
+	return func(s *Subscriber) {
+		s.parentCtx = ctx
+	}
+}
+
+// WithPhonebook sets the phonebook instance.
+func WithPhonebook(pb IPhonebook) SubscriberOption {
+	return func(s *Subscriber) {
+		s.phonebook = pb
+	}
+}
+
+// WithEventBus sets the event bus.
+func WithEventBus(bus events.Bus) SubscriberOption {
+	return func(s *Subscriber) {
+		s.eventBus = bus
+	}
+}
+
+// WithSubscriberLogger sets the logger.
+func WithSubscriberLogger(logger *zap.Logger) SubscriberOption {
+	return func(s *Subscriber) {
+		s.logger = logger
+	}
+}
+
+// NewSubscriber creates a new phonebook event subscriber.
+func NewSubscriber(opts ...SubscriberOption) *Subscriber {
+	s := &Subscriber{
+		logger: zap.NewNop(),
+	}
+
+	// Apply options first to capture parentCtx if provided
+	for _, opt := range opts {
+		opt(s)
+	}
+
+	// Derive context from parent if provided, otherwise use Background
+	if s.parentCtx != nil {
+		s.ctx, s.cancel = context.WithCancel(s.parentCtx)
+	} else {
+		s.ctx, s.cancel = context.WithCancel(context.Background())
+	}
+
+	return s
+}
+
+// Start begins listening for events.
+func (s *Subscriber) Start() error {
+	// Validate required dependencies
+	if s.phonebook == nil {
+		return errors.New("phonebook is required")
+	}
+	if s.eventBus == nil {
+		return errors.New("eventBus is required")
+	}
+
+	// Subscribe to auth events
+	newMemberAnnouncedCh := s.eventBus.Subscribe(events.TypeNewMemberAnnounced)
+	newMemberReceivedCh := s.eventBus.Subscribe(events.TypeNewMemberReceived)
+	clusterMembersCh := s.eventBus.Subscribe(events.TypeClusterMembersReceived)
+
+	s.wg.Add(3)
+	go func() {
+		defer s.wg.Done()
+		s.handleNewMemberAnnounced(newMemberAnnouncedCh)
+	}()
+	go func() {
+		defer s.wg.Done()
+		s.handleNewMemberReceived(newMemberReceivedCh)
+	}()
+	go func() {
+		defer s.wg.Done()
+		s.handleClusterMembersReceived(clusterMembersCh)
+	}()
+
+	s.logger.Debug("phonebook subscriber started")
+	return nil
+}
+
+// Stop stops listening for events.
+func (s *Subscriber) Stop() {
+	s.cancel()
+	s.wg.Wait()
+	s.logger.Debug("phonebook subscriber stopped")
+}
+
+// handleNewMemberAnnounced processes NewMemberAnnounced events (we authenticated a new member).
+func (s *Subscriber) handleNewMemberAnnounced(ch <-chan events.Event) {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+
+			e, ok := event.(events.NewMemberAnnounced)
+			if !ok {
+				continue
+			}
+
+			s.addOrUpdateEntry(e.NodeID, e.ClusterPath, e.Addresses, e.PublicKey, e.Capabilities)
+		}
+	}
+}
+
+// handleNewMemberReceived processes NewMemberReceived events (received via PubSub).
+func (s *Subscriber) handleNewMemberReceived(ch <-chan events.Event) {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+
+			e, ok := event.(events.NewMemberReceived)
+			if !ok {
+				continue
+			}
+
+			s.addOrUpdateEntry(e.NodeID, e.ClusterPath, e.Addresses, e.PublicKey, e.Capabilities)
+		}
+	}
+}
+
+// handleClusterMembersReceived processes ClusterMembersReceived events (after authentication).
+func (s *Subscriber) handleClusterMembersReceived(ch <-chan events.Event) {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+
+			e, ok := event.(events.ClusterMembersReceived)
+			if !ok {
+				continue
+			}
+
+			for _, member := range e.Members {
+				s.addOrUpdateEntry(member.NodeID, e.ClusterPath, member.Addresses, member.PublicKey, member.Capabilities)
+			}
+
+			s.logger.Info("stored cluster members",
+				zap.String("cluster", e.ClusterPath),
+				zap.Int("count", len(e.Members)))
+		}
+	}
+}
+
+// addOrUpdateEntry adds or updates a phonebook entry.
+func (s *Subscriber) addOrUpdateEntry(nodeID, clusterPath string, addresses []string, publicKey []byte, caps *events.Capabilities) {
+	cp, _ := shared.ParseClusterPath(clusterPath)
+
+	entry := &Entry{
+		NodeID:      nodeID,
+		ClusterPath: clusterPath,
+		PublicKey:   publicKey,
+		Addresses:   addresses,
+		Region:      cp.Region,
+		Datacenter:  cp.Datacenter,
+		FirstSeen:   time.Now(),
+		LastSeen:    time.Now(),
+		Status:      NodeStatusEnum.Active(),
+	}
+
+	if caps != nil {
+		entry.Capabilities = &Capabilities{
+			CPUCores:   caps.CPUCores,
+			MemoryMB:   caps.MemoryMB,
+			DiskGB:     caps.DiskGB,
+			Datacenter: caps.Datacenter,
+			Tags:       caps.Tags,
+			Metadata:   caps.Metadata,
+		}
+	}
+
+	exists, _ := s.phonebook.Exists(nodeID, clusterPath)
+	if exists {
+		if err := s.phonebook.Update(entry); err != nil {
+			s.logger.Error("failed to update phonebook entry",
+				zap.String("nodeId", nodeID),
+				zap.Error(err))
+		}
+	} else {
+		if err := s.phonebook.Add(entry); err != nil {
+			s.logger.Error("failed to add phonebook entry",
+				zap.String("nodeId", nodeID),
+				zap.Error(err))
+		}
+	}
+
+	s.logger.Debug("phonebook entry updated",
+		zap.String("nodeId", nodeID),
+		zap.String("cluster", clusterPath))
+}

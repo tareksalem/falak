@@ -1,0 +1,144 @@
+syntax = "proto3";
+
+package falak.api.v1alpha1;
+
+option go_package = "github.com/tareksalem/falak/api/proto/v1alpha1pb";
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "api/proto/v1alpha1/common.proto";
+
+// CapsuleService manages capsule lifecycle via the Falak API.
+service CapsuleService {
+    // Create deploys a new capsule to the mesh.
+    rpc Create(CreateCapsuleRequest) returns (CapsuleResource);
+
+    // Get returns a single capsule by ID.
+    rpc Get(GetCapsuleRequest) returns (CapsuleResource);
+
+    // List returns capsules matching the filter criteria.
+    rpc List(ListCapsulesRequest) returns (ListCapsulesResponse);
+
+    // Update modifies an existing capsule's spec.
+    rpc Update(UpdateCapsuleRequest) returns (CapsuleResource);
+
+    // Delete removes a capsule from the mesh.
+    rpc Delete(DeleteCapsuleRequest) returns (google.protobuf.Empty);
+
+    // Watch streams capsule events in real time.
+    rpc Watch(WatchCapsulesRequest) returns (stream WatchEvent);
+
+    // Logs streams container logs from the node running the capsule.
+    rpc Logs(LogsRequest) returns (stream LogEntry);
+}
+
+// --- Messages ------------------------------------------------------------
+
+message CapsuleResource {
+    ObjectMeta meta = 1;
+    CapsuleSpec spec = 2;
+    CapsuleStatus status = 3;
+}
+
+message CapsuleSpec {
+    string image = 1;
+    string image_digest = 2;
+    string orbit = 3;
+    string tier = 4;
+    int32 cpu_cores = 5;
+    int32 cpu_cores_max = 6;
+    int64 memory_mb = 7;
+    int64 memory_mb_max = 8;
+    int64 disk_mb = 9;
+    int32 replicas_min = 10;
+    int32 replicas_max = 11;
+    int32 replicas_exact = 12;
+    map<string, string> env = 13;
+    repeated string command = 14;
+    string network_mode = 15;
+}
+
+message CapsuleStatus {
+    string status = 1;
+    repeated ReplicaStatus replicas = 2;
+}
+
+message ReplicaStatus {
+    string replica_id = 1;
+    string node_id = 2;
+    string status = 3;
+    google.protobuf.Timestamp started_at = 4;
+}
+
+message CreateCapsuleRequest {
+    string cluster = 1;
+    string name = 2;
+    string image = 3;
+    string orbit = 4;
+    string tier = 5;
+    map<string, string> labels = 6;
+    int32 cpu_cores = 7;
+    int32 cpu_cores_max = 8;
+    int64 memory_mb = 9;
+    int64 memory_mb_max = 10;
+    int64 disk_mb = 11;
+    int32 replicas_min = 12;
+    int32 replicas_max = 13;
+    int32 replicas_exact = 14;
+    map<string, string> env = 15;
+    repeated string command = 16;
+    string network_mode = 17;
+    string image_digest = 18;
+    string registry_url = 19;
+    string registry_username = 20;
+    string registry_password = 21;
+}
+
+message GetCapsuleRequest {
+    string id = 1;
+    string cluster = 2;
+}
+
+message ListCapsulesRequest {
+    string cluster = 1;
+    map<string, string> labels = 2;
+    string orbit = 3;
+    Pagination pagination = 4;
+}
+
+message ListCapsulesResponse {
+    repeated CapsuleResource capsules = 1;
+    PagedResult paging = 2;
+}
+
+message UpdateCapsuleRequest {
+    string id = 1;
+    string cluster = 2;
+    string image = 3;
+    map<string, string> env = 4;
+    repeated string command = 5;
+}
+
+message DeleteCapsuleRequest {
+    string id = 1;
+    string cluster = 2;
+}
+
+message WatchCapsulesRequest {
+    string cluster = 1;
+    map<string, string> labels = 2;
+}
+
+message LogsRequest {
+    string capsule_id = 1;
+    string replica_id = 2;
+    bool follow = 3;
+    int32 tail = 4;
+    google.protobuf.Timestamp since = 5;
+}
+
+message LogEntry {
+    google.protobuf.Timestamp timestamp = 1;
+    string stream = 2;  // "stdout" or "stderr"
+    string line = 3;
+}

@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package falak.api.v1alpha1;
+
+option go_package = "github.com/tareksalem/falak/api/proto/v1alpha1pb";
+
+import "google/protobuf/timestamp.proto";
+
+// ObjectMeta carries common metadata for every API resource.
+message ObjectMeta {
+    string name = 1;
+    string id = 2;
+    string cluster = 3;
+    map<string, string> labels = 4;
+    google.protobuf.Timestamp created_at = 5;
+    google.protobuf.Timestamp updated_at = 6;
+}
+
+// Pagination holds cursor-based pagination for List requests.
+message Pagination {
+    int32 page_size = 1;
+    string next_page_token = 2;
+}
+
+// PagedResult carries pagination metadata in List responses.
+message PagedResult {
+    string next_page_token = 1;
+    int32 total_count = 2;
+}
+
+// WatchEvent is a single event in a Watch stream.
+message WatchEvent {
+    enum Type {
+        ADDED = 0;
+        MODIFIED = 1;
+        DELETED = 2;
+        ERROR = 3;
+    }
+    Type type = 1;
+    bytes resource = 2;  // serialized resource
+    google.protobuf.Timestamp timestamp = 3;
+}
+
+// ErrorDetail carries structured error information.
+message ErrorDetail {
+    int32 code = 1;           // gRPC status code
+    string message = 2;       // human-readable message
+    string field = 3;         // field that caused the error (for validation)
+}
+
+// HealthResponse is the response for health check endpoints.
+message HealthResponse {
+    string status = 1;  // "ok" or error message
+}
+
+// SystemInfo is the response for system info endpoint.
+message SystemInfo {
+    string node_id = 1;
+    string node_name = 2;
+    string version = 3;
+    string go_version = 4;
+    string platform = 5;
+    int64 uptime_seconds = 6;
+    string api_address = 7;
+    repeated string clusters = 8;
+}

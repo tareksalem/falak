@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package falak.api.v1alpha1;
+
+option go_package = "github.com/tareksalem/falak/api/proto/v1alpha1pb";
+
+import "api/proto/v1alpha1/common.proto";
+
+service SystemService {
+    rpc Info(SystemInfoRequest) returns (SystemInfo);
+    rpc Version(VersionRequest) returns (VersionResponse);
+}
+
+message SystemInfoRequest {}
+message VersionRequest {}
+
+message VersionResponse {
+    string version = 1;
+    string go_version = 2;
+    string platform = 3;
+}

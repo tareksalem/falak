@@ -1,0 +1,11 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go run ./falakd/"
+  bin = ""
+  include_ext = ["go"]
+  send_interrupt = true
+
+[misc]
+  clean_on_exit = true
