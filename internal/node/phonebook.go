@@ -61,14 +61,14 @@ func (p *Phonebook) UpdateFromDelta(delta *models.PhonebookDelta) {
 	if delta == nil {
 		return
 	}
-	
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	for _, dcUpdate := range delta.DataCenters {
 		p.mergeDataCenterUpdateLocked(dcUpdate)
 	}
-	
+
 	log.Printf("Updated phonebook from delta: %d data centers", len(delta.DataCenters))
 }
 
@@ -76,14 +76,14 @@ func (p *Phonebook) UpdateFromDelta(delta *models.PhonebookDelta) {
 func (p *Phonebook) GetPeersByDataCenter(dc string) []Peer {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	var dcPeers []Peer
 	for _, peer := range p.peers {
 		if peer.DataCenter == dc {
 			dcPeers = append(dcPeers, peer)
 		}
 	}
-	
+
 	return dcPeers
 }
 
@@ -99,7 +99,7 @@ func (p *Phonebook) mergeDataCenterUpdateLocked(dcUpdate *models.DataCenterUpdat
 	if dcUpdate == nil {
 		return
 	}
-	
+
 	for _, peerInfo := range dcUpdate.Peers {
 		// Convert protobuf PeerInfo to internal Peer struct
 		peer := Peer{
@@ -110,12 +110,12 @@ func (p *Phonebook) mergeDataCenterUpdateLocked(dcUpdate *models.DataCenterUpdat
 			TrustScore: 1.0, // Default trust score
 			Tags:       make(Tags),
 		}
-		
+
 		// Copy labels to tags
 		for k, v := range peerInfo.Labels {
 			peer.Tags[k] = v
 		}
-		
+
 		// Only update if this is authoritative or we don't have the peer
 		if dcUpdate.IsAuthoritative {
 			p.peers[peer.ID] = peer
@@ -123,7 +123,7 @@ func (p *Phonebook) mergeDataCenterUpdateLocked(dcUpdate *models.DataCenterUpdat
 			p.peers[peer.ID] = peer
 		}
 	}
-	
+
 	log.Printf("Merged data center update for DC %s: %d peers", dcUpdate.DcId, len(dcUpdate.Peers))
 }
 
@@ -149,19 +149,19 @@ func (p *Phonebook) convertNodeStatus(status models.NodeStatus) string {
 func (p *Phonebook) GetDataCenters() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	dcSet := make(map[string]bool)
 	for _, peer := range p.peers {
 		if peer.DataCenter != "" {
 			dcSet[peer.DataCenter] = true
 		}
 	}
-	
+
 	var datacenters []string
 	for dc := range dcSet {
 		datacenters = append(datacenters, dc)
 	}
-	
+
 	return datacenters
 }
 
@@ -169,7 +169,7 @@ func (p *Phonebook) GetDataCenters() []string {
 func (p *Phonebook) UpdatePeerLastSeen(peerID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	if peer, exists := p.peers[peerID]; exists {
 		peer.LastSeen = time.Now()
 		p.peers[peerID] = peer
@@ -180,7 +180,7 @@ func (p *Phonebook) UpdatePeerLastSeen(peerID string) {
 func (p *Phonebook) UpdatePeerTrustScore(peerID string, score float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	if peer, exists := p.peers[peerID]; exists {
 		peer.TrustScore = score
 		p.peers[peerID] = peer
@@ -191,16 +191,16 @@ func (p *Phonebook) UpdatePeerTrustScore(peerID string, score float64) {
 func (p *Phonebook) GetStalePeers(staleDuration time.Duration) []Peer {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	threshold := time.Now().Add(-staleDuration)
 	var stalePeers []Peer
-	
+
 	for _, peer := range p.peers {
 		if peer.LastSeen.Before(threshold) {
 			stalePeers = append(stalePeers, peer)
 		}
 	}
-	
+
 	return stalePeers
 }
 
@@ -208,33 +208,33 @@ func (p *Phonebook) GetStalePeers(staleDuration time.Duration) []Peer {
 func (p *Phonebook) GeneratePhonebookDelta() *models.PhonebookDelta {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	// Group peers by data center
 	dcPeers := make(map[string][]*models.PeerInfo)
-	
+
 	for _, peer := range p.peers {
 		dc := peer.DataCenter
 		if dc == "" {
 			dc = "default"
 		}
-		
+
 		peerInfo := &models.PeerInfo{
-			NodeId:      peer.ID,
-			Multiaddrs:  []string{}, // TODO: Extract from AddrInfo
-			Labels:      make(map[string]string),
-			NodeStatus:  p.convertStringToNodeStatus(peer.Status),
+			NodeId:     peer.ID,
+			Multiaddrs: []string{}, // TODO: Extract from AddrInfo
+			Labels:     make(map[string]string),
+			NodeStatus: p.convertStringToNodeStatus(peer.Status),
 		}
-		
+
 		// Copy tags to labels
 		for k, v := range peer.Tags {
 			if strVal, ok := v.(string); ok {
 				peerInfo.Labels[k] = strVal
 			}
 		}
-		
+
 		dcPeers[dc] = append(dcPeers[dc], peerInfo)
 	}
-	
+
 	// Create data center updates
 	var dcUpdates []*models.DataCenterUpdate
 	for dc, peers := range dcPeers {
@@ -245,7 +245,7 @@ func (p *Phonebook) GeneratePhonebookDelta() *models.PhonebookDelta {
 		}
 		dcUpdates = append(dcUpdates, dcUpdate)
 	}
-	
+
 	return &models.PhonebookDelta{
 		DataCenters: dcUpdates,
 	}
