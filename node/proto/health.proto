@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package falak.health;
+
+option go_package = "github.com/tareksalem/falak/node/proto/healthpb";
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================================
+// STREAM MESSAGES (Protocol: /falak/health/ping/1.0)
+// ============================================================================
+
+// Ping is sent from prober to target via direct stream
+message Ping {
+    string from_node_id = 1;               // Prober's node ID
+    int64 sequence = 2;                    // Unique sequence number (unix nano)
+    google.protobuf.Timestamp timestamp = 3;
+}
+
+// Ack is the response to a Ping
+message Ack {
+    string from_node_id = 1;               // Target's node ID (responder)
+    int64 sequence = 2;                    // Must match Ping.sequence
+    google.protobuf.Timestamp timestamp = 3;
+}
+
+// ============================================================================
+// PUBSUB MESSAGES (Topic: falak/{region}/{dc}/{cluster}/health)
+// ============================================================================
+
+// HealthMessage is the envelope for all health-related PubSub messages
+message HealthMessage {
+    string type = 1;                       // "score_update", "ping_request", "threshold_crossed"
+    bytes payload = 2;                     // Serialized message based on type
+    string sender_id = 3;                  // Node that published this message
+    google.protobuf.Timestamp timestamp = 4;
+    bytes signature = 5;                   // Signature over (type + payload + sender_id + timestamp)
+}
+
+// ScoreUpdate is published on every score change
+message ScoreUpdate {
+    string target_node_id = 1;             // Node this score is about
+    double score = 2;                      // Current reliability score
+    bool alive = 3;                        // If true, target responded, score = 0
+    string updated_by = 4;                 // Node that published this update
+    google.protobuf.Timestamp timestamp = 5;
+    string reason = 6;                     // "direct_ping_fail", "indirect_ping_fail", "probe_success", etc.
+}
+
+// PingRequest is published when direct ping fails, asking others to probe
+message PingRequest {
+    string target_node_id = 1;             // Node to ping
+    string requester_id = 2;               // Node requesting the probe
+    string request_id = 3;                 // Unique ID for this request (UUID)
+    google.protobuf.Timestamp timestamp = 4;
+}
+
+// ThresholdCrossed is published when a node's score crosses quarantine threshold
+message ThresholdCrossed {
+    string target_node_id = 1;             // Node that crossed threshold
+    double score = 2;                      // Current score
+    string reported_by = 3;                // Node that detected the crossing
+    google.protobuf.Timestamp timestamp = 4;
+}
+
+// ResourceUpdate is published periodically by every node with the latest
+// snapshot of host-level resource utilization. Carried inside the
+// HealthMessage envelope (type = "resource_update").
+message ResourceUpdate {
+    string node_id = 1;                    // Node the snapshot belongs to (== HealthMessage.sender_id)
+    google.protobuf.Timestamp captured_at = 2;
+
+    // CPU
+    int32 cpu_cores = 10;
+    double cpu_used_percent = 11;
+
+    // Memory (megabytes)
+    int64 memory_total_mb = 20;
+    int64 memory_available_mb = 21;
+    int64 memory_used_mb = 22;
+    double memory_used_percent = 23;
+
+    // Disk (megabytes; primary volume)
+    int64 disk_total_mb = 30;
+    int64 disk_free_mb = 31;
+    int64 disk_used_mb = 32;
+    double disk_used_percent = 33;
+
+    // Load averages (1m, 5m, 15m)
+    double load_one = 40;
+    double load_five = 41;
+    double load_fifteen = 42;
+
+    // Network throughput (bytes per second, aggregated across interfaces)
+    int64 net_sent_bytes_per_sec = 50;
+    int64 net_recv_bytes_per_sec = 51;
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+// NodeStatus represents the health status of a node
+enum NodeStatus {
+    NODE_STATUS_UNSPECIFIED = 0;
+    NODE_STATUS_ACTIVE = 1;                // Healthy, score 0-4
+    NODE_STATUS_SUSPECTED = 2;             // Score 4-10, being watched
+    NODE_STATUS_QUARANTINED = 3;           // Score >= 10, isolated
+    NODE_STATUS_FAILED = 4;                // Confirmed dead, removed
+}

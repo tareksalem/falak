@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package falak.api.v1alpha1;
+
+option go_package = "github.com/tareksalem/falak/api/proto/v1alpha1pb";
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+service ClusterService {
+    rpc Join(JoinClusterRequest) returns (google.protobuf.Empty);
+    rpc Leave(LeaveClusterRequest) returns (google.protobuf.Empty);
+    rpc List(ListClustersRequest) returns (ListClustersResponse);
+    rpc Members(ClusterMembersRequest) returns (ClusterMembersResponse);
+}
+
+message JoinClusterRequest {
+    string path = 1;
+    string psk = 2;
+    repeated string bootstrap_peers = 3;
+}
+
+message LeaveClusterRequest {
+    string path = 1;
+}
+
+message ListClustersRequest {}
+
+message ListClustersResponse {
+    repeated ClusterInfo clusters = 1;
+}
+
+message ClusterInfo {
+    string path = 1;
+    google.protobuf.Timestamp joined_at = 2;
+    int32 members = 3;
+}
+
+message ClusterMembersRequest {
+    string path = 1;
+}
+
+message ClusterMembersResponse {
+    repeated NodeInfo nodes = 1;
+}
+
+message NodeInfo {
+    string id = 1;
+    string name = 2;
+    string status = 3;
+    repeated string addresses = 4;
+    string datacenter = 5;
+    string region = 6;
+    int32 cpu_cores = 7;
+    int64 memory_mb = 8;
+}

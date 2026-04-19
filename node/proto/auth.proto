@@ -1,0 +1,167 @@
+syntax = "proto3";
+
+package falak.auth;
+
+option go_package = "github.com/tareksalem/falak/node/proto/authpb";
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================================
+// STREAM MESSAGES (Protocol: /falak/auth/1.0)
+// ============================================================================
+
+// JoinRequest is sent by a joining node to request cluster membership
+message JoinRequest {
+    string node_id = 1;                    // Joining node's peer ID
+    string cluster_path = 2;               // Cluster to join (region/dc/cluster)
+    repeated string addresses = 3;         // Joining node's multiaddrs
+    Capabilities capabilities = 4;         // Node capabilities
+    bytes nonce = 5;                       // Random nonce for challenge
+    bytes public_key = 6;                  // Node's public key
+}
+
+// Challenge is sent by existing node to verify PSK knowledge
+message Challenge {
+    bytes challenge = 1;                   // Random challenge bytes
+    bytes server_nonce = 2;                // Server's nonce for mutual auth
+}
+
+// ChallengeResponse contains the HMAC response and signature
+message ChallengeResponse {
+    bytes response = 1;                    // HMAC(challenge + nonces, PSK)
+    bytes signature = 2;                   // Signature over response
+}
+
+// Step1Result indicates success/failure of Step 1
+message Step1Result {
+    bool success = 1;
+    string error = 2;                      // Error message if failed
+    bytes step1_token = 3;                 // Token for Step 2 correlation
+    bool await_broadcast = 4;              // If true, wait for AuthComplete
+}
+
+// AuthComplete is sent after Step 2 broadcast succeeds
+message AuthComplete {
+    bool fully_authenticated = 1;
+    repeated MemberInfo cluster_members = 2;  // Current cluster members
+    repeated string accessible_topics = 3;    // Topics the node can now access
+    NodeCertificate node_certificate = 4;     // Certificate issued for the joining node
+}
+
+// ============================================================================
+// PUBSUB MESSAGES (Topic: falak/{region}/{dc}/{cluster}/auth)
+// ============================================================================
+
+// AuthMessage is the envelope for all auth-related PubSub messages
+message AuthMessage {
+    string type = 1;                       // "new_member"
+    bytes payload = 2;                     // Serialized message based on type
+    string sender_id = 3;                  // Node that published this message
+    google.protobuf.Timestamp timestamp = 4;
+    bytes signature = 5;                   // Signature over (type + payload + sender_id + timestamp)
+}
+
+// NewMemberAnnouncement is broadcast after successful Step 1 authentication
+message NewMemberAnnouncement {
+    string new_node_id = 1;                // New node's peer ID
+    repeated string new_node_addrs = 2;    // New node's addresses
+    Capabilities capabilities = 3;         // New node's capabilities
+    string cluster_path = 4;               // Cluster being joined
+    string voucher_node_id = 5;            // Node that authenticated (voucher)
+    bytes voucher_signature = 6;           // Voucher's signature over announcement content
+    bytes public_key = 7;                  // New node's public key
+    google.protobuf.Timestamp timestamp = 8;
+    NodeCertificate certificate = 9;       // Certificate signed by voucher
+}
+
+// MemberAuthConfirmed is broadcast by nodes that successfully verified a new member
+message MemberAuthConfirmed {
+    string new_node_id = 1;                // The node being confirmed
+    string confirming_node_id = 2;         // Node sending this confirmation
+    string cluster_path = 3;               // Cluster path
+    bytes signature = 4;                   // Signature over (new_node_id + cluster_path + timestamp)
+    google.protobuf.Timestamp timestamp = 5;
+}
+
+// MemberAuthRejected is broadcast by nodes that failed to verify a new member
+message MemberAuthRejected {
+    string new_node_id = 1;                // The node being rejected
+    string rejecting_node_id = 2;          // Node sending this rejection
+    string cluster_path = 3;               // Cluster path
+    string reason = 4;                     // Reason for rejection
+    bytes signature = 5;                   // Signature over (new_node_id + cluster_path + reason + timestamp)
+    google.protobuf.Timestamp timestamp = 6;
+}
+
+// ============================================================================
+// CERTIFICATE TYPES
+// ============================================================================
+
+// NodeCertificate is a certificate proving a node's membership in a cluster
+message NodeCertificate {
+    string node_id = 1;                    // Node's peer ID
+    bytes node_public_key = 2;             // Node's public key (libp2p format)
+    string cluster_path = 3;               // Cluster this certificate is valid for
+    string issuer_node_id = 4;             // Node that issued this cert (voucher or self for bootstrap)
+    google.protobuf.Timestamp issued_at = 5;
+    google.protobuf.Timestamp expires_at = 6;  // Optional expiration
+    bytes signature = 7;                   // Signature over (node_id + node_public_key + cluster_path + issuer + issued_at + expires_at)
+    bool is_self_signed = 8;               // True for first node bootstrap
+}
+
+// ============================================================================
+// REVOCATION MESSAGES
+// ============================================================================
+
+// CertificateRevocation is broadcast when a node's certificate is revoked.
+// PubSub message type: "cert_revoked"
+message CertificateRevocation {
+    string cert_fingerprint = 1;           // SHA-256 of the certificate bytes
+    string node_id = 2;                    // Node whose cert is revoked
+    string cluster_path = 3;               // Cluster this applies to
+    string reason = 4;                     // Reason for revocation
+    string revoked_by = 5;                 // Node ID that initiated revocation
+    google.protobuf.Timestamp revoked_at = 6;
+    bytes signature = 7;                   // Signature by revoking node
+}
+
+// ============================================================================
+// RENEWAL MESSAGES (Protocol: /falak/auth/renew/1.0)
+// ============================================================================
+
+// RenewalRequest is sent by a node requesting certificate renewal.
+message RenewalRequest {
+    NodeCertificate current_cert = 1;      // The certificate being renewed
+    bytes new_public_key = 2;              // Optional: for key rotation
+    string cluster_path = 3;               // Cluster this renewal is for
+}
+
+// RenewalResponse is sent by the renewing peer.
+message RenewalResponse {
+    bool success = 1;
+    NodeCertificate new_cert = 2;          // The renewed certificate
+    string error = 3;                      // Error message if failed
+}
+
+// ============================================================================
+// SHARED TYPES
+// ============================================================================
+
+// Capabilities describes a node's resources and features
+message Capabilities {
+    int32 cpu_cores = 1;
+    int64 memory_mb = 2;
+    int64 disk_gb = 3;
+    string datacenter = 4;
+    repeated string tags = 5;
+    map<string, string> metadata = 6;      // Additional key-value metadata
+}
+
+// MemberInfo describes a cluster member
+message MemberInfo {
+    string node_id = 1;
+    repeated string addresses = 2;
+    Capabilities capabilities = 3;
+    google.protobuf.Timestamp joined_at = 4;
+    bytes public_key = 5;
+}

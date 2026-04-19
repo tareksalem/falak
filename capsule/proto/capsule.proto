@@ -1,0 +1,188 @@
+syntax = "proto3";
+
+package falak.capsule;
+
+option go_package = "github.com/tareksalem/falak/capsule/proto/capsulepb";
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================================
+// CORE TYPES
+// ============================================================================
+
+message CapsuleSpec {
+    string name = 1;
+    string image = 2;
+    string image_digest = 3;
+    string orbit = 4;
+    string tier = 5;                             // "critical", "standard", "background"
+    map<string, string> labels = 6;
+    ResourceRequirements resources = 7;
+    ReplicaConfig replicas = 8;
+    repeated ScalingRule scaling_rules = 9;
+    repeated PlacementRule placement_rules = 10;
+    // Field 11 was SnapshotRef, removed. Reserved to prevent reuse.
+    reserved 11;
+    RuntimeConfig runtime = 12;
+    MomentumConfig momentum_config = 13;
+    string image_alias = 14;
+    repeated string command = 15;
+}
+
+message ResourceRequirements {
+    int32 cpu_cores = 1;
+    int64 memory_mb = 2;
+    int64 disk_mb = 3;
+    int32 cpu_cores_max = 4;
+    int64 memory_mb_max = 5;
+}
+
+message ReplicaConfig {
+    int32 min = 1;
+    int32 max = 2;
+    int32 exact = 3;                             // 0 means use min/max
+}
+
+message ScalingRule {
+    string name = 1;
+    string trigger = 2;                          // "any" or "all"
+    repeated string conditions = 3;
+    string action = 4;                           // "scaleUp", "scaleDown", "scaleToZero"
+    int32 cooldown_seconds = 5;
+}
+
+message PlacementRule {
+    string name = 1;
+    string type = 2;                             // "node", "cluster", "datacenter", "capsule"
+    string mode = 3;                             // "near", "away" (capsule type only)
+    repeated string target_names = 4;
+    map<string, string> labels = 5;              // "same" = compare keyword
+    bool required = 6;
+}
+
+message RuntimeConfig {
+    map<string, string> env = 2;
+    NetworkConfig network = 5;
+    HealthCheck health_check = 6;
+    FailurePolicy failure_policy = 7;
+    LogRetention log_retention = 8;
+    int32 stats_interval_seconds = 9;
+    RegistryAuth registry = 10;
+    SnapshotConfig snapshot = 11;
+    // Fields 1, 3, 4 were type, ports, old health — reserved.
+    reserved 1, 3, 4;
+}
+
+message NetworkConfig {
+    string mode = 1;                             // "bridge", "host"
+    repeated PortMapping ports = 2;
+}
+
+message PortMapping {
+    string name = 1;
+    uint32 container_port = 2;
+    uint32 host_port = 3;                        // 0 = auto-assign
+    string protocol = 4;                         // "tcp", "udp"
+}
+
+message HealthCheck {
+    string type = 1;                             // "http", "tcp"
+    string path = 2;                             // http only
+    uint32 port = 3;
+    int32 interval_seconds = 4;
+    int32 timeout_seconds = 5;
+    int32 retries = 6;
+    int32 initial_delay_seconds = 7;
+}
+
+message FailurePolicy {
+    int32 restart_limit = 1;
+    int32 max_node_attempts = 2;
+    int32 graceful_timeout_seconds = 3;
+}
+
+message LogRetention {
+    int32 max_file_size_mb = 1;
+    int32 max_files = 2;
+}
+
+message RegistryAuth {
+    string url = 1;
+    bytes username_encrypted = 2;
+    bytes password_encrypted = 3;
+}
+
+message SnapshotConfig {
+    int32 max_per_capsule = 1;
+    int32 ttl_seconds = 2;
+}
+
+message MomentumConfig {
+    int32 base = 1;
+    bool boost_on_traffic = 2;
+    bool reduce_on_idle = 3;
+    int32 idle_timeout_seconds = 4;
+}
+
+// ============================================================================
+// CAPSULE ENTITY
+// ============================================================================
+
+message Capsule {
+    string id = 1;
+    string cluster_id = 2;
+    CapsuleSpec spec = 3;
+    string status = 4;
+    repeated ReplicaState replicas = 5;
+    string version = 6;
+    google.protobuf.Timestamp created_at = 7;
+    google.protobuf.Timestamp updated_at = 8;
+    MomentumState momentum = 9;
+}
+
+message ReplicaState {
+    string replica_id = 1;
+    string node_id = 2;
+    string status = 3;                           // "electing", "assigned", "running", "stopping"
+    google.protobuf.Timestamp started_at = 4;
+}
+
+message MomentumState {
+    int32 current = 1;
+    int32 base = 2;
+    google.protobuf.Timestamp last_adjusted = 3;
+}
+
+// ============================================================================
+// PUBSUB MESSAGES
+// ============================================================================
+
+// OrbitMessage is the envelope for all messages on orbit topics.
+message OrbitMessage {
+    string type = 1;                             // "announcement", "status", "withdrawal"
+    bytes payload = 2;
+    string sender_id = 3;
+    google.protobuf.Timestamp timestamp = 4;
+    bytes signature = 5;
+}
+
+// CapsuleAnnouncement is published when a capsule enters an orbit.
+message CapsuleAnnouncement {
+    Capsule capsule = 1;
+    string announcing_node = 2;
+}
+
+// CapsuleStatusUpdate is published by the running node to inform the mesh.
+message CapsuleStatusUpdate {
+    string capsule_id = 1;
+    string status = 2;
+    repeated ReplicaState replicas = 3;
+    MomentumState momentum = 4;
+    google.protobuf.Timestamp timestamp = 5;
+}
+
+// CapsuleWithdrawal is published when a capsule is removed from an orbit.
+message CapsuleWithdrawal {
+    string capsule_id = 1;
+    string reason = 2;                           // "deleted", "stopped", "replaced"
+}

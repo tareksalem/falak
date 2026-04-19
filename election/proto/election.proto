@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package falak.election;
+
+option go_package = "github.com/tareksalem/falak/election/proto/electionpb";
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================================
+// PUBSUB MESSAGES (Topic: falak/{cluster}/election)
+// ============================================================================
+
+// ElectionMessage is the envelope for every election pubsub message.
+// Following the same pattern as auth, health, and capsule orbit messages,
+// it carries a type tag, a signed payload, and the sender identity.
+message ElectionMessage {
+    string type = 1;                       // "claim" | "failed"
+    bytes payload = 2;                     // Serialized Claim or ElectionFailed
+    string sender_id = 3;                  // Publishing node's libp2p peer ID
+    google.protobuf.Timestamp timestamp = 4;
+    bytes signature = 5;                   // Over (type + payload + sender_id + timestamp)
+}
+
+// Claim is broadcast by the elected node once its strategy decides it
+// should run a capsule replica. The first node whose claim reaches the
+// rest of the mesh becomes the winner, with deterministic tiebreak when
+// multiple claims race.
+//
+// Tiebreak order when two Claim messages arrive for the same
+// (capsule_id, replica_id):
+//   1. Higher gravity_score wins.
+//   2. Earlier timestamp wins.
+//   3. Lexicographically smaller node_id wins.
+//
+// Both sides apply the same rule independently and converge on the
+// same winner even when messages arrive in different orders.
+message Claim {
+    string capsule_id = 1;
+    string replica_id = 2;
+    string cluster_path = 3;
+    string node_id = 4;                    // Node claiming the replica
+    double gravity_score = 5;              // 0–100 percentage score
+    int64 timestamp_micros = 6;            // Claim creation time, microseconds since epoch
+}
+
+// ElectionFailed is broadcast when any node concludes that no winner
+// can be elected for a particular (capsule_id, replica_id). Every
+// receiving node marks the capsule's replica as failed so the failure
+// surfaces uniformly across the mesh.
+message ElectionFailed {
+    string capsule_id = 1;
+    string replica_id = 2;
+    string cluster_path = 3;
+    string sender_id = 4;                  // Node reporting the failure
+    string reason = 5;                     // Human-readable failure reason
+    int64 timestamp_micros = 6;            // Failure detection time
+}
