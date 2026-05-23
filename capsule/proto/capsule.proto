@@ -27,6 +27,55 @@ message CapsuleSpec {
     MomentumConfig momentum_config = 13;
     string image_alias = 14;
     repeated string command = 15;
+    CapsuleKind kind = 16;                       // default: CAPSULE_KIND_CAPSULE
+    string group_id = 17;                        // set on member capsules; empty otherwise
+    bool group_member = 18;                      // true on member capsules
+    GroupSpec group = 19;                        // set when kind == CAPSULE_KIND_GROUP
+}
+
+// CapsuleKind discriminates standalone capsules from group-kind ones.
+enum CapsuleKind {
+    CAPSULE_KIND_UNSPECIFIED = 0;
+    CAPSULE_KIND_CAPSULE = 1;
+    CAPSULE_KIND_GROUP = 2;
+}
+
+// ColocationMode controls whether group members must share a node.
+enum ColocationMode {
+    COLOCATION_MODE_UNSPECIFIED = 0;
+    COLOCATION_MODE_SAME_NODE = 1;
+    COLOCATION_MODE_SAME_ORBIT = 2;
+}
+
+// MemberDeps lists the names of other group members a member depends on.
+message MemberDeps {
+    repeated string depends_on = 1;
+}
+
+// MemberSpec is a CapsuleSpec scoped to a group context. At admission time,
+// each MemberSpec is materialized into a full Capsule with kind set to
+// CAPSULE_KIND_CAPSULE and group_id pointing at the parent group.
+//
+// Fields 3 and 4 (discovers, replica_labels) are reserved for Phase 11.
+// Phase 10 admission rejects any input setting those fields with a clear
+// "feature not yet supported" error; reserving the IDs here keeps wire
+// compatibility when Phase 11 lands.
+message MemberSpec {
+    string name = 1;                             // member name (DNS-friendly)
+    CapsuleSpec spec = 2;                        // full capsule spec; kind is forced to CAPSULE_KIND_CAPSULE at admission
+    reserved 3, 4;                               // discovers, replica_labels — Phase 11
+}
+
+// GroupSpec is set on capsules with kind == CAPSULE_KIND_GROUP. It carries
+// the canonical member specs (for cascade), a dependency DAG keyed by
+// member name, the post-admission member capsule IDs, and the cascade
+// delete flag.
+message GroupSpec {
+    ColocationMode colocation = 1;
+    repeated MemberSpec members = 2;             // canonical member specs for cascading
+    map<string, MemberDeps> deps = 3;            // member_name -> dependencies
+    repeated string member_ids = 4;              // populated after admission
+    bool cascade_delete = 5;                     // false leaves members standalone on group delete
 }
 
 message ResourceRequirements {

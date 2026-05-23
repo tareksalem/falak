@@ -5,17 +5,18 @@ import (
 	"time"
 
 	"github.com/tareksalem/falak/capsule"
+	"github.com/tareksalem/falak/capsule/enums"
 )
 
 // --- Condition Parsing Tests ---
 
 func TestParseCondition(t *testing.T) {
 	tests := []struct {
-		raw      string
-		metric   string
-		value    float64
-		unit     string
-		wantErr  bool
+		raw     string
+		metric  string
+		value   float64
+		unit    string
+		wantErr bool
 	}{
 		{"cpu > 70%", "cpu", 70, "%", false},
 		{"memory > 80%", "memory", 80, "%", false},
@@ -104,12 +105,12 @@ func TestEvaluator_AllMatch(t *testing.T) {
 	rules := []Rule{
 		{
 			Name:    "high load",
-			Trigger: capsule.TriggerModeEnum.All(),
+			Trigger: enums.TriggerModeEnum.All(),
 			Conditions: []Condition{
 				{Metric: "cpu", Operator: ">", Value: 70},
 				{Metric: "memory", Operator: ">", Value: 60},
 			},
-			Action:   capsule.ScalingActionEnum.ScaleUp(),
+			Action:   enums.ScalingActionEnum.ScaleUp(),
 			Cooldown: 0,
 		},
 	}
@@ -118,7 +119,7 @@ func TestEvaluator_AllMatch(t *testing.T) {
 	if result == nil || !result.Matched {
 		t.Error("expected rule to match")
 	}
-	if result.Action != capsule.ScalingActionEnum.ScaleUp() {
+	if result.Action != enums.ScalingActionEnum.ScaleUp() {
 		t.Error("expected scaleUp action")
 	}
 }
@@ -133,12 +134,12 @@ func TestEvaluator_AllNotMatch(t *testing.T) {
 	rules := []Rule{
 		{
 			Name:    "high load",
-			Trigger: capsule.TriggerModeEnum.All(),
+			Trigger: enums.TriggerModeEnum.All(),
 			Conditions: []Condition{
 				{Metric: "cpu", Operator: ">", Value: 70},
 				{Metric: "memory", Operator: ">", Value: 60},
 			},
-			Action: capsule.ScalingActionEnum.ScaleUp(),
+			Action: enums.ScalingActionEnum.ScaleUp(),
 		},
 	}
 
@@ -158,12 +159,12 @@ func TestEvaluator_AnyMatch(t *testing.T) {
 	rules := []Rule{
 		{
 			Name:    "traffic spike",
-			Trigger: capsule.TriggerModeEnum.Any(),
+			Trigger: enums.TriggerModeEnum.Any(),
 			Conditions: []Condition{
 				{Metric: "latency.p95", Operator: ">", Value: 200},
 				{Metric: "rps", Operator: ">", Value: 1000},
 			},
-			Action: capsule.ScalingActionEnum.ScaleUp(),
+			Action: enums.ScalingActionEnum.ScaleUp(),
 		},
 	}
 
@@ -180,11 +181,11 @@ func TestEvaluator_Cooldown(t *testing.T) {
 	rules := []Rule{
 		{
 			Name:    "high cpu",
-			Trigger: capsule.TriggerModeEnum.All(),
+			Trigger: enums.TriggerModeEnum.All(),
 			Conditions: []Condition{
 				{Metric: "cpu", Operator: ">", Value: 70},
 			},
-			Action:   capsule.ScalingActionEnum.ScaleUp(),
+			Action:   enums.ScalingActionEnum.ScaleUp(),
 			Cooldown: 1 * time.Minute,
 		},
 	}
@@ -209,19 +210,19 @@ func TestEvaluator_FirstMatchWins(t *testing.T) {
 	rules := []Rule{
 		{
 			Name:    "high cpu",
-			Trigger: capsule.TriggerModeEnum.All(),
+			Trigger: enums.TriggerModeEnum.All(),
 			Conditions: []Condition{
 				{Metric: "cpu", Operator: ">", Value: 70},
 			},
-			Action: capsule.ScalingActionEnum.ScaleUp(),
+			Action: enums.ScalingActionEnum.ScaleUp(),
 		},
 		{
 			Name:    "low rps",
-			Trigger: capsule.TriggerModeEnum.All(),
+			Trigger: enums.TriggerModeEnum.All(),
 			Conditions: []Condition{
 				{Metric: "rps", Operator: "<", Value: 10},
 			},
-			Action: capsule.ScalingActionEnum.ScaleDown(),
+			Action: enums.ScalingActionEnum.ScaleDown(),
 		},
 	}
 
@@ -239,9 +240,9 @@ func TestEvaluator_FirstMatchWins(t *testing.T) {
 func TestFromSpec(t *testing.T) {
 	spec := capsule.ScalingRule{
 		Name:       "test",
-		Trigger:    capsule.TriggerModeEnum.All(),
+		Trigger:    enums.TriggerModeEnum.All(),
 		Conditions: []string{"cpu > 70%", "memory > 60%"},
-		Action:     capsule.ScalingActionEnum.ScaleUp(),
+		Action:     enums.ScalingActionEnum.ScaleUp(),
 		Cooldown:   time.Minute,
 	}
 

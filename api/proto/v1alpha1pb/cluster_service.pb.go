@@ -7,6 +7,7 @@
 package v1alpha1pb
 
 import (
+	_ "google.golang.org/genproto/googleapis/api/annotations"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
@@ -459,7 +460,7 @@ var File_api_proto_v1alpha1_cluster_service_proto protoreflect.FileDescriptor
 
 const file_api_proto_v1alpha1_cluster_service_proto_rawDesc = "" +
 	"\n" +
-	"(api/proto/v1alpha1/cluster_service.proto\x12\x12falak.api.v1alpha1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"c\n" +
+	"(api/proto/v1alpha1/cluster_service.proto\x12\x12falak.api.v1alpha1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1cgoogle/api/annotations.proto\"c\n" +
 	"\x12JoinClusterRequest\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x10\n" +
 	"\x03psk\x18\x02 \x01(\tR\x03psk\x12'\n" +
@@ -487,12 +488,12 @@ const file_api_proto_v1alpha1_cluster_service_proto_rawDesc = "" +
 	"datacenter\x12\x16\n" +
 	"\x06region\x18\x06 \x01(\tR\x06region\x12\x1b\n" +
 	"\tcpu_cores\x18\a \x01(\x05R\bcpuCores\x12\x1b\n" +
-	"\tmemory_mb\x18\b \x01(\x03R\bmemoryMb2\xdf\x02\n" +
-	"\x0eClusterService\x12F\n" +
-	"\x04Join\x12&.falak.api.v1alpha1.JoinClusterRequest\x1a\x16.google.protobuf.Empty\x12H\n" +
-	"\x05Leave\x12'.falak.api.v1alpha1.LeaveClusterRequest\x1a\x16.google.protobuf.Empty\x12Y\n" +
-	"\x04List\x12'.falak.api.v1alpha1.ListClustersRequest\x1a(.falak.api.v1alpha1.ListClustersResponse\x12`\n" +
-	"\aMembers\x12).falak.api.v1alpha1.ClusterMembersRequest\x1a*.falak.api.v1alpha1.ClusterMembersResponseB2Z0github.com/tareksalem/falak/api/proto/v1alpha1pbb\x06proto3"
+	"\tmemory_mb\x18\b \x01(\x03R\bmemoryMb2\xe9\x03\n" +
+	"\x0eClusterService\x12e\n" +
+	"\x04Join\x12&.falak.api.v1alpha1.JoinClusterRequest\x1a\x16.google.protobuf.Empty\"\x1d\x82\xd3\xe4\x93\x02\x17:\x01*\"\x12/v1alpha1/clusters\x12k\n" +
+	"\x05Leave\x12'.falak.api.v1alpha1.LeaveClusterRequest\x1a\x16.google.protobuf.Empty\"!\x82\xd3\xe4\x93\x02\x1b*\x19/v1alpha1/clusters/{path}\x12u\n" +
+	"\x04List\x12'.falak.api.v1alpha1.ListClustersRequest\x1a(.falak.api.v1alpha1.ListClustersResponse\"\x1a\x82\xd3\xe4\x93\x02\x14\x12\x12/v1alpha1/clusters\x12\x8b\x01\n" +
+	"\aMembers\x12).falak.api.v1alpha1.ClusterMembersRequest\x1a*.falak.api.v1alpha1.ClusterMembersResponse\")\x82\xd3\xe4\x93\x02#\x12!/v1alpha1/clusters/{path}/membersB2Z0github.com/tareksalem/falak/api/proto/v1alpha1pbb\x06proto3"
 
 var (
 	file_api_proto_v1alpha1_cluster_service_proto_rawDescOnce sync.Once

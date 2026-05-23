@@ -7,6 +7,7 @@
 package v1alpha1pb
 
 import (
+	_ "google.golang.org/genproto/googleapis/api/annotations"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
@@ -157,17 +158,17 @@ var File_api_proto_v1alpha1_system_service_proto protoreflect.FileDescriptor
 
 const file_api_proto_v1alpha1_system_service_proto_rawDesc = "" +
 	"\n" +
-	"'api/proto/v1alpha1/system_service.proto\x12\x12falak.api.v1alpha1\x1a\x1fapi/proto/v1alpha1/common.proto\"\x13\n" +
+	"'api/proto/v1alpha1/system_service.proto\x12\x12falak.api.v1alpha1\x1a\x1fapi/proto/v1alpha1/common.proto\x1a\x1cgoogle/api/annotations.proto\"\x13\n" +
 	"\x11SystemInfoRequest\"\x10\n" +
 	"\x0eVersionRequest\"f\n" +
 	"\x0fVersionResponse\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x1d\n" +
 	"\n" +
 	"go_version\x18\x02 \x01(\tR\tgoVersion\x12\x1a\n" +
-	"\bplatform\x18\x03 \x01(\tR\bplatform2\xb2\x01\n" +
-	"\rSystemService\x12M\n" +
-	"\x04Info\x12%.falak.api.v1alpha1.SystemInfoRequest\x1a\x1e.falak.api.v1alpha1.SystemInfo\x12R\n" +
-	"\aVersion\x12\".falak.api.v1alpha1.VersionRequest\x1a#.falak.api.v1alpha1.VersionResponseB2Z0github.com/tareksalem/falak/api/proto/v1alpha1pbb\x06proto3"
+	"\bplatform\x18\x03 \x01(\tR\bplatform2\xf3\x01\n" +
+	"\rSystemService\x12l\n" +
+	"\x04Info\x12%.falak.api.v1alpha1.SystemInfoRequest\x1a\x1e.falak.api.v1alpha1.SystemInfo\"\x1d\x82\xd3\xe4\x93\x02\x17\x12\x15/v1alpha1/system/info\x12t\n" +
+	"\aVersion\x12\".falak.api.v1alpha1.VersionRequest\x1a#.falak.api.v1alpha1.VersionResponse\" \x82\xd3\xe4\x93\x02\x1a\x12\x18/v1alpha1/system/versionB2Z0github.com/tareksalem/falak/api/proto/v1alpha1pbb\x06proto3"
 
 var (
 	file_api_proto_v1alpha1_system_service_proto_rawDescOnce sync.Once

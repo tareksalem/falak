@@ -7,6 +7,7 @@
 package v1alpha1pb
 
 import (
+	_ "google.golang.org/genproto/googleapis/api/annotations"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
@@ -1055,7 +1056,7 @@ var File_api_proto_v1alpha1_capsule_service_proto protoreflect.FileDescriptor
 
 const file_api_proto_v1alpha1_capsule_service_proto_rawDesc = "" +
 	"\n" +
-	"(api/proto/v1alpha1/capsule_service.proto\x12\x12falak.api.v1alpha1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1fapi/proto/v1alpha1/common.proto\"\xb5\x01\n" +
+	"(api/proto/v1alpha1/capsule_service.proto\x12\x12falak.api.v1alpha1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1cgoogle/api/annotations.proto\x1a\x1fapi/proto/v1alpha1/common.proto\"\xb5\x01\n" +
 	"\x0fCapsuleResource\x122\n" +
 	"\x04meta\x18\x01 \x01(\v2\x1e.falak.api.v1alpha1.ObjectMetaR\x04meta\x123\n" +
 	"\x04spec\x18\x02 \x01(\v2\x1f.falak.api.v1alpha1.CapsuleSpecR\x04spec\x129\n" +
@@ -1164,15 +1165,15 @@ const file_api_proto_v1alpha1_capsule_service_proto_rawDesc = "" +
 	"\bLogEntry\x128\n" +
 	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x16\n" +
 	"\x06stream\x18\x02 \x01(\tR\x06stream\x12\x12\n" +
-	"\x04line\x18\x03 \x01(\tR\x04line2\xda\x04\n" +
-	"\x0eCapsuleService\x12W\n" +
-	"\x06Create\x12(.falak.api.v1alpha1.CreateCapsuleRequest\x1a#.falak.api.v1alpha1.CapsuleResource\x12Q\n" +
-	"\x03Get\x12%.falak.api.v1alpha1.GetCapsuleRequest\x1a#.falak.api.v1alpha1.CapsuleResource\x12Y\n" +
-	"\x04List\x12'.falak.api.v1alpha1.ListCapsulesRequest\x1a(.falak.api.v1alpha1.ListCapsulesResponse\x12W\n" +
-	"\x06Update\x12(.falak.api.v1alpha1.UpdateCapsuleRequest\x1a#.falak.api.v1alpha1.CapsuleResource\x12J\n" +
-	"\x06Delete\x12(.falak.api.v1alpha1.DeleteCapsuleRequest\x1a\x16.google.protobuf.Empty\x12S\n" +
-	"\x05Watch\x12(.falak.api.v1alpha1.WatchCapsulesRequest\x1a\x1e.falak.api.v1alpha1.WatchEvent0\x01\x12G\n" +
-	"\x04Logs\x12\x1f.falak.api.v1alpha1.LogsRequest\x1a\x1c.falak.api.v1alpha1.LogEntry0\x01B2Z0github.com/tareksalem/falak/api/proto/v1alpha1pbb\x06proto3"
+	"\x04line\x18\x03 \x01(\tR\x04line2\xa9\x06\n" +
+	"\x0eCapsuleService\x12v\n" +
+	"\x06Create\x12(.falak.api.v1alpha1.CreateCapsuleRequest\x1a#.falak.api.v1alpha1.CapsuleResource\"\x1d\x82\xd3\xe4\x93\x02\x17:\x01*\"\x12/v1alpha1/capsules\x12r\n" +
+	"\x03Get\x12%.falak.api.v1alpha1.GetCapsuleRequest\x1a#.falak.api.v1alpha1.CapsuleResource\"\x1f\x82\xd3\xe4\x93\x02\x19\x12\x17/v1alpha1/capsules/{id}\x12u\n" +
+	"\x04List\x12'.falak.api.v1alpha1.ListCapsulesRequest\x1a(.falak.api.v1alpha1.ListCapsulesResponse\"\x1a\x82\xd3\xe4\x93\x02\x14\x12\x12/v1alpha1/capsules\x12{\n" +
+	"\x06Update\x12(.falak.api.v1alpha1.UpdateCapsuleRequest\x1a#.falak.api.v1alpha1.CapsuleResource\"\"\x82\xd3\xe4\x93\x02\x1c:\x01*\x1a\x17/v1alpha1/capsules/{id}\x12k\n" +
+	"\x06Delete\x12(.falak.api.v1alpha1.DeleteCapsuleRequest\x1a\x16.google.protobuf.Empty\"\x1f\x82\xd3\xe4\x93\x02\x19*\x17/v1alpha1/capsules/{id}\x12S\n" +
+	"\x05Watch\x12(.falak.api.v1alpha1.WatchCapsulesRequest\x1a\x1e.falak.api.v1alpha1.WatchEvent0\x01\x12u\n" +
+	"\x04Logs\x12\x1f.falak.api.v1alpha1.LogsRequest\x1a\x1c.falak.api.v1alpha1.LogEntry\",\x82\xd3\xe4\x93\x02&\x12$/v1alpha1/capsules/{capsule_id}/logs0\x01B2Z0github.com/tareksalem/falak/api/proto/v1alpha1pbb\x06proto3"
 
 var (
 	file_api_proto_v1alpha1_capsule_service_proto_rawDescOnce sync.Once

@@ -2,6 +2,7 @@ package gravity
 
 import (
 	"github.com/tareksalem/falak/capsule"
+	capsuleEnums "github.com/tareksalem/falak/capsule/enums"
 )
 
 // Ineligibility describes why a node was rejected by IsEligible. It is the
@@ -179,16 +180,16 @@ func ruleMatchesNode(
 	lookup CapsuleTargetLookup,
 ) bool {
 	switch rule.Type {
-	case capsule.PlacementTypeEnum.Node():
+	case capsuleEnums.PlacementTypeEnum.Node():
 		return matchNodeRule(rule, node)
 
-	case capsule.PlacementTypeEnum.Cluster():
+	case capsuleEnums.PlacementTypeEnum.Cluster():
 		return matchClusterRule(rule, node)
 
-	case capsule.PlacementTypeEnum.Datacenter():
+	case capsuleEnums.PlacementTypeEnum.Datacenter():
 		return matchDatacenterRule(rule, node)
 
-	case capsule.PlacementTypeEnum.Capsule():
+	case capsuleEnums.PlacementTypeEnum.Capsule():
 		return matchCapsuleRule(rule, node, lookup)
 	}
 	// Unknown placement type — treat as failing so we never accidentally
@@ -237,7 +238,7 @@ func matchCapsuleRule(rule capsule.PlacementRule, node NodeState, lookup Capsule
 	if lookup == nil || len(rule.Names) == 0 {
 		// We cannot evaluate the rule. Treat near as failing (cannot
 		// guarantee proximity) and away as passing (cannot prove conflict).
-		return rule.Mode == capsule.PlacementModeEnum.Away()
+		return rule.Mode == capsuleEnums.PlacementModeEnum.Away()
 	}
 
 	// Collect the set of node IDs running any of the target capsules.
@@ -246,7 +247,7 @@ func matchCapsuleRule(rule capsule.PlacementRule, node NodeState, lookup Capsule
 		targetIDs = append(targetIDs, lookup.NodesRunningCapsule(node.ClusterPath, name)...)
 	}
 	if len(targetIDs) == 0 {
-		return rule.Mode == capsule.PlacementModeEnum.Away()
+		return rule.Mode == capsuleEnums.PlacementModeEnum.Away()
 	}
 
 	// For "same"-keyword labels we need to look up each target node's
@@ -260,10 +261,10 @@ func matchCapsuleRule(rule capsule.PlacementRule, node NodeState, lookup Capsule
 	// A richer comparison (same datacenter, same region, …) is delegated
 	// to gravity scoring where we have full StateProvider access.
 	isAlsoRunner := containsString(targetIDs, node.NodeID)
-	if rule.Mode == capsule.PlacementModeEnum.Near() {
+	if rule.Mode == capsuleEnums.PlacementModeEnum.Near() {
 		return isAlsoRunner
 	}
-	if rule.Mode == capsule.PlacementModeEnum.Away() {
+	if rule.Mode == capsuleEnums.PlacementModeEnum.Away() {
 		return !isAlsoRunner
 	}
 	return false

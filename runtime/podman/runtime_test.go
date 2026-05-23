@@ -2,13 +2,79 @@ package podman
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/tareksalem/falak/runtime"
 )
+
+// TestPullStreaming_ParsesProgressLines feeds canned JSON-Lines progress
+// records into parsePullProgress and asserts the onProgress callback
+// observes the (current, total) deltas in order. Drives the parser
+// without an HTTP server so the test runs in milliseconds and stays in
+// unit-test pipelines that do not have a Podman socket.
+func TestPullStreaming_ParsesProgressLines(t *testing.T) {
+	t.Parallel()
+
+	// Realistic Podman libpod /images/pull payload: a sequence of
+	// JSON-Lines records, the first carrying a "stream" header, then
+	// per-layer progress, then a terminal stream line.
+	feed := strings.Join([]string{
+		`{"stream":"Trying to pull docker.io/library/alpine:latest..."}`,
+		`{"id":"abc","status":"Pulling fs layer","progressDetail":{}}`,
+		`{"id":"abc","status":"Downloading","progressDetail":{"current":1024,"total":10240}}`,
+		`{"id":"abc","status":"Downloading","progressDetail":{"current":5120,"total":10240}}`,
+		`{"id":"abc","status":"Downloading","progressDetail":{"current":10240,"total":10240}}`,
+		`{"stream":"Pulled image: docker.io/library/alpine:latest\n"}`,
+	}, "\n")
+
+	type observed struct{ current, total int64 }
+	var calls []observed
+	err := parsePullProgress(strings.NewReader(feed), func(current, total int64) {
+		calls = append(calls, observed{current, total})
+	})
+	if err != nil {
+		t.Fatalf("parsePullProgress: %v", err)
+	}
+	if got, want := len(calls), 6; got != want {
+		t.Fatalf("callback fired %d times, want %d (calls=%v)", got, want, calls)
+	}
+
+	// The three progress lines must carry the right (current, total).
+	want := []observed{
+		{0, 0},          // stream header
+		{0, 0},          // Pulling fs layer (empty progressDetail)
+		{1024, 10240},   // first Downloading tick
+		{5120, 10240},   // second Downloading tick
+		{10240, 10240},  // final Downloading tick
+		{0, 0},          // terminal Pulled stream line
+	}
+	for i, w := range want {
+		if calls[i] != w {
+			t.Errorf("call[%d] = %+v, want %+v", i, calls[i], w)
+		}
+	}
+}
+
+// TestPullStreaming_ParsePropagatesDecodeErrors confirms that the parser
+// returns a wrapped non-nil error on malformed JSON (something an
+// upstream operator must see in logs).
+func TestPullStreaming_ParsePropagatesDecodeErrors(t *testing.T) {
+	t.Parallel()
+	feed := `{"stream":"ok"}` + "\n" + `{not-json`
+	err := parsePullProgress(strings.NewReader(feed), func(int64, int64) {})
+	if err == nil {
+		t.Fatal("expected decode error, got nil")
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("EOF is treated as clean close; bad JSON must surface: %v", err)
+	}
+}
 
 // skipIfNoPodman skips the test if no Podman socket is found.
 func skipIfNoPodman(t *testing.T) string {

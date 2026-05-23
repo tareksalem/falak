@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/tareksalem/falak/capsule"
+	"github.com/tareksalem/falak/capsule/enums"
 )
 
 // MetricsProvider supplies current metric values for scaling evaluation.
@@ -19,7 +20,7 @@ type MetricsProvider interface {
 // EvalResult holds the result of evaluating scaling rules for a capsule.
 type EvalResult struct {
 	RuleName string
-	Action   capsule.ScalingAction
+	Action   enums.ScalingAction
 	Matched  bool
 }
 
@@ -64,9 +65,9 @@ func (e *Evaluator) Evaluate(capsuleID capsule.CapsuleID, rules []Rule, metrics 
 
 func (e *Evaluator) evaluateRule(rule Rule, metrics MetricsProvider) bool {
 	switch rule.Trigger {
-	case capsule.TriggerModeEnum.All():
+	case enums.TriggerModeEnum.All():
 		return e.evaluateAll(rule.Conditions, metrics)
-	case capsule.TriggerModeEnum.Any():
+	case enums.TriggerModeEnum.Any():
 		return e.evaluateAny(rule.Conditions, metrics)
 	default:
 		return false

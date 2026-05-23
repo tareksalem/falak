@@ -3,6 +3,8 @@ package capsule
 import (
 	"context"
 	"testing"
+
+	enums "github.com/tareksalem/falak/capsule/enums"
 )
 
 func TestCountingMetrics_CreateEmitsCounter(t *testing.T) {
@@ -43,7 +45,7 @@ func TestCountingMetrics_ReceiveEmitsCounter(t *testing.T) {
 		ID:        NewCapsuleID(),
 		ClusterID: "test/dc1",
 		Spec:      CapsuleSpec{Name: "test", Image: "img", Orbit: "api"},
-		Status:    CapsuleStatusEnum.Announced(),
+		Status:    enums.CapsuleStatusEnum.Announced(),
 	}
 	DefaultSpec(&c.Spec)
 	if err := mgr.Receive(c); err != nil {

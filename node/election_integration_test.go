@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/tareksalem/falak/capsule"
+	"github.com/tareksalem/falak/capsule/enums"
 	"github.com/tareksalem/falak/node/internal/events"
 )
 
@@ -188,9 +189,9 @@ func TestElection_3Node_SinglePicker(t *testing.T) {
 	if c == nil {
 		t.Fatalf("winning node %s does not know about capsule %s", winner, capsuleID)
 	}
-	if c.Status == capsule.CapsuleStatusEnum.Created() ||
-		c.Status == capsule.CapsuleStatusEnum.Announced() ||
-		c.Status == capsule.CapsuleStatusEnum.Electing() {
+	if c.Status == enums.CapsuleStatusEnum.Created() ||
+		c.Status == enums.CapsuleStatusEnum.Announced() ||
+		c.Status == enums.CapsuleStatusEnum.Electing() {
 		t.Errorf("winning node lifecycle should be past Electing, got %s", c.Status)
 	}
 }

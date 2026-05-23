@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 
+	gwruntime "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
@@ -69,21 +70,55 @@ func NewServer(c *core.Core, opts ...ServerOption) *Server {
 		s.grpcServer = grpc.NewServer()
 	}
 
+	// Build service implementations once — shared between gRPC server
+	// and the in-process grpc-gateway mux.
+	capsuleSrv := &capsuleService{core: c}
+	clusterSrv := &clusterService{core: c}
+	systemSrv := &systemService{core: c}
+	serviceSrv := &serviceService{core: c}
+
 	// Register gRPC services.
-	pb.RegisterCapsuleServiceServer(s.grpcServer, &capsuleService{core: c})
-	pb.RegisterClusterServiceServer(s.grpcServer, &clusterService{core: c})
-	pb.RegisterSystemServiceServer(s.grpcServer, &systemService{core: c})
+	pb.RegisterCapsuleServiceServer(s.grpcServer, capsuleSrv)
+	pb.RegisterClusterServiceServer(s.grpcServer, clusterSrv)
+	pb.RegisterSystemServiceServer(s.grpcServer, systemSrv)
+	pb.RegisterServiceServiceServer(s.grpcServer, serviceSrv)
 
 	// Enable gRPC reflection for debugging (grpcurl, grpcui).
 	reflection.Register(s.grpcServer)
+
+	// Build grpc-gateway mux that dispatches REST → in-process server
+	// implementations. NOTE: the in-process dispatch path bypasses the
+	// gRPC interceptor chain, so HTTP requests do NOT yet enforce the
+	// same mTLS / auth guarantees as the gRPC path. This is a documented
+	// follow-up from 11B.20 — see docs/api.md ("HTTP mTLS gap"). The
+	// Service endpoints inherit that gap, just like the capsule
+	// endpoints already do; closing it is a single-PR change that
+	// applies an HTTP middleware around gwmux for the production wiring.
+	gwmux := gwruntime.NewServeMux()
+	if err := pb.RegisterCapsuleServiceHandlerServer(context.Background(), gwmux, capsuleSrv); err != nil {
+		panic(fmt.Sprintf("register capsule gateway: %v", err))
+	}
+	if err := pb.RegisterClusterServiceHandlerServer(context.Background(), gwmux, clusterSrv); err != nil {
+		panic(fmt.Sprintf("register cluster gateway: %v", err))
+	}
+	if err := pb.RegisterSystemServiceHandlerServer(context.Background(), gwmux, systemSrv); err != nil {
+		panic(fmt.Sprintf("register system gateway: %v", err))
+	}
+	if err := pb.RegisterServiceServiceHandlerServer(context.Background(), gwmux, serviceSrv); err != nil {
+		panic(fmt.Sprintf("register service gateway: %v", err))
+	}
 
 	// Register HTTP health endpoints.
 	s.httpMux.HandleFunc("/healthz", s.handleHealthz)
 	s.httpMux.HandleFunc("/readyz", s.handleReadyz)
 
-	// Register SSE streaming endpoints for browser/curl clients.
+	// SSE streaming endpoints (exact paths win over the prefix handler
+	// below, so /v1alpha1/watch keeps routing to SSE).
 	sse := falakhttp.NewSSEHandler(c, s.logger.Named("sse"))
 	sse.RegisterRoutes(s.httpMux)
+
+	// Mount grpc-gateway as the catch-all for /v1alpha1/* REST routes.
+	s.httpMux.Handle("/v1alpha1/", gwmux)
 
 	return s
 }

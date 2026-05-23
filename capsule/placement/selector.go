@@ -2,12 +2,13 @@ package placement
 
 import (
 	"github.com/tareksalem/falak/capsule"
+	enums "github.com/tareksalem/falak/capsule/enums"
 )
 
 // Entity represents any entity in the mesh that can be targeted by placement rules.
 type Entity struct {
 	Name   string
-	Type   capsule.PlacementType
+	Type   enums.PlacementType
 	Labels capsule.Labels
 }
 

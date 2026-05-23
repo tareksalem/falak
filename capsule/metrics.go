@@ -1,6 +1,10 @@
 package capsule
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	enums "github.com/tareksalem/falak/capsule/enums"
+)
 
 // Metrics defines observability hooks for the capsule subsystem. Implementations
 // can plug these into Prometheus, OpenTelemetry, StatsD, or any other backend.
@@ -24,10 +28,10 @@ type Metrics interface {
 	IncWithdrawn(clusterID, reason string)
 
 	// IncStatusTransition records a lifecycle transition (from → to).
-	IncStatusTransition(from, to CapsuleStatus, trigger string)
+	IncStatusTransition(from, to enums.CapsuleStatus, trigger string)
 
 	// IncScalingTriggered records a scaling rule firing.
-	IncScalingTriggered(action ScalingAction, rule string)
+	IncScalingTriggered(action enums.ScalingAction, rule string)
 
 	// ObserveMomentum records the current momentum value for a capsule.
 	ObserveMomentum(capsuleID CapsuleID, value int32)
@@ -36,13 +40,13 @@ type Metrics interface {
 // NoopMetrics is the default Metrics implementation; all calls are no-ops.
 type NoopMetrics struct{}
 
-func (NoopMetrics) IncCreated(string)                              {}
-func (NoopMetrics) IncReceived(string)                             {}
-func (NoopMetrics) IncAnnounced(string, string)                    {}
-func (NoopMetrics) IncWithdrawn(string, string)                    {}
-func (NoopMetrics) IncStatusTransition(CapsuleStatus, CapsuleStatus, string) {}
-func (NoopMetrics) IncScalingTriggered(ScalingAction, string)      {}
-func (NoopMetrics) ObserveMomentum(CapsuleID, int32)               {}
+func (NoopMetrics) IncCreated(string)                                                    {}
+func (NoopMetrics) IncReceived(string)                                                   {}
+func (NoopMetrics) IncAnnounced(string, string)                                          {}
+func (NoopMetrics) IncWithdrawn(string, string)                                          {}
+func (NoopMetrics) IncStatusTransition(enums.CapsuleStatus, enums.CapsuleStatus, string) {}
+func (NoopMetrics) IncScalingTriggered(enums.ScalingAction, string)                      {}
+func (NoopMetrics) ObserveMomentum(CapsuleID, int32)                                     {}
 
 // CountingMetrics is a simple in-memory Metrics implementation useful for
 // tests and debug UIs. It tracks totals using atomic counters, with no tags.
@@ -58,10 +62,12 @@ type CountingMetrics struct {
 // NewCountingMetrics returns a new CountingMetrics.
 func NewCountingMetrics() *CountingMetrics { return &CountingMetrics{} }
 
-func (c *CountingMetrics) IncCreated(string)                                         { c.Created.Add(1) }
-func (c *CountingMetrics) IncReceived(string)                                        { c.Received.Add(1) }
-func (c *CountingMetrics) IncAnnounced(string, string)                               { c.Announced.Add(1) }
-func (c *CountingMetrics) IncWithdrawn(string, string)                               { c.Withdrawn.Add(1) }
-func (c *CountingMetrics) IncStatusTransition(CapsuleStatus, CapsuleStatus, string)  { c.Transitions.Add(1) }
-func (c *CountingMetrics) IncScalingTriggered(ScalingAction, string)                 { c.ScalingEvents.Add(1) }
-func (c *CountingMetrics) ObserveMomentum(CapsuleID, int32)                          {}
+func (c *CountingMetrics) IncCreated(string)           { c.Created.Add(1) }
+func (c *CountingMetrics) IncReceived(string)          { c.Received.Add(1) }
+func (c *CountingMetrics) IncAnnounced(string, string) { c.Announced.Add(1) }
+func (c *CountingMetrics) IncWithdrawn(string, string) { c.Withdrawn.Add(1) }
+func (c *CountingMetrics) IncStatusTransition(enums.CapsuleStatus, enums.CapsuleStatus, string) {
+	c.Transitions.Add(1)
+}
+func (c *CountingMetrics) IncScalingTriggered(enums.ScalingAction, string) { c.ScalingEvents.Add(1) }
+func (c *CountingMetrics) ObserveMomentum(CapsuleID, int32)                {}

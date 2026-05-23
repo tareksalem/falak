@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tareksalem/falak/capsule"
+	"github.com/tareksalem/falak/capsule/enums"
 )
 
 // Operator represents a comparison operator in a condition.
@@ -35,9 +36,9 @@ type Condition struct {
 // Rule is an evaluated scaling rule with parsed conditions.
 type Rule struct {
 	Name       string
-	Trigger    capsule.TriggerMode
+	Trigger    enums.TriggerMode
 	Conditions []Condition
-	Action     capsule.ScalingAction
+	Action     enums.ScalingAction
 	Cooldown   time.Duration
 }
 

@@ -267,11 +267,12 @@ falak/
 │
 └── cmd/                             # github.com/tareksalem/falak (main module)
     ├── go.mod
-    ├── falakd/                      # Daemon
-    │   ├── main.go
-    │   └── config.go
-    └── falakctl/                    # CLI tool
-        ├── main.go
+    └── falak/                       # Single binary — CLI + daemon
+        ├── main.go                  # cobra root: capsule|cluster|node|service|daemon|...
+        ├── daemon_cmds.go           # `falak daemon start|stop|status` (replaces old falakd)
+        ├── capsule_cmds.go
+        ├── service_cmds.go
+        └── ...
         └── commands/
             ├── root.go
             ├── join.go
@@ -1026,8 +1027,8 @@ api:
 
 ### Phase 8: API & CLI
 - [ ] api/ module (gRPC + gateway)
-- [ ] cmd/falakd
-- [ ] cmd/falakctl
+- [x] cmd/falak (single binary, daemon folded in)
+- [ ] cmd/falak (single binary)
 
 ### Phase 9: Hardening
 - [ ] Advanced phi accrual
@@ -1142,8 +1143,58 @@ air -- --name=node2 --address=/ip4/127.0.0.1/tcp/4002 \
   --peers=/ip4/127.0.0.1/tcp/4001/p2p/<node1-peer-id>
 
 # Terminal 3: Publish capsule via CLI
-./falakctl capsule create --spec=examples/capsule.yaml
+./falak capsule create --spec=examples/capsule.yaml
 ```
+
+---
+
+## 11b. Running privileged tests (`make test-privileged`)
+
+### Why these tests exist
+The `network/overlay/` package implements the VXLAN data plane and the
+XFRM-based IPsec policies that secure cross-host traffic. Both touch
+the Linux kernel directly — VXLAN creates a netlink-managed virtual
+interface; IPsec installs SAD/SPD entries via XFRM netlink. These
+behaviors cannot be tested with userspace mocks alone; a regression
+that affects, say, the XFRM template selector or VXLAN VNI allocator
+would slip past the unit tests and break the data plane silently.
+
+The privileged test lane exercises the real kernel paths:
+- `vxlan_linux_test.go` — creates/destroys a real VXLAN interface,
+  asserts MTU, VNI, and BUM-traffic flooding behavior.
+- `ipsec_test.go` — installs XFRM policies + states with a generated
+  key, sends a packet, asserts encryption + decryption succeed.
+
+### How to run
+1. Boot a rootful Linux environment (a VM, a privileged container, or
+   a bare Linux host you control).
+2. Ensure the `vxlan`, `esp4`, and `xfrm_user` kernel modules are
+   loadable (`modprobe vxlan && modprobe esp4 && modprobe xfrm_user`).
+   On most distributions these are built-in or ship as kernel modules
+   in the linux-modules-extra package.
+3. Run:
+   ```bash
+   sudo make test-privileged
+   ```
+   The make target asserts `getuid() == 0`, loads the required modules,
+   and runs `go test -race -count=1 -timeout=600s ./network/overlay/...`.
+
+### What CAP_NET_ADMIN gets you
+`CAP_NET_ADMIN` is the Linux capability that authorizes interface
+configuration (creating VXLANs, attaching XDP, installing XFRM policy)
+and netlink writes that change kernel networking state. In a rootful
+container, the runtime grants this capability automatically; in a
+rootless container, it cannot. That is why the privileged tests
+require true root rather than a `setcap` workaround.
+
+### CI status
+**There is no CI lane today that runs `make test-privileged`.** GitHub
+Actions and most cloud CI runners disallow privileged operations on
+shared infrastructure. Operators changing anything under
+`network/overlay/` MUST run `sudo make test-privileged` locally on a
+Linux VM or rootful container before merging. The kernel-touching
+tests carry a `t.Skip("requires root + vxlan module")` guard so the
+default unit-test runs (CI, `make test`) stay green without privileges.
 
 ---
 
@@ -1162,7 +1213,7 @@ air -- --name=node2 --address=/ip4/127.0.0.1/tcp/4002 \
 10. `runtime/` - 1 go.mod, ~6 .go files (containerd integration)
 11. `node/` - 1 go.mod, ~6 .go files (orchestration)
 12. `api/` - 1 go.mod, ~8 .go files (gRPC + gateway)
-13. `cmd/` - 1 go.mod, ~10 .go files (falakd, falakctl)
+13. `cmd/` - 1 go.mod, ~10 .go files (falak (single binary))
 
 **Total: 13 go.mod files, ~107 .go files**
 

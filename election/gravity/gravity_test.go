@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/tareksalem/falak/capsule"
+	capsuleEnums "github.com/tareksalem/falak/capsule/enums"
 )
 
 // --- Test fixtures -----------------------------------------------------------
@@ -114,7 +115,7 @@ func TestIsEligible_HardPlacementRuleFails(t *testing.T) {
 		c.Spec.PlacementRules = []capsule.PlacementRule{
 			{
 				Name:     "gpu required",
-				Type:     capsule.PlacementTypeEnum.Node(),
+				Type:     capsuleEnums.PlacementTypeEnum.Node(),
 				Labels:   capsule.Labels{"gpu": "true"},
 				Required: true,
 			},
@@ -133,7 +134,7 @@ func TestIsEligible_HardPlacementRulePasses(t *testing.T) {
 		c.Spec.PlacementRules = []capsule.PlacementRule{
 			{
 				Name:     "gpu required",
-				Type:     capsule.PlacementTypeEnum.Node(),
+				Type:     capsuleEnums.PlacementTypeEnum.Node(),
 				Labels:   capsule.Labels{"gpu": "true"},
 				Required: true,
 			},
@@ -154,7 +155,7 @@ func TestIsEligible_SoftRulesIgnoredByEligibility(t *testing.T) {
 		c.Spec.PlacementRules = []capsule.PlacementRule{
 			{
 				Name:     "prefer gpu",
-				Type:     capsule.PlacementTypeEnum.Node(),
+				Type:     capsuleEnums.PlacementTypeEnum.Node(),
 				Labels:   capsule.Labels{"gpu": "true"},
 				Required: false,
 			},
@@ -275,13 +276,13 @@ func TestFactorSoftPlacementMatch_PartialMatch(t *testing.T) {
 		c.Spec.PlacementRules = []capsule.PlacementRule{
 			{
 				Name:     "prefer gpu",
-				Type:     capsule.PlacementTypeEnum.Node(),
+				Type:     capsuleEnums.PlacementTypeEnum.Node(),
 				Labels:   capsule.Labels{"gpu": "true"},
 				Required: false,
 			},
 			{
 				Name:     "prefer ssd",
-				Type:     capsule.PlacementTypeEnum.Node(),
+				Type:     capsuleEnums.PlacementTypeEnum.Node(),
 				Labels:   capsule.Labels{"ssd": "true"},
 				Required: false,
 			},
@@ -303,10 +304,10 @@ func TestFactorAffinityProximity(t *testing.T) {
 	c := minimalCapsule("test", func(c *capsule.Capsule) {
 		c.Spec.PlacementRules = []capsule.PlacementRule{
 			{
-				Name:  "near db",
-				Type:  capsule.PlacementTypeEnum.Capsule(),
-				Mode:  capsule.PlacementModeEnum.Near(),
-				Names: []string{"db"},
+				Name:   "near db",
+				Type:   capsuleEnums.PlacementTypeEnum.Capsule(),
+				Mode:   capsuleEnums.PlacementModeEnum.Near(),
+				Names:  []string{"db"},
 				Labels: capsule.Labels{"node": "same"},
 			},
 		}

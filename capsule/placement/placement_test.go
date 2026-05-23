@@ -4,14 +4,15 @@ import (
 	"testing"
 
 	"github.com/tareksalem/falak/capsule"
+	enums "github.com/tareksalem/falak/capsule/enums"
 )
 
 // --- Mock EntityProvider ---
 
 type mockProvider struct {
-	nodes       []Entity
-	clusters    []Entity
-	datacenters []Entity
+	nodes        []Entity
+	clusters     []Entity
+	datacenters  []Entity
 	capsuleNodes map[string][]Entity // capsuleName -> nodes
 }
 
@@ -61,9 +62,9 @@ func TestSelectByLabels(t *testing.T) {
 func TestEvaluateDirectNodeRule(t *testing.T) {
 	provider := &mockProvider{
 		nodes: []Entity{
-			{Name: "node1", Type: capsule.PlacementTypeEnum.Node(), Labels: capsule.Labels{"gpu": "true", "region": "us-east"}},
-			{Name: "node2", Type: capsule.PlacementTypeEnum.Node(), Labels: capsule.Labels{"gpu": "false", "region": "us-east"}},
-			{Name: "node3", Type: capsule.PlacementTypeEnum.Node(), Labels: capsule.Labels{"gpu": "true", "region": "eu-west"}},
+			{Name: "node1", Type: enums.PlacementTypeEnum.Node(), Labels: capsule.Labels{"gpu": "true", "region": "us-east"}},
+			{Name: "node2", Type: enums.PlacementTypeEnum.Node(), Labels: capsule.Labels{"gpu": "false", "region": "us-east"}},
+			{Name: "node3", Type: enums.PlacementTypeEnum.Node(), Labels: capsule.Labels{"gpu": "true", "region": "eu-west"}},
 		},
 	}
 
@@ -72,7 +73,7 @@ func TestEvaluateDirectNodeRule(t *testing.T) {
 	rules := []Rule{
 		{
 			Name:     "gpu nodes",
-			Type:     capsule.PlacementTypeEnum.Node(),
+			Type:     enums.PlacementTypeEnum.Node(),
 			Labels:   capsule.Labels{"gpu": "true"},
 			Required: true,
 		},
@@ -103,13 +104,13 @@ func TestEvaluateSoftRule(t *testing.T) {
 	rules := []Rule{
 		{
 			Name:     "gpu required",
-			Type:     capsule.PlacementTypeEnum.Node(),
+			Type:     enums.PlacementTypeEnum.Node(),
 			Labels:   capsule.Labels{"gpu": "true"},
 			Required: true,
 		},
 		{
 			Name:     "prefer ssd",
-			Type:     capsule.PlacementTypeEnum.Node(),
+			Type:     enums.PlacementTypeEnum.Node(),
 			Labels:   capsule.Labels{"ssd": "true"},
 			Required: false,
 		},
@@ -155,8 +156,8 @@ func TestEvaluateCapsuleAffinity(t *testing.T) {
 	rules := []Rule{
 		{
 			Name:     "near db",
-			Type:     capsule.PlacementTypeEnum.Capsule(),
-			Mode:     capsule.PlacementModeEnum.Near(),
+			Type:     enums.PlacementTypeEnum.Capsule(),
+			Mode:     enums.PlacementModeEnum.Near(),
 			Names:    []string{"capsule-db"},
 			Labels:   capsule.Labels{"datacenter": capsule.SameKeyword},
 			Required: true,
@@ -201,8 +202,8 @@ func TestEvaluateCapsuleAntiAffinity(t *testing.T) {
 	rules := []Rule{
 		{
 			Name:     "away from old",
-			Type:     capsule.PlacementTypeEnum.Capsule(),
-			Mode:     capsule.PlacementModeEnum.Away(),
+			Type:     enums.PlacementTypeEnum.Capsule(),
+			Mode:     enums.PlacementModeEnum.Away(),
 			Names:    []string{"capsule-old"},
 			Labels:   capsule.Labels{"node": capsule.SameKeyword},
 			Required: true,
@@ -237,7 +238,7 @@ func TestEvaluateClusterRule(t *testing.T) {
 	rules := []Rule{
 		{
 			Name:     "prod clusters only",
-			Type:     capsule.PlacementTypeEnum.Cluster(),
+			Type:     enums.PlacementTypeEnum.Cluster(),
 			Names:    []string{"prod-1", "prod-2"},
 			Labels:   capsule.Labels{},
 			Required: true,

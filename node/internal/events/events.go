@@ -288,16 +288,17 @@ func (e NodeProbeResult) EventType() string { return TypeNodeProbeResult }
 // --- Capsule Events ---
 
 const (
-	TypeCapsuleCreated   = "capsule.created"
-	TypeCapsuleAnnounced = "capsule.announced"
-	TypeCapsuleReceived  = "capsule.received"
-	TypeCapsuleAssigned  = "capsule.assigned"
-	TypeCapsuleRunning   = "capsule.running"
-	TypeCapsuleStopping  = "capsule.stopping"
-	TypeCapsuleStopped   = "capsule.stopped"
-	TypeCapsuleWithdrawn = "capsule.withdrawn"
-	TypeCapsuleFailed    = "capsule.failed"
-	TypeCapsuleUpdated   = "capsule.updated"
+	TypeCapsuleCreated        = "capsule.created"
+	TypeCapsuleAnnounced      = "capsule.announced"
+	TypeCapsuleReceived       = "capsule.received"
+	TypeCapsuleAssigned       = "capsule.assigned"
+	TypeCapsuleRunning        = "capsule.running"
+	TypeCapsuleStopping       = "capsule.stopping"
+	TypeCapsuleStopped        = "capsule.stopped"
+	TypeCapsuleWithdrawn      = "capsule.withdrawn"
+	TypeCapsuleFailed         = "capsule.failed"
+	TypeCapsuleUpdated        = "capsule.updated"
+	TypeCapsuleGroupReleased  = "capsule.group_released"
 )
 
 // CapsuleCreated is emitted when a capsule is created locally.
@@ -343,6 +344,25 @@ type CapsuleUpdated struct {
 }
 
 func (e CapsuleUpdated) EventType() string { return TypeCapsuleUpdated }
+
+// CapsuleGroupReleased is emitted when a member capsule has been detached
+// from its group as part of a non-cascade group delete. The member keeps
+// running as a standalone capsule; its GroupID has been cleared and the
+// capsule has been re-announced on its orbit. PreviousGroupID carries the
+// group the capsule used to belong to so downstream subscribers
+// (Phase 11A bridge teardown, observability, audit) can correlate the
+// release with the now-deleted group without re-querying state.
+type CapsuleGroupReleased struct {
+	BaseEvent
+	CapsuleID       string
+	CapsuleName     string
+	Orbit           string
+	ClusterPath     string
+	PreviousGroupID string
+}
+
+// EventType returns the event type identifier for CapsuleGroupReleased.
+func (e CapsuleGroupReleased) EventType() string { return TypeCapsuleGroupReleased }
 
 // CapsuleWithdrawn is emitted when a capsule is removed from the mesh.
 type CapsuleWithdrawn struct {
@@ -448,6 +468,23 @@ const (
 	TypeElectionWon       = "election.won"
 	TypeElectionLost      = "election.lost"
 	TypeElectionFailed    = "election.failed"
+
+	// Group-mode election events (Phase 10.14). same-node CapsuleGroups
+	// elect atomically: one claim covers every member's combined
+	// resources + placement constraints. These events fire instead of
+	// the per-replica election triggers above when a group has
+	// Colocation == SameNode.
+	TypeGroupClaimRequested      = "election.group_claim_requested"
+	TypeGroupClaimWon            = "election.group_claim_won"
+	TypeGroupClaimLost           = "election.group_claim_lost"
+	TypeGroupClaimFailed         = "election.group_claim_failed"
+	TypeGroupReelectionRequested = "election.group_reelection_requested"
+
+	// Phase 10.15 / 10.16 events — surfaced by runtime + capsule
+	// handler to coordinate rollback and image-pull-aware reservation
+	// deadlines.
+	TypeMemberPlacementFailed = "election.member_placement_failed"
+	TypePullProgress          = "runtime.pull_progress"
 )
 
 // ElectionReason explains why an election was requested. It is used by the
@@ -552,3 +589,125 @@ type ElectionFailed struct {
 }
 
 func (e ElectionFailed) EventType() string { return TypeElectionFailed }
+
+// GroupClaimRequested is fired locally on every node when a same-node
+// CapsuleGroup needs an atomic placement. Unlike per-replica
+// ElectionRequested, the claim covers every member's combined
+// resources + AND of all placement rules. The winning node alone
+// starts the members in topological order (see runtime.StartGroup).
+type GroupClaimRequested struct {
+	BaseEvent
+	GroupID     string
+	ClusterPath string
+	// MemberIDs lists the member capsule IDs in topological order.
+	// The runtime handler walks this list when starting the group on
+	// the winning node; the election manager uses it to compute the
+	// combined-fit score against the local node.
+	MemberIDs []string
+	// Reason explains why the claim was requested (initial placement,
+	// re-election after a node failure, retry after rollback).
+	Reason ElectionReason
+	// ExcludeNodes lists nodes the previous round already failed on.
+	// Used after rollback to avoid re-electing on the same node.
+	ExcludeNodes []string
+	Priority     int
+}
+
+func (e GroupClaimRequested) EventType() string { return TypeGroupClaimRequested }
+
+// GroupClaimWon is emitted when the local node has been selected to host
+// every member of a same-node CapsuleGroup. The runtime handler's
+// StartGroup is the primary subscriber.
+type GroupClaimWon struct {
+	BaseEvent
+	GroupID     string
+	ClusterPath string
+	MemberIDs   []string // topological order
+	NodeID      string   // local node ID
+	Score       float64
+}
+
+func (e GroupClaimWon) EventType() string { return TypeGroupClaimWon }
+
+// GroupClaimLost is emitted when another node won the group election.
+type GroupClaimLost struct {
+	BaseEvent
+	GroupID      string
+	ClusterPath  string
+	WinnerNodeID string
+}
+
+func (e GroupClaimLost) EventType() string { return TypeGroupClaimLost }
+
+// GroupClaimFailed is emitted when no node could be elected for the
+// group (no node fits all members, timeout, all eligible nodes refused).
+// Triggers the placement_failed state on the group capsule; recovery
+// fires automatically when cluster membership grows (NodeJoined).
+type GroupClaimFailed struct {
+	BaseEvent
+	GroupID     string
+	ClusterPath string
+	Reason      string
+}
+
+func (e GroupClaimFailed) EventType() string { return TypeGroupClaimFailed }
+
+// GroupReelectionRequested fires when the node currently hosting a
+// same-node group dies, when a placement rollback round picks a new
+// node, or when the cluster grows and a previously placement-failed
+// group becomes a candidate for recovery (10.17). The capsule handler
+// emits it; the election manager treats it like a fresh
+// GroupClaimRequested with the failed node + ExcludeNodes added to the
+// election manager's exclude list.
+//
+// FailedNodeID is the node we are recovering FROM on this specific
+// emission (the holder that just died, or the rollback winner that
+// just failed placement). It is empty on a 10.17 NodeJoined-driven
+// recovery, where no single node is the cause — the recovery is
+// triggered by cluster growth.
+//
+// ExcludeNodes is the cumulative set of nodes from prior failed
+// placement rounds for this group. The election manager merges
+// FailedNodeID + ExcludeNodes before computing the eligible set.
+type GroupReelectionRequested struct {
+	BaseEvent
+	GroupID      string
+	ClusterPath  string
+	MemberIDs    []string
+	FailedNodeID string
+	ExcludeNodes []string
+}
+
+func (e GroupReelectionRequested) EventType() string { return TypeGroupReelectionRequested }
+
+// MemberPlacementFailed is emitted by the runtime when a member of a
+// same-node group fails to start beyond its restart_limit (image pull
+// error, container start failure, healthcheck never passes). The
+// group's manager subscribes to this to drive rollback: stop siblings,
+// release capacity reservation, re-elect on a different node.
+type MemberPlacementFailed struct {
+	BaseEvent
+	GroupID     string
+	CapsuleID   string
+	NodeID      string
+	ClusterPath string
+	Reason      string
+}
+
+func (e MemberPlacementFailed) EventType() string { return TypeMemberPlacementFailed }
+
+// PullProgress is emitted periodically by the runtime image-pull layer
+// while a pull is making progress. The election manager uses these
+// heartbeats to extend the capacity-reservation deadline so slow image
+// pulls do not falsely time out and trigger rollback.
+type PullProgress struct {
+	BaseEvent
+	GroupID         string
+	CapsuleID       string
+	NodeID          string
+	ClusterPath     string
+	BytesRemaining  int64
+	BytesPerSecond  int64
+}
+
+func (e PullProgress) EventType() string { return TypePullProgress }

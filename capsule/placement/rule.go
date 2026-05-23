@@ -5,13 +5,14 @@ package placement
 
 import (
 	"github.com/tareksalem/falak/capsule"
+	enums "github.com/tareksalem/falak/capsule/enums"
 )
 
 // Rule is an evaluated placement rule with its parsed constraints.
 type Rule struct {
 	Name     string
-	Type     capsule.PlacementType
-	Mode     capsule.PlacementMode // only for Type=capsule
+	Type     enums.PlacementType
+	Mode     enums.PlacementMode // only for Type=capsule
 	Names    []string
 	Labels   capsule.Labels
 	Required bool
@@ -40,17 +41,17 @@ func FromSpecList(specs []capsule.PlacementRule) []Rule {
 
 // IsCapsuleRule returns true if this rule targets another capsule (affinity/anti-affinity).
 func (r Rule) IsCapsuleRule() bool {
-	return r.Type == capsule.PlacementTypeEnum.Capsule()
+	return r.Type == enums.PlacementTypeEnum.Capsule()
 }
 
 // IsNear returns true if this is a near-affinity capsule rule.
 func (r Rule) IsNear() bool {
-	return r.IsCapsuleRule() && r.Mode == capsule.PlacementModeEnum.Near()
+	return r.IsCapsuleRule() && r.Mode == enums.PlacementModeEnum.Near()
 }
 
 // IsAway returns true if this is an anti-affinity capsule rule.
 func (r Rule) IsAway() bool {
-	return r.IsCapsuleRule() && r.Mode == capsule.PlacementModeEnum.Away()
+	return r.IsCapsuleRule() && r.Mode == enums.PlacementModeEnum.Away()
 }
 
 // SameKeys returns the label keys that use the "same" keyword for comparison.

@@ -46,6 +46,7 @@ type NodeFacade interface {
 // here. Transport layers (gRPC, HTTP, CLI) call Core methods exclusively.
 type Core struct {
 	node      NodeFacade
+	services  ServiceFacade
 	logger    *zap.Logger
 	startedAt time.Time
 
@@ -58,6 +59,20 @@ type Option func(*Core)
 // WithLogger sets the logger.
 func WithLogger(logger *zap.Logger) Option {
 	return func(c *Core) { c.logger = logger }
+}
+
+// WithServices wires the ServiceFacade implementation. Optional — when
+// unset, every Service-* method returns ErrUnavailable so the transport
+// layer can surface "feature disabled on this node" cleanly.
+func WithServices(s ServiceFacade) Option {
+	return func(c *Core) { c.services = s }
+}
+
+// Services returns the wired ServiceFacade, or nil when none was set.
+func (c *Core) Services() ServiceFacade {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.services
 }
 
 // New creates a Core API instance backed by the given node.

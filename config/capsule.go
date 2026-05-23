@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/tareksalem/falak/capsule"
+	"github.com/tareksalem/falak/capsule/enums"
 )
 
 // ToCapsuleSpec converts a declarative CapsuleConfig (loaded from CUE) into
@@ -23,7 +24,7 @@ func (c *CapsuleConfig) ToCapsuleSpec() (capsule.CapsuleSpec, error) {
 		ImageAlias:  c.ImageAlias,
 		ImageDigest: c.ImageDigest,
 		Orbit:       c.Orbit,
-		Tier:        capsule.Tier(c.Tier),
+		Tier:        enums.Tier(c.Tier),
 		Labels:      c.Labels,
 		Command:     c.Command,
 	}
@@ -68,15 +69,15 @@ func (c *CapsuleConfig) ToCapsuleSpec() (capsule.CapsuleSpec, error) {
 				}
 				cooldown = d
 			}
-			trigger := capsule.TriggerMode(rule.Trigger)
+			trigger := enums.TriggerMode(rule.Trigger)
 			if trigger == "" {
-				trigger = capsule.TriggerModeEnum.All()
+				trigger = enums.TriggerModeEnum.All()
 			}
 			spec.ScalingRules = append(spec.ScalingRules, capsule.ScalingRule{
 				Name:       rule.Name,
 				Trigger:    trigger,
 				Conditions: rule.Conditions,
-				Action:     capsule.ScalingAction(rule.Action),
+				Action:     enums.ScalingAction(rule.Action),
 				Cooldown:   cooldown,
 			})
 		}
@@ -89,8 +90,8 @@ func (c *CapsuleConfig) ToCapsuleSpec() (capsule.CapsuleSpec, error) {
 		}
 		spec.PlacementRules = append(spec.PlacementRules, capsule.PlacementRule{
 			Name:     p.Name,
-			Type:     capsule.PlacementType(p.Type),
-			Mode:     capsule.PlacementMode(p.Mode),
+			Type:     enums.PlacementType(p.Type),
+			Mode:     enums.PlacementMode(p.Mode),
 			Names:    p.Targets,
 			Labels:   p.Labels,
 			Required: required,
@@ -102,7 +103,7 @@ func (c *CapsuleConfig) ToCapsuleSpec() (capsule.CapsuleSpec, error) {
 		spec.Runtime.Env = c.Runtime.Env
 
 		if c.Runtime.Network != nil {
-			spec.Runtime.Network.Mode = capsule.NetworkMode(c.Runtime.Network.Mode)
+			spec.Runtime.Network.Mode = enums.NetworkMode(c.Runtime.Network.Mode)
 			for _, p := range c.Runtime.Network.Ports {
 				proto := p.Protocol
 				if proto == "" {
@@ -123,7 +124,7 @@ func (c *CapsuleConfig) ToCapsuleSpec() (capsule.CapsuleSpec, error) {
 			timeout, _ := parseOptionalDuration(hc.Timeout)
 			initialDelay, _ := parseOptionalDuration(hc.InitialDelay)
 			spec.Runtime.HealthCheck = &capsule.HealthCheck{
-				Type:         capsule.HealthCheckType(hc.Type),
+				Type:         enums.HealthCheckType(hc.Type),
 				Path:         hc.Path,
 				Port:         uint16(hc.Port),
 				Interval:     interval,

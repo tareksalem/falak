@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/tareksalem/falak/capsule"
+	"github.com/tareksalem/falak/capsule/enums"
 )
 
 func TestLoadFromString_WithCapsules(t *testing.T) {
@@ -143,9 +144,9 @@ func TestCapsuleConfig_ToCapsuleSpec(t *testing.T) {
 				},
 			},
 			HealthCheck: &HealthCheckCfg{
-				Type: "http",
-				Path: "/health",
-				Port: 8080,
+				Type:     "http",
+				Path:     "/health",
+				Port:     8080,
 				Interval: "10s",
 				Timeout:  "3s",
 			},
@@ -168,7 +169,7 @@ func TestCapsuleConfig_ToCapsuleSpec(t *testing.T) {
 	if spec.Name != "test-api" {
 		t.Errorf("name: got %q", spec.Name)
 	}
-	if spec.Tier != capsule.TierEnum.Critical() {
+	if spec.Tier != enums.TierEnum.Critical() {
 		t.Errorf("tier: got %q", spec.Tier)
 	}
 	if spec.Resources.CPUCores != 4 {

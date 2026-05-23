@@ -34,6 +34,27 @@ test-integration: ## Run integration tests with real environment
 	@echo "🌐 Running integration tests..."
 	@./scripts/dev-env.sh test
 
+test-privileged: ## Run privileged kernel tests (VXLAN + XFRM IPsec). MUST run as root in a Linux env with vxlan/esp4/xfrm_user modules loaded.
+	@echo "🛡️  Running privileged kernel tests..."
+	@if [ "$$(id -u)" != "0" ]; then \
+		echo "ERROR: test-privileged must be run as root. Try: sudo make test-privileged"; \
+		exit 1; \
+	fi
+	@if [ "$$(uname -s)" != "Linux" ]; then \
+		echo "ERROR: test-privileged requires Linux (VXLAN + XFRM are kernel features)."; \
+		exit 1; \
+	fi
+	@modprobe vxlan      || { echo "ERROR: failed to modprobe vxlan"; exit 1; }
+	@modprobe esp4       || { echo "ERROR: failed to modprobe esp4"; exit 1; }
+	@modprobe xfrm_user  || { echo "ERROR: failed to modprobe xfrm_user"; exit 1; }
+	@rp="$$(sysctl -n net.ipv4.conf.all.rp_filter)"; \
+		if [ "$$rp" != "1" ]; then \
+			echo "WARN: net.ipv4.conf.all.rp_filter = $$rp (recommended: 1)"; \
+		fi
+	@source ~/.gvm/scripts/gvm 2>/dev/null && gvm use go1.25 2>/dev/null; \
+		cd network && go test -race -count=1 -timeout=600s ./overlay/...
+	@echo "✅ Privileged tests completed"
+
 test-coverage: ## Run tests with coverage report
 	@echo "📊 Generating test coverage..."
 	@cd internal/node && go test ./tests/ -race -coverprofile=coverage.out -covermode=atomic

@@ -51,6 +51,208 @@ https://github.com/user-attachments/assets/85525925-9802-4fbf-ba72-4aca762eb890
 
 ---
 
+## 🚀 Getting Started
+
+Falak ships as a **single binary** — `falak`. The daemon, CLI, capsule
+management, cluster operations, and Service mesh control all live behind
+subcommands of that one binary.
+
+### Prerequisites
+
+* **Go 1.25.7+** (via `gvm` or system installation)
+* **Linux** for full functionality (kernel VXLAN, IPsec/XFRM, iptables).
+  macOS/Windows work for the in-process / single-node paths but the
+  cross-node overlay is Linux-only.
+* **Podman** if you want capsules to actually run containers. Without
+  Podman the control-plane (capsule create, gossip, election) still
+  works; the runtime layer just retries pulls.
+* **CAP_NET_ADMIN** + kernel modules `vxlan`, `esp4`, `xfrm_user` if
+  you want the cross-node service mesh overlay. The daemon refuses to
+  start without them on Linux (override in dev with config).
+
+### Build
+
+```bash
+# If you use gvm
+source ~/.gvm/scripts/gvm && gvm use go1.25
+
+# From the repo root
+go build -o /tmp/falak ./cmd/falak
+```
+
+That's the only binary you need.
+
+### Run a single node
+
+```bash
+/tmp/falak daemon start \
+    --name=node1 \
+    --port=4001 \
+    --cluster=test/dc1/prod \
+    --psk=mysupersecretkey1234567890123456 \
+    --log-level=info
+```
+
+The first node self-vouches via the PSK and waits for peers. Logs show:
+
+```
+node started        id=12D3KooW... name=node1 addrs=[/ip4/0.0.0.0/tcp/4001]
+cluster joined      cluster=test/dc1/prod
+health monitor started
+```
+
+In another terminal:
+
+```bash
+/tmp/falak daemon status                 # RUNNING (pid …)
+/tmp/falak --insecure node list          # one node, status=Active
+```
+
+Stop with `Ctrl-C` or:
+
+```bash
+/tmp/falak daemon stop
+```
+
+### Run a 3-node cluster
+
+Open three terminals (or use `tmux` / multiple shells):
+
+```bash
+# Terminal 1 — bootstrap node
+/tmp/falak daemon start --name=node1 --port=4001 \
+    --cluster=test/dc1/prod --psk=$PSK --log-level=info
+# Note node1's peer ID from the log line "peer ID: 12D3KooW..."
+# Construct: BOOT=/ip4/127.0.0.1/tcp/4001/p2p/<peer-id>
+
+# Terminal 2 — join via bootstrap
+/tmp/falak daemon start --name=node2 --port=4002 \
+    --cluster=test/dc1/prod --psk=$PSK --bootstrap=$BOOT
+
+# Terminal 3 — third node
+/tmp/falak daemon start --name=node3 --port=4003 \
+    --cluster=test/dc1/prod --psk=$PSK --bootstrap=$BOOT
+```
+
+After ~5 seconds the SWIM mesh forms. Verify:
+
+```bash
+/tmp/falak --insecure node list          # 3 nodes, all Active
+```
+
+### Deploy a capsule
+
+```bash
+cat > /tmp/cap-api.cue <<'EOF'
+capsule: {
+    name:  "api"
+    image: "docker.io/library/nginx:alpine"
+    orbit: "default"
+    runtime: network: ports: [{name: "http", container: 80}]
+    replicas: { exact: 1 }
+}
+EOF
+
+/tmp/falak --insecure capsule create -f /tmp/cap-api.cue
+/tmp/falak --insecure capsule list
+```
+
+The capsule announcement propagates over the orbit gossip topic; nodes
+elect a winner via gravity scoring; the winner's runtime starts the
+container.
+
+### Deploy a CapsuleGroup (related capsules with dependencies)
+
+```bash
+cat > /tmp/grp-stack.cue <<'EOF'
+capsule: {
+    name: "my-stack"
+    kind: "group"
+    group: {
+        colocation: "same-orbit"
+        cascade_delete: true
+        members: {
+            db: {
+                image: "docker.io/library/postgres:15-alpine"
+                orbit: "data"
+                runtime: env: POSTGRES_PASSWORD: "test"
+            }
+            api: {
+                image: "docker.io/library/nginx:alpine"
+                orbit: "public"
+                depends_on: ["db"]
+            }
+        }
+    }
+}
+EOF
+
+/tmp/falak --insecure capsule create -f /tmp/grp-stack.cue
+```
+
+`api` is parked until `db` reports Running.
+
+### Define a Service (traffic splitting + canary)
+
+```bash
+cat > /tmp/svc.cue <<'EOF'
+services: payments: {
+    name: "payments"
+    visibility: "cluster"
+    ports: [{ name: "http", port: 8080, protocol: "tcp" }]
+    backends: [
+        { capsule: "payments-v1", weight: 90 },
+        { capsule: "payments-v2", weight: 10 },
+    ]
+}
+EOF
+
+/tmp/falak --insecure service apply -f /tmp/svc.cue
+/tmp/falak --insecure service list
+```
+
+Apps in cluster capsules connect to `payments:8080` over plain DNS —
+the per-node proxy handles SWRR backend selection. Canary, blue-green,
+and identity-bound rebind flows are supported (`falak service rebind …`).
+
+### Full subcommand surface
+
+```bash
+/tmp/falak --help
+```
+
+| Group | Examples |
+|-------|----------|
+| Daemon | `falak daemon start \| stop \| status` |
+| Capsules | `falak capsule create \| get \| list \| delete \| logs \| watch` |
+| Cluster | `falak cluster join \| leave \| list \| members` |
+| Nodes | `falak node list \| get \| health` |
+| Services | `falak service create \| get \| list \| delete \| apply \| rebind \| watch` |
+| System | `falak system info \| version` |
+| Config | `falak config use-context \| list-contexts \| set-context` |
+
+### Deeper testing
+
+For a layered manual verification of every subsystem (single node →
+SWIM → capsules → groups → service mesh), see
+[`docs/MANUAL_TESTING.md`](docs/MANUAL_TESTING.md). That guide walks
+through 7 layers, each building on the previous, with the log lines
+you should see at each step.
+
+### Privileged tests
+
+The kernel-level VXLAN + IPsec tests require root and Linux kernel
+modules. To run them locally:
+
+```bash
+sudo make test-privileged
+```
+
+This sets up the modules, asserts `rp_filter=1`, and runs the overlay
+tests under `-race`.
+
+---
+
 ## 🔄 Detailed Workflow
 
 ### 🔍 1. **Capsule Discovery & Sync**

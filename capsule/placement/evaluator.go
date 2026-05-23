@@ -2,15 +2,16 @@ package placement
 
 import (
 	"github.com/tareksalem/falak/capsule"
+	enums "github.com/tareksalem/falak/capsule/enums"
 )
 
 // Result holds the evaluation outcome for a single node against all placement rules.
 type Result struct {
-	NodeName       string
-	Eligible       bool    // true if all hard rules pass
-	Score          float64 // soft rules contribute to score (higher = better fit)
-	FailedRules    []string
-	MatchedSoft    []string
+	NodeName    string
+	Eligible    bool    // true if all hard rules pass
+	Score       float64 // soft rules contribute to score (higher = better fit)
+	FailedRules []string
+	MatchedSoft []string
 }
 
 // Evaluator evaluates placement rules against the current mesh state.
@@ -89,13 +90,13 @@ func (e *Evaluator) EligibleNodes(rules []Rule) []Result {
 
 func (e *Evaluator) evaluateRule(node Entity, rule Rule) bool {
 	switch rule.Type {
-	case capsule.PlacementTypeEnum.Node():
+	case enums.PlacementTypeEnum.Node():
 		return e.evaluateDirectRule(node, rule)
-	case capsule.PlacementTypeEnum.Cluster():
+	case enums.PlacementTypeEnum.Cluster():
 		return e.evaluateClusterRule(node, rule)
-	case capsule.PlacementTypeEnum.Datacenter():
+	case enums.PlacementTypeEnum.Datacenter():
 		return e.evaluateDatacenterRule(node, rule)
-	case capsule.PlacementTypeEnum.Capsule():
+	case enums.PlacementTypeEnum.Capsule():
 		return e.evaluateCapsuleRule(node, rule)
 	default:
 		return false

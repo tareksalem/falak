@@ -4,27 +4,29 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	enums "github.com/tareksalem/falak/capsule/enums"
 )
 
 // Validation errors.
 var (
-	ErrNameRequired       = errors.New("capsule name is required")
-	ErrImageRequired      = errors.New("capsule image is required")
-	ErrOrbitRequired      = errors.New("capsule orbit is required")
-	ErrInvalidTier        = errors.New("invalid tier: must be critical, standard, or background")
-	ErrInvalidCPU         = errors.New("CPU cores must be positive")
-	ErrInvalidMemory      = errors.New("memory must be positive")
-	ErrInvalidDisk        = errors.New("disk must be positive")
-	ErrInvalidReplicas    = errors.New("invalid replica config: min must be <= max, and both positive")
+	ErrNameRequired         = errors.New("capsule name is required")
+	ErrImageRequired        = errors.New("capsule image is required")
+	ErrOrbitRequired        = errors.New("capsule orbit is required")
+	ErrInvalidTier          = errors.New("invalid tier: must be critical, standard, or background")
+	ErrInvalidCPU           = errors.New("CPU cores must be positive")
+	ErrInvalidMemory        = errors.New("memory must be positive")
+	ErrInvalidDisk          = errors.New("disk must be positive")
+	ErrInvalidReplicas      = errors.New("invalid replica config: min must be <= max, and both positive")
 	ErrInvalidExactReplicas = errors.New("exact replicas must be positive")
-	ErrReplicaConflict    = errors.New("cannot set both exact and min/max replicas")
+	ErrReplicaConflict      = errors.New("cannot set both exact and min/max replicas")
 )
 
 // DefaultSpec applies default values to a CapsuleSpec.
 // Call this before Validate to fill in missing fields.
 func DefaultSpec(spec *CapsuleSpec) {
 	if spec.Tier == "" {
-		spec.Tier = TierEnum.Standard()
+		spec.Tier = enums.TierEnum.Standard()
 	}
 
 	if spec.Labels == nil {
@@ -57,7 +59,7 @@ func DefaultSpec(spec *CapsuleSpec) {
 		spec.Runtime.Env = make(map[string]string)
 	}
 	if spec.Runtime.Network.Mode == "" {
-		spec.Runtime.Network.Mode = NetworkModeEnum.Bridge()
+		spec.Runtime.Network.Mode = enums.NetworkModeEnum.Bridge()
 	}
 	if spec.Runtime.StatsInterval == 0 {
 		spec.Runtime.StatsInterval = 5 * time.Second
@@ -124,7 +126,7 @@ func defaultPlacementRule(rule *PlacementRule) {
 
 func defaultScalingRule(rule *ScalingRule) {
 	if rule.Trigger == "" {
-		rule.Trigger = TriggerModeEnum.All()
+		rule.Trigger = enums.TriggerModeEnum.All()
 	}
 	if rule.Cooldown == 0 {
 		rule.Cooldown = 60 * time.Second
@@ -205,7 +207,7 @@ func validatePlacementRule(rule PlacementRule, index int) error {
 	}
 
 	// Mode is only valid for capsule type
-	if rule.Type == PlacementTypeEnum.Capsule() {
+	if rule.Type == enums.PlacementTypeEnum.Capsule() {
 		if !rule.Mode.Valid() {
 			return fmt.Errorf("placement rule %d: capsule type requires mode (near or away)", index)
 		}
@@ -221,7 +223,7 @@ func validatePlacementRule(rule PlacementRule, index int) error {
 	}
 
 	// For capsule type with near/away, labels should use "same" keyword
-	if rule.Type == PlacementTypeEnum.Capsule() {
+	if rule.Type == enums.PlacementTypeEnum.Capsule() {
 		for key, val := range rule.Labels {
 			if val != SameKeyword {
 				return fmt.Errorf("placement rule %d: capsule affinity label %q must use %q keyword, got %q", index, key, SameKeyword, val)

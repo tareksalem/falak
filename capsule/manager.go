@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	enums "github.com/tareksalem/falak/capsule/enums"
 	"go.uber.org/zap"
 )
 
@@ -14,25 +15,40 @@ import (
 var ErrNotFound = errors.New("capsule not found")
 
 // ManagerEvent is emitted by the capsule manager on lifecycle actions.
+//
+// Meta carries optional contextual fields that some event types need but
+// that don't fit on the Capsule snapshot itself. For example,
+// EventCapsuleGroupReleased uses Meta["previous_group_id"] to expose the
+// group ID a detached member used to belong to (the Capsule.Spec.GroupID
+// has already been cleared at emit time). Meta is nil by default; only
+// emitters that have side-band context populate it.
 type ManagerEvent struct {
 	Type      string
 	CapsuleID CapsuleID
 	Capsule   *Capsule
 	Timestamp time.Time
+	Meta      map[string]string
 }
 
 // Manager event types.
 const (
-	EventCapsuleCreated       = "capsule.created"
-	EventCapsuleUpdated       = "capsule.updated"
-	EventCapsuleDeleted       = "capsule.deleted"
-	EventCapsuleReceived      = "capsule.received"
-	EventCapsuleAnnounced     = "capsule.announced"
-	EventCapsuleRunning       = "capsule.running"
-	EventCapsuleStopping      = "capsule.stopping"
-	EventCapsuleStopped       = "capsule.stopped"
-	EventCapsuleStatusChanged = "capsule.status_changed"
+	EventCapsuleCreated        = "capsule.created"
+	EventCapsuleUpdated        = "capsule.updated"
+	EventCapsuleDeleted        = "capsule.deleted"
+	EventCapsuleReceived       = "capsule.received"
+	EventCapsuleAnnounced      = "capsule.announced"
+	EventCapsuleRunning        = "capsule.running"
+	EventCapsuleStopping       = "capsule.stopping"
+	EventCapsuleStopped        = "capsule.stopped"
+	EventCapsuleStatusChanged  = "capsule.status_changed"
+	EventCapsuleGroupReleased  = "capsule.group_released"
 )
+
+// MetaPreviousGroupID is the ManagerEvent.Meta key carrying the previous
+// group ID for EventCapsuleGroupReleased. It is set on the side-band path
+// because by the time the event fires the capsule's own Spec.GroupID has
+// been cleared as part of the non-cascade group delete contract.
+const MetaPreviousGroupID = "previous_group_id"
 
 // EventHandler is called when a manager event occurs.
 type EventHandler func(event ManagerEvent)
@@ -112,7 +128,7 @@ func NewManager(opts ...ManagerOption) *Manager {
 }
 
 // newLifecycle constructs a Lifecycle wired to emit via the manager's event bus.
-func (m *Manager) newLifecycle(id CapsuleID, initial CapsuleStatus) *Lifecycle {
+func (m *Manager) newLifecycle(id CapsuleID, initial enums.CapsuleStatus) *Lifecycle {
 	return NewLifecycle(id,
 		WithLifecycleLogger(m.logger.Named("lifecycle")),
 		WithLifecycleInitialState(initial),
@@ -133,9 +149,14 @@ func (m *Manager) onLifecycleTransition(event LifecycleEvent) {
 	m.mu.Lock()
 	c.Status = event.To
 	c.UpdatedAt = time.Now()
+	// Hold the manager mutex across the store Update so the inner
+	// UpdatedAt write does not race with concurrent Manager.Get
+	// snapshot reads. The store has its own mutex; both together
+	// serialise the field write against Get's read-side copy.
+	updateErr := m.store.Update(c)
 	m.mu.Unlock()
 
-	if err := m.store.Update(c); err != nil {
+	if err := updateErr; err != nil {
 		m.logger.Error("failed to persist lifecycle transition",
 			zap.String("capsule_id", string(event.CapsuleID)),
 			zap.String("cluster", c.ClusterID),
@@ -158,15 +179,15 @@ func (m *Manager) onLifecycleTransition(event LifecycleEvent) {
 }
 
 // statusEventType maps a CapsuleStatus to the corresponding ManagerEvent type.
-func statusEventType(status CapsuleStatus) string {
+func statusEventType(status enums.CapsuleStatus) string {
 	switch status {
-	case CapsuleStatusEnum.Announced():
+	case enums.CapsuleStatusEnum.Announced():
 		return EventCapsuleAnnounced
-	case CapsuleStatusEnum.Running():
+	case enums.CapsuleStatusEnum.Running():
 		return EventCapsuleRunning
-	case CapsuleStatusEnum.Stopping():
+	case enums.CapsuleStatusEnum.Stopping():
 		return EventCapsuleStopping
-	case CapsuleStatusEnum.Stopped():
+	case enums.CapsuleStatusEnum.Stopped():
 		return EventCapsuleStopped
 	default:
 		return EventCapsuleStatusChanged
@@ -182,6 +203,14 @@ func (m *Manager) Create(_ context.Context, clusterID string, spec CapsuleSpec) 
 		return nil, fmt.Errorf("clusterID is required")
 	}
 
+	// Group capsules must be admitted via CreateGroup (task 10.6) so the
+	// member materialization, GroupID linking, and per-kind status
+	// transitions are all handled in one place. Standalone Create rejects
+	// group kind explicitly rather than silently mishandling it.
+	if spec.Kind == CapsuleKindEnum.Group() {
+		return nil, errors.New("group capsules must be created via CreateGroup (task 10.6)")
+	}
+
 	// Apply defaults
 	DefaultSpec(&spec)
 
@@ -195,7 +224,7 @@ func (m *Manager) Create(_ context.Context, clusterID string, spec CapsuleSpec) 
 		ID:        NewCapsuleID(),
 		ClusterID: clusterID,
 		Spec:      spec,
-		Status:    CapsuleStatusEnum.Created(),
+		Status:    enums.CapsuleStatusEnum.Created(),
 		Replicas:  nil,
 		Momentum: MomentumState{
 			Current:      spec.MomentumConfig.Base,
@@ -213,7 +242,7 @@ func (m *Manager) Create(_ context.Context, clusterID string, spec CapsuleSpec) 
 
 	// Install a fresh lifecycle starting at Created.
 	m.lifecyclesMu.Lock()
-	m.lifecycles[c.ID] = m.newLifecycle(c.ID, CapsuleStatusEnum.Created())
+	m.lifecycles[c.ID] = m.newLifecycle(c.ID, enums.CapsuleStatusEnum.Created())
 	m.lifecyclesMu.Unlock()
 
 	m.logger.Info("capsule created",
@@ -224,25 +253,58 @@ func (m *Manager) Create(_ context.Context, clusterID string, spec CapsuleSpec) 
 		zap.String("tier", string(spec.Tier)))
 
 	m.metrics.IncCreated(clusterID)
-	m.emit(EventCapsuleCreated, c)
 
-	// Immediately advance the lifecycle to Announced. The originator
-	// always announces the capsule on creation; remote nodes that
-	// receive the capsule via gossip start their lifecycle at the
-	// already-Announced state mirrored from the originator. This makes
-	// the subsequent StartElection transition (Announced → Electing)
-	// always valid on every node.
+	// Advance the lifecycle to Announced BEFORE emitting EventCapsuleCreated.
+	// Subscribers of EventCapsuleCreated (the node-level CapsuleHandler)
+	// synchronously announce the capsule onto the orbit AND publish initial
+	// election requests. Both must observe the capsule already at status
+	// Announced:
+	//
+	//   - The orbit announcement carries c.Status to peers; if it leaves at
+	//     Created, every receiver installs its lifecycle at Created and the
+	//     downstream StartElection (Announced → Electing) is rejected.
+	//   - The originator's election handler invokes StartElection on the
+	//     local lifecycle as soon as it dispatches the request; that
+	//     transition is only valid from Announced.
+	//
+	// Running Announce first guarantees both invariants on every node.
 	if err := m.Announce(c.ID); err != nil {
 		m.logger.Warn("auto-announce after create failed",
 			zap.String("id", c.ID.String()),
 			zap.Error(err))
 	}
+
+	m.emit(EventCapsuleCreated, c)
 	return c, nil
 }
 
 // Get retrieves a capsule by ID.
+//
+// The returned *Capsule is a snapshot: the struct itself is freshly
+// allocated and the Replicas slice is copied. Callers may iterate and
+// read fields without coordinating with the manager's mutex. Internal
+// callers that need to MUTATE the live capsule (e.g. AssignReplica,
+// SyncStatus) go through m.store.Get directly under m.mu, never through
+// this method.
+//
+// The snapshot is taken under m.mu.RLock so concurrent writers
+// (AssignReplica, SyncStatus, Update) that hold m.mu.Lock cannot
+// interleave with the slice copy — closing a data race that would
+// otherwise be observable when callers iterate c.Replicas while a
+// replica is being assigned.
 func (m *Manager) Get(id CapsuleID) *Capsule {
-	return m.store.Get(id)
+	c := m.store.Get(id)
+	if c == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	snapshot := *c
+	if len(c.Replicas) > 0 {
+		snapshot.Replicas = make([]ReplicaState, len(c.Replicas))
+		copy(snapshot.Replicas, c.Replicas)
+	}
+	return &snapshot
 }
 
 // GetByName retrieves a capsule by name.
@@ -250,9 +312,56 @@ func (m *Manager) GetByName(name string) *Capsule {
 	return m.store.GetByName(name)
 }
 
-// List returns all capsules.
-func (m *Manager) List() []*Capsule {
+// ListLive returns all capsules with the LIVE pointer semantics: each
+// returned *Capsule references the corresponding store entry directly.
+//
+// CAUTION: callers MUST NOT mutate the returned entries or read mutable
+// fields (most importantly Replicas, which is rewritten by AssignReplica /
+// SyncStatus) outside the manager mutex. The Spec is immutable post-create
+// so reading c.Spec.* is always safe.
+//
+// In practice most callers want ListSnapshot, which copies the Replicas
+// backing array under the manager's RLock and is safe for concurrent
+// iteration. ListLive exists for hot paths (e.g. the per-node-failure scan
+// in the capsule handler) that only consult immutable Spec fields.
+func (m *Manager) ListLive() []*Capsule {
 	return m.store.List()
+}
+
+// List is a deprecated alias for ListLive retained for one release so
+// downstream call sites can migrate. New code MUST call ListLive or
+// ListSnapshot explicitly so the live-pointer semantics are visible at
+// the call site (audit minor #7).
+//
+// Deprecated: use ListLive when the caller only reads immutable Spec
+// fields, or ListSnapshot when the caller iterates Replicas.
+func (m *Manager) List() []*Capsule {
+	return m.ListLive()
+}
+
+// ListSnapshot returns deep-copied capsule snapshots safe for concurrent
+// readers. Each entry's Replicas slice is freshly allocated under
+// m.mu.RLock so concurrent writers (AssignReplica, SyncStatus) that hold
+// m.mu.Lock cannot interleave with the copy. Callers that iterate
+// c.Replicas across all capsules (e.g. gravity self-anti-affinity lookups)
+// MUST use this method instead of List() to stay race-free under -race.
+func (m *Manager) ListSnapshot() []*Capsule {
+	live := m.store.List()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Capsule, 0, len(live))
+	for _, c := range live {
+		if c == nil {
+			continue
+		}
+		snap := *c
+		if len(c.Replicas) > 0 {
+			snap.Replicas = make([]ReplicaState, len(c.Replicas))
+			copy(snap.Replicas, c.Replicas)
+		}
+		out = append(out, &snap)
+	}
+	return out
 }
 
 // ListByOrbit returns capsules in a specific orbit.
@@ -298,10 +407,24 @@ func (m *Manager) Update(_ context.Context, id CapsuleID, spec CapsuleSpec) (*Ca
 }
 
 // Delete removes a capsule and emits CapsuleDeleted.
-func (m *Manager) Delete(_ context.Context, id CapsuleID) error {
+//
+// Delete is idempotent in the sense reapers depend on: when no capsule with
+// the given id exists, ErrNotFound is returned (not a wrapped fmt error) so
+// callers in cascade/teardown paths can match it via errors.Is and treat it
+// as success.
+//
+// When the capsule's Kind is Group, Delete dispatches to deleteGroup which
+// either cascades to every member (CascadeDelete=true) or detaches members
+// from the group (CascadeDelete=false). Standalone capsules follow the
+// existing path: store delete, lifecycle drop, EventCapsuleDeleted.
+func (m *Manager) Delete(ctx context.Context, id CapsuleID) error {
 	c := m.store.Get(id)
 	if c == nil {
-		return fmt.Errorf("capsule %s not found", id)
+		return ErrNotFound
+	}
+
+	if c.Spec.Kind == CapsuleKindEnum.Group() {
+		return m.deleteGroup(ctx, c)
 	}
 
 	if err := m.store.Delete(id); err != nil {
@@ -343,7 +466,7 @@ func (m *Manager) Receive(c *Capsule) error {
 		// Install a fresh lifecycle at the received capsule's current status.
 		initial := c.Status
 		if !initial.Valid() {
-			initial = CapsuleStatusEnum.Announced()
+			initial = enums.CapsuleStatusEnum.Announced()
 		}
 		m.lifecyclesMu.Lock()
 		m.lifecycles[c.ID] = m.newLifecycle(c.ID, initial)
@@ -365,10 +488,36 @@ func (m *Manager) Receive(c *Capsule) error {
 // to change a capsule's status — the state machine validates the transition
 // and rejects illegal moves. On success the store is updated and a
 // ManagerEvent is emitted corresponding to the new status.
+//
+// Fire enforces per-kind gating on triggers. The underlying FSM is uniform
+// across kinds (so it stays small and easy to reason about), and this method
+// is the seam that rejects triggers that are valid for one kind but not the
+// other:
+//
+//   - Group capsules reject all election/execution/scaling triggers.
+//     Group lifecycle is admission-driven, not election-driven.
+//   - Non-group capsules reject TriggerMembersAdmitted. That trigger is
+//     only meaningful for groups.
 func (m *Manager) Fire(id CapsuleID, trigger string) error {
 	lc := m.getLifecycle(id)
 	if lc == nil {
 		return fmt.Errorf("capsule %s not found", id)
+	}
+	c := m.store.Get(id)
+	if c == nil {
+		return fmt.Errorf("capsule %s not found", id)
+	}
+	if c.Spec.Kind == CapsuleKindEnum.Group() {
+		switch trigger {
+		case TriggerElectionStarted, TriggerElectionWon, TriggerElectionTimeout,
+			TriggerExecutionStart, TriggerContainerReady, TriggerNodeFailed,
+			TriggerScaleUpNeeded, TriggerScaleDownNeeded:
+			return fmt.Errorf("trigger %q not valid for group capsules", trigger)
+		}
+	} else {
+		if trigger == TriggerMembersAdmitted {
+			return fmt.Errorf("trigger %q only valid for group capsules", trigger)
+		}
 	}
 	if err := lc.Fire(trigger); err != nil {
 		return fmt.Errorf("capsule %s: %w", id, err)
@@ -377,7 +526,7 @@ func (m *Manager) Fire(id CapsuleID, trigger string) error {
 }
 
 // Status returns the current lifecycle state for a capsule.
-func (m *Manager) Status(id CapsuleID) (CapsuleStatus, error) {
+func (m *Manager) Status(id CapsuleID) (enums.CapsuleStatus, error) {
 	lc := m.getLifecycle(id)
 	if lc == nil {
 		return "", fmt.Errorf("capsule %s not found", id)
@@ -413,6 +562,16 @@ func (m *Manager) StartExecution(id CapsuleID) error {
 // MarkRunning transitions Executing → Running after the container is ready.
 func (m *Manager) MarkRunning(id CapsuleID) error {
 	return m.Fire(id, TriggerContainerReady)
+}
+
+// MarkGroupRunning transitions a group capsule from Announced to Running by
+// firing TriggerMembersAdmitted. This is the group-only analogue of
+// MarkRunning — group lifecycle is admission-driven, not election-driven, so
+// a group goes Created → Announced → Running once every member has been
+// materialized and persisted. Calling this on a non-group capsule returns an
+// error from Fire.
+func (m *Manager) MarkGroupRunning(id CapsuleID) error {
+	return m.Fire(id, TriggerMembersAdmitted)
 }
 
 // ExecutionFailed transitions Assigned/Executing → Announced for re-election.
@@ -472,7 +631,7 @@ func (m *Manager) AssignReplica(id CapsuleID, replicaID ReplicaID, nodeID string
 	for i, r := range c.Replicas {
 		if r.ReplicaID == replicaID {
 			c.Replicas[i].NodeID = nodeID
-			c.Replicas[i].Status = CapsuleStatusEnum.Assigned()
+			c.Replicas[i].Status = enums.CapsuleStatusEnum.Assigned()
 			c.Replicas[i].StartedAt = time.Now()
 			found = true
 			break
@@ -482,14 +641,20 @@ func (m *Manager) AssignReplica(id CapsuleID, replicaID ReplicaID, nodeID string
 		c.Replicas = append(c.Replicas, ReplicaState{
 			ReplicaID: replicaID,
 			NodeID:    nodeID,
-			Status:    CapsuleStatusEnum.Assigned(),
+			Status:    enums.CapsuleStatusEnum.Assigned(),
 			StartedAt: time.Now(),
 		})
 	}
 	c.UpdatedAt = time.Now()
+	// Hold the manager mutex across the store Update so the store's
+	// internal write of capsule.UpdatedAt (line 270 of store.go) does
+	// not race with concurrent readers calling Manager.Get (which
+	// snapshot-copies *c under m.mu.RLock). The store also serialises
+	// the write on its own mutex; both locks together close the prior
+	// race surfaced once same-node group placement was wired.
+	err := m.store.Update(c)
 	m.mu.Unlock()
-
-	if err := m.store.Update(c); err != nil {
+	if err != nil {
 		return fmt.Errorf("failed to persist replica assignment: %w", err)
 	}
 
@@ -505,7 +670,7 @@ func (m *Manager) AssignReplica(id CapsuleID, replicaID ReplicaID, nodeID string
 // only when mirroring state from another node's PubSub announcement.
 // The local lifecycle machine is rebuilt at the new state so future local
 // transitions proceed correctly from there.
-func (m *Manager) SyncStatus(id CapsuleID, status CapsuleStatus) error {
+func (m *Manager) SyncStatus(id CapsuleID, status enums.CapsuleStatus) error {
 	if !status.Valid() {
 		return fmt.Errorf("invalid status %q", status)
 	}
@@ -519,9 +684,12 @@ func (m *Manager) SyncStatus(id CapsuleID, status CapsuleStatus) error {
 	previous := c.Status
 	c.Status = status
 	c.UpdatedAt = time.Now()
+	// Hold the manager mutex across the store Update so the store's
+	// internal UpdatedAt write does not race with concurrent
+	// Manager.Get snapshot reads.
+	err := m.store.Update(c)
 	m.mu.Unlock()
-
-	if err := m.store.Update(c); err != nil {
+	if err != nil {
 		return fmt.Errorf("failed to persist synced status: %w", err)
 	}
 
@@ -566,5 +734,21 @@ func (m *Manager) emit(eventType string, c *Capsule) {
 		CapsuleID: c.ID,
 		Capsule:   c,
 		Timestamp: time.Now(),
+	})
+}
+
+// emitWithMeta emits a manager event with side-band metadata. Used by
+// flows that need to expose context that isn't on the capsule snapshot
+// itself — e.g. the previous group ID for EventCapsuleGroupReleased.
+func (m *Manager) emitWithMeta(eventType string, c *Capsule, meta map[string]string) {
+	m.handlerMu.RLock()
+	h := m.handler
+	m.handlerMu.RUnlock()
+	h(ManagerEvent{
+		Type:      eventType,
+		CapsuleID: c.ID,
+		Capsule:   c,
+		Timestamp: time.Now(),
+		Meta:      meta,
 	})
 }

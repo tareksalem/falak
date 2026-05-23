@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package falak.service;
+
+option go_package = "github.com/tareksalem/falak/service/proto/servicepb";
+
+import "google/protobuf/timestamp.proto";
+
+// Service is the gossip-wire representation of a Falak Service.
+// Mirrors service.Service in service/service.go.
+message Service {
+  string id = 1;
+  string cluster_id = 2;
+  ServiceSpec spec = 3;
+  string status = 4;
+  string version = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+  repeated BackendState backend_states = 8;
+}
+
+// ServiceSpec mirrors service.ServiceSpec.
+message ServiceSpec {
+  string name = 1;
+  string visibility = 2;
+  string group = 3;
+  repeated ServicePort ports = 4;
+  repeated ServiceBackend backends = 5;
+  Strategy strategy = 6;
+  ServiceTimeouts timeouts = 7;
+}
+
+// ServicePort mirrors service.ServicePort.
+message ServicePort {
+  string name = 1;
+  uint32 port = 2;
+  string protocol = 3;
+}
+
+// ServiceBackend mirrors service.ServiceBackend.
+message ServiceBackend {
+  string capsule = 1;
+  string captured_capsule_id = 2;
+  map<string, string> port_map = 3;
+  int32 weight = 4;
+}
+
+// Strategy mirrors service.Strategy.
+message Strategy {
+  string type = 1;
+  CanaryStrategy canary = 2;
+  BlueGreenStrategy blue_green = 3;
+}
+
+// CanaryStrategy mirrors service.CanaryStrategy. Interval is seconds.
+message CanaryStrategy {
+  string target = 1;
+  string from = 2;
+  int32 step = 3;
+  int32 interval_seconds = 4;
+  repeated string success_criteria = 5;
+  repeated string abort_on = 6;
+}
+
+// BlueGreenStrategy mirrors service.BlueGreenStrategy. Drain is seconds.
+message BlueGreenStrategy {
+  string active = 1;
+  int32 drain_seconds = 2;
+}
+
+// ServiceTimeouts mirrors service.ServiceTimeouts. Values are seconds.
+message ServiceTimeouts {
+  int32 idle_seconds = 1;
+  int32 connect_seconds = 2;
+}
+
+// BackendState mirrors service.BackendState. The "name" field is the
+// backend's capsule name (matching ServiceBackend.capsule).
+message BackendState {
+  string name = 1;
+  string resolution = 2;
+  string captured_capsule_id = 3;
+  google.protobuf.Timestamp last_resolved_at = 4;
+}
+
+// ServiceUpdate is the gossip payload announcing a Service create/update.
+message ServiceUpdate {
+  Service service = 1;
+  string sender_node_id = 2;
+}
+
+// ServiceWithdrawal is the gossip payload announcing a Service deletion.
+message ServiceWithdrawal {
+  string service_id = 1;
+  string sender_node_id = 2;
+}
+
+// Envelope is the signed wrapper for every Service-gossip message.
+// type is "update" or "withdrawal"; payload is the marshaled inner
+// message. Signature covers a canonical length-prefixed concatenation
+// of (type, payload, sender_id, timestamp).
+message Envelope {
+  string type = 1;
+  bytes payload = 2;
+  string sender_id = 3;
+  google.protobuf.Timestamp timestamp = 4;
+  bytes signature = 5;
+}

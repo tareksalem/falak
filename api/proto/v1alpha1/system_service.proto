@@ -5,10 +5,19 @@ package falak.api.v1alpha1;
 option go_package = "github.com/tareksalem/falak/api/proto/v1alpha1pb";
 
 import "api/proto/v1alpha1/common.proto";
+import "google/api/annotations.proto";
 
 service SystemService {
-    rpc Info(SystemInfoRequest) returns (SystemInfo);
-    rpc Version(VersionRequest) returns (VersionResponse);
+    rpc Info(SystemInfoRequest) returns (SystemInfo) {
+        option (google.api.http) = {
+            get: "/v1alpha1/system/info"
+        };
+    }
+    rpc Version(VersionRequest) returns (VersionResponse) {
+        option (google.api.http) = {
+            get: "/v1alpha1/system/version"
+        };
+    }
 }
 
 message SystemInfoRequest {}

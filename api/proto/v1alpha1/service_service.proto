@@ -1,0 +1,195 @@
+syntax = "proto3";
+
+package falak.api.v1alpha1;
+
+option go_package = "github.com/tareksalem/falak/api/proto/v1alpha1pb";
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "google/api/annotations.proto";
+import "api/proto/v1alpha1/common.proto";
+
+// ServiceService manages Falak Service entities — logical names with
+// weighted backends and traffic-management strategies. Decoupled from
+// any single capsule; deleting a Service stops routing only.
+service ServiceService {
+    // Create admits a new Service. Backends are resolved leniently —
+    // unknown backend capsules are accepted and bound when they appear.
+    rpc Create(CreateServiceRequest) returns (ServiceResource) {
+        option (google.api.http) = {
+            post: "/v1alpha1/services"
+            body: "*"
+        };
+    }
+
+    // Get returns a Service by name.
+    rpc Get(GetServiceRequest) returns (ServiceResource) {
+        option (google.api.http) = {
+            get: "/v1alpha1/services/{name}"
+        };
+    }
+
+    // List returns every Service known to this node.
+    rpc List(ListServicesRequest) returns (ListServicesResponse) {
+        option (google.api.http) = {
+            get: "/v1alpha1/services"
+        };
+    }
+
+    // Update replaces the spec on an existing Service. Captured backend
+    // IDs are preserved when a backend stays in the new spec.
+    rpc Update(UpdateServiceRequest) returns (ServiceResource) {
+        option (google.api.http) = {
+            put: "/v1alpha1/services/{name}"
+            body: "*"
+        };
+    }
+
+    // Delete removes a Service. Capsules referenced by the Service are
+    // never touched — only routing stops.
+    rpc Delete(DeleteServiceRequest) returns (google.protobuf.Empty) {
+        option (google.api.http) = {
+            delete: "/v1alpha1/services/{name}"
+        };
+    }
+
+    // Apply is the declarative upsert: create when absent, update otherwise.
+    rpc Apply(ApplyServiceRequest) returns (ServiceResource) {
+        option (google.api.http) = {
+            post: "/v1alpha1/services:apply"
+            body: "*"
+        };
+    }
+
+    // RebindBackend clears the captured capsule ID on a backend so the
+    // current capsule with that name binds on the next resolve pass.
+    // Used after a delete+recreate of a backend capsule.
+    rpc RebindBackend(RebindServiceBackendRequest) returns (ServiceResource) {
+        option (google.api.http) = {
+            post: "/v1alpha1/services/{name}/rebind/{backend}"
+            body: "*"
+        };
+    }
+
+    // Watch streams Service lifecycle events.
+    rpc Watch(WatchServicesRequest) returns (stream WatchEvent);
+}
+
+// --- Messages ------------------------------------------------------------
+
+message ServiceResource {
+    ObjectMeta meta = 1;
+    ServiceSpec spec = 2;
+    ServiceStatus status = 3;
+}
+
+message ServiceSpec {
+    // visibility is "group" or "cluster" (default cluster). external is reserved.
+    string visibility = 1;
+    string group = 2;
+    repeated ServicePort ports = 3;
+    repeated ServiceBackend backends = 4;
+    Strategy strategy = 5;
+    ServiceTimeouts timeouts = 6;
+}
+
+message ServicePort {
+    string name = 1;
+    uint32 port = 2;
+    string protocol = 3; // "tcp" or "udp"
+}
+
+message ServiceBackend {
+    string capsule = 1;
+    string captured_capsule_id = 2;
+    map<string, string> port_map = 3;
+    int32 weight = 4;
+}
+
+message Strategy {
+    string type = 1; // "static" | "canary" | "blue-green"
+    CanaryStrategy canary = 2;
+    BlueGreenStrategy blue_green = 3;
+}
+
+message CanaryStrategy {
+    string target = 1;
+    string from = 2;
+    int32 step = 3;
+    int64 interval_ms = 4;
+    repeated string success_criteria = 5;
+    repeated string abort_on = 6;
+}
+
+message BlueGreenStrategy {
+    string active = 1;
+    int64 drain_ms = 2;
+}
+
+message ServiceTimeouts {
+    int64 idle_ms = 1;
+    int64 connect_ms = 2;
+}
+
+message ServiceStatus {
+    string status = 1; // created|active|draining|deleted|canary_aborted|placement_failed
+    string version = 2;
+    repeated BackendState backend_states = 3;
+}
+
+message BackendState {
+    string backend = 1;
+    string resolution = 2; // resolved|unresolved|unresolved_capsule_deleted|unresolved_identity_changed
+    string captured_capsule_id = 3;
+    google.protobuf.Timestamp last_resolved_at = 4;
+}
+
+message CreateServiceRequest {
+    string cluster = 1;
+    ServiceSpec spec = 2;
+    string name = 3; // logical Service name; promoted out of spec to match CLI ergonomics.
+}
+
+message GetServiceRequest {
+    string name = 1;
+    string cluster = 2;
+}
+
+message ListServicesRequest {
+    string cluster = 1;
+    string visibility = 2;
+    string group = 3;
+    Pagination pagination = 4;
+}
+
+message ListServicesResponse {
+    repeated ServiceResource services = 1;
+    PagedResult paging = 2;
+}
+
+message UpdateServiceRequest {
+    string name = 1;
+    string cluster = 2;
+    ServiceSpec spec = 3;
+}
+
+message DeleteServiceRequest {
+    string name = 1;
+    string cluster = 2;
+}
+
+message ApplyServiceRequest {
+    string cluster = 1;
+    string name = 2;
+    ServiceSpec spec = 3;
+}
+
+message RebindServiceBackendRequest {
+    string name = 1;
+    string backend = 2;
+    string cluster = 3;
+}
+
+message WatchServicesRequest {
+    string cluster = 1;
+}

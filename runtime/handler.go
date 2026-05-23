@@ -48,6 +48,15 @@ type CapsuleSpec struct {
 	}
 	RegistryUsername string // decrypted by the adapter
 	RegistryPassword string // decrypted by the adapter
+
+	// DNSFlags are opaque Podman create flags (e.g. "--dns=...",
+	// "--dns-search=", "--dns-option=ndots:0") that the node-side
+	// adapter populates for capsules belonging to a CapsuleGroup. The
+	// runtime layer passes them through via WithDNSFlags so the
+	// container's /etc/resolv.conf points at the per-group DNS
+	// responder. Empty for standalone capsules: those keep Podman's
+	// default networking and DNS.
+	DNSFlags []string
 }
 
 // CapsuleStore is the narrow interface the handler uses to look up
@@ -81,6 +90,34 @@ type LifecycleNotifier interface {
 	MarkRunning(capsuleID string) error
 	MarkFailed(capsuleID, reason string) error
 	MarkStopped(capsuleID string) error
+}
+
+// GroupEventEmitter is the narrow interface the runtime handler uses
+// to publish group-aware events onto the node event bus without
+// importing the node-internal events package. Satisfied by an adapter
+// in the node wiring layer.
+//
+// MemberPlacementFailed is emitted INSTEAD of the per-replica
+// MarkFailed path when a member of a same-node group fails its initial
+// start sequence. The node-side capsule handler drives same-node
+// rollback (stop siblings, release reservation, request re-election
+// with ExcludeNodes) from this event.
+//
+// PullProgress is emitted as a heartbeat during image pulls. The
+// election manager treats each heartbeat as "alive, extend the
+// capacity reservation deadline".
+type GroupEventEmitter interface {
+	// EmitMemberPlacementFailed signals that a same-node group member
+	// could not be started locally. The runtime handler computes
+	// groupID via GroupView; capsuleID is the failing member; reason
+	// carries a human-readable explanation.
+	EmitMemberPlacementFailed(groupID, capsuleID, reason string)
+
+	// EmitPullProgress is a periodic heartbeat fired while an image
+	// pull is in flight. bytesRemaining and bytesPerSecond are
+	// best-effort progress estimates; pass -1 / 0 to signal "alive,
+	// progress unknown". groupID is empty for standalone capsules.
+	EmitPullProgress(groupID, capsuleID string, bytesRemaining, bytesPerSecond int64)
 }
 
 // containerID builds a deterministic container name from capsule +
@@ -127,20 +164,37 @@ type StatsRegistry interface {
 // snapshot or cold-start, manages the container lifecycle, and reports
 // outcomes back to the capsule lifecycle.
 type Handler struct {
-	runtime        Runtime
-	capsuleStore   CapsuleStore
-	snapshotStore  SnapshotStore
-	snapshotPuller SnapshotPuller
-	snapshotBC     SnapshotBroadcaster
-	lifecycle      LifecycleNotifier
-	statsRegistry  StatsRegistry
-	logger         *zap.Logger
+	runtime           Runtime
+	capsuleStore      CapsuleStore
+	snapshotStore     SnapshotStore
+	snapshotPuller    SnapshotPuller
+	snapshotBC        SnapshotBroadcaster
+	lifecycle         LifecycleNotifier
+	statsRegistry     StatsRegistry
+	groupView         GroupView
+	groupEmitter      GroupEventEmitter
+	depTimeout        time.Duration
+	pullHeartbeatTick time.Duration
+	logger            *zap.Logger
 
-	mu       sync.Mutex
-	running  map[string]context.CancelFunc // containerID -> cancel for stats/watcher goroutine
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	mu      sync.Mutex
+	running map[string]context.CancelFunc // containerID -> cancel for stats/watcher goroutine
+
+	// groupDispatched tracks capsule IDs that were dispatched as part
+	// of a StartGroup call. Their start failures route to
+	// MemberPlacementFailed rollback (driven by the node-side capsule
+	// handler) rather than the per-replica MarkFailed path. Cleared
+	// when the capsule reaches Running so a future crash-and-retry
+	// goes through the normal per-replica flow.
+	groupDispatched map[string]struct{}
+
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+
+	// group is the parked-start coordinator. nil when the handler runs
+	// without a GroupView (e.g. tests with no group module).
+	group *groupCoord
 }
 
 // HandlerOption configures a Handler.
@@ -184,12 +238,65 @@ func WithStatsRegistry(sr StatsRegistry) HandlerOption {
 	return func(h *Handler) { h.statsRegistry = sr }
 }
 
+// WithGroupView wires the group dependency lookup. When set, the
+// handler parks ElectionWon events for capsules whose DependsOn list
+// includes siblings not yet Running. Without it, every capsule starts
+// immediately on ElectionWon (the Phase-9 behaviour).
+func WithGroupView(v GroupView) HandlerOption {
+	return func(h *Handler) { h.groupView = v }
+}
+
+// WithGroupEventEmitter wires the emitter the handler uses to publish
+// group-aware events (MemberPlacementFailed for rollback,
+// PullProgress for reservation-deadline extension). When unset, the
+// runtime handler falls back to the per-replica MarkFailed path for
+// every start failure regardless of group membership; suitable for
+// tests that exercise the standalone-capsule code paths.
+func WithGroupEventEmitter(e GroupEventEmitter) HandlerOption {
+	return func(h *Handler) { h.groupEmitter = e }
+}
+
+// WithPullHeartbeatInterval overrides the interval between PullProgress
+// heartbeats emitted during image pulls. Non-positive values are
+// ignored. Default is 10 seconds; very small values are used by tests
+// to assert that the heartbeat actually fires without waiting for the
+// production interval.
+func WithPullHeartbeatInterval(d time.Duration) HandlerOption {
+	return func(h *Handler) {
+		if d > 0 {
+			h.pullHeartbeatTick = d
+		}
+	}
+}
+
+// WithDependencyTimeout overrides the default group-dependency wait
+// (5 minutes). When the timeout fires before all DependsOn members
+// reach Running, the parked start is dropped and MarkFailed is called
+// so the lifecycle re-elects on a different node. Non-positive values
+// are ignored (default kept).
+func WithDependencyTimeout(d time.Duration) HandlerOption {
+	return func(h *Handler) {
+		if d > 0 {
+			h.depTimeout = d
+		}
+	}
+}
+
+// defaultPullHeartbeatInterval bounds how long the handler waits
+// between PullProgress heartbeats during a long-running image pull.
+// 10s matches the election manager's typical reservation-watchdog
+// granularity so a missed heartbeat for a single interval cannot by
+// itself trip a reservation timeout.
+const defaultPullHeartbeatInterval = 10 * time.Second
+
 // NewHandler constructs a runtime handler.
 func NewHandler(rt Runtime, opts ...HandlerOption) *Handler {
 	h := &Handler{
-		runtime: rt,
-		logger:  zap.NewNop(),
-		running: make(map[string]context.CancelFunc),
+		runtime:           rt,
+		logger:            zap.NewNop(),
+		running:           make(map[string]context.CancelFunc),
+		groupDispatched:   make(map[string]struct{}),
+		pullHeartbeatTick: defaultPullHeartbeatInterval,
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -197,14 +304,79 @@ func NewHandler(rt Runtime, opts ...HandlerOption) *Handler {
 	return h
 }
 
+// markGroupDispatched marks every member capsule listed in ids as
+// "dispatched via StartGroup" so that a start failure for that
+// capsule routes to MemberPlacementFailed rather than the per-replica
+// MarkFailed path. The groupID argument is logged for observability;
+// the flag itself is keyed per-capsule (a member belongs to exactly
+// one group).
+func (h *Handler) markGroupDispatched(groupID string, ids []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		h.groupDispatched[id] = struct{}{}
+	}
+}
+
+// isGroupDispatched reports whether the given capsule was last
+// dispatched through StartGroup (i.e. its start is part of a same-node
+// group placement). The flag is consulted by reportStartFailure to
+// decide between the MemberPlacementFailed rollback path and the
+// per-replica MarkFailed path.
+func (h *Handler) isGroupDispatched(capsuleID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, ok := h.groupDispatched[capsuleID]
+	return ok
+}
+
+// clearGroupDispatched removes the StartGroup flag for a capsule.
+// Called when the capsule reaches Running (a successful start ends
+// the group-placement window) AND when the rollback path clears the
+// flag explicitly so a stale flag does not survive into a future
+// election round.
+func (h *Handler) clearGroupDispatched(capsuleID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.groupDispatched, capsuleID)
+}
+
 // Start begins the handler's background goroutines.
 func (h *Handler) Start(ctx context.Context) {
 	h.ctx, h.cancel = context.WithCancel(ctx)
+
+	// Initialize the group coordinator now that we have the long-lived
+	// context. The coordinator's per-park goroutines derive from h.ctx
+	// so Stop cancels them cleanly.
+	if h.groupView != nil {
+		h.group = newGroupCoord(
+			h.groupView,
+			h.depTimeout,
+			h.logger.Named("group"),
+			h.startContainerNow,
+			func(capsuleID, reason string) {
+				if h.lifecycle != nil {
+					if err := h.lifecycle.MarkFailed(capsuleID, reason); err != nil {
+						h.logger.Warn("group dep timeout: MarkFailed failed",
+							zap.String("capsule_id", capsuleID),
+							zap.Error(err))
+					}
+				}
+			},
+			&h.wg,
+		)
+	}
 }
 
 // Stop cancels all container watchers and waits for clean exit.
 func (h *Handler) Stop() {
 	h.cancel()
+	if h.group != nil {
+		h.group.stop()
+	}
 	h.mu.Lock()
 	for id, cancel := range h.running {
 		cancel()
@@ -215,10 +387,40 @@ func (h *Handler) Stop() {
 }
 
 // HandleElectionWon is called when the local node wins an election for
-// a capsule replica. It decides the start mode (restore vs cold start),
-// creates and starts the container, captures a snapshot if needed, and
-// reports the outcome.
+// a capsule replica. When the capsule is a group member with unmet
+// dependencies, the start is parked until every DependsOn entry reaches
+// Running. Otherwise (standalone capsule, or all deps already Running)
+// the container starts immediately.
+//
+// The parked-start path enforces first-boot-only dependency semantics:
+// once a capsule has been released past first boot, future re-elections
+// skip dep gating entirely. This prevents cascade-restart storms when
+// a long-running dependency crashes and re-elects elsewhere.
 func (h *Handler) HandleElectionWon(event ElectionWon) {
+	if h.group != nil {
+		if waiting := h.group.shouldPark(event); len(waiting) > 0 {
+			h.group.park(h.ctx, event, waiting)
+			return
+		}
+	}
+	h.startContainerNow(event)
+}
+
+// OnDependencyRunning is the hook the node-side bridge calls when a
+// capsule reaches Running on the local view. Idempotent for unrelated
+// capsules. When the running capsule is a group member, parked siblings
+// waiting on it have their waiting set updated and may release.
+func (h *Handler) OnDependencyRunning(capsuleID string) {
+	if h.group != nil {
+		h.group.onDependencyRunning(capsuleID)
+	}
+}
+
+// startContainerNow launches the per-replica goroutine that drives the
+// container start. Used both by HandleElectionWon for capsules with no
+// dependency wait and by the group coordinator when a parked start is
+// released.
+func (h *Handler) startContainerNow(event ElectionWon) {
 	h.wg.Add(1)
 	go func() {
 		defer h.wg.Done()
@@ -238,7 +440,7 @@ func (h *Handler) startContainer(event ElectionWon) {
 		h.logger.Error("runtime: capsule spec lookup failed",
 			zap.String("capsule_id", capsuleID),
 			zap.Error(err))
-		h.lifecycle.MarkFailed(capsuleID, "spec lookup failed: "+err.Error())
+		h.reportStartFailure(capsuleID, "spec lookup failed: "+err.Error())
 		return
 	}
 
@@ -311,11 +513,11 @@ func (h *Handler) coldStart(ctx context.Context, cID, capsuleID, tag string, spe
 	if spec.RegistryUsername != "" {
 		pullOpts = append(pullOpts, WithRegistryAuth(spec.RegistryUsername, spec.RegistryPassword))
 	}
-	if err := h.runtime.Pull(ctx, spec.Image, pullOpts...); err != nil {
+	if err := h.pullWithHeartbeat(ctx, capsuleID, spec.Image, pullOpts...); err != nil {
 		h.logger.Error("runtime: image pull failed",
 			zap.String("capsule_id", capsuleID),
 			zap.Error(err))
-		h.lifecycle.MarkFailed(capsuleID, "image pull failed: "+err.Error())
+		h.reportStartFailure(capsuleID, "image pull failed: "+err.Error())
 		return
 	}
 
@@ -330,12 +532,15 @@ func (h *Handler) coldStart(ctx context.Context, cID, capsuleID, tag string, spe
 	if len(spec.Command) > 0 {
 		createOpts = append(createOpts, WithCommand(spec.Command...))
 	}
+	if len(spec.DNSFlags) > 0 {
+		createOpts = append(createOpts, WithDNSFlags(spec.DNSFlags))
+	}
 
 	if err := h.runtime.Create(ctx, cID, spec.Image, createOpts...); err != nil {
 		h.logger.Error("runtime: create failed",
 			zap.String("capsule_id", capsuleID),
 			zap.Error(err))
-		h.lifecycle.MarkFailed(capsuleID, "create failed: "+err.Error())
+		h.reportStartFailure(capsuleID, "create failed: "+err.Error())
 		return
 	}
 
@@ -345,7 +550,7 @@ func (h *Handler) coldStart(ctx context.Context, cID, capsuleID, tag string, spe
 			zap.String("capsule_id", capsuleID),
 			zap.Error(err))
 		h.runtime.Remove(ctx, cID)
-		h.lifecycle.MarkFailed(capsuleID, "start failed: "+err.Error())
+		h.reportStartFailure(capsuleID, "start failed: "+err.Error())
 		return
 	}
 
@@ -436,6 +641,11 @@ func (h *Handler) onContainerRunning(cID, capsuleID string, spec *CapsuleSpec) {
 	h.logger.Info("runtime: container running",
 		zap.String("container_id", cID),
 		zap.String("capsule_id", capsuleID))
+
+	// Clear the StartGroup dispatch flag now that the member has
+	// reached Running — a future crash + per-replica re-election is
+	// no longer part of the original group placement window.
+	h.clearGroupDispatched(capsuleID)
 
 	if err := h.lifecycle.MarkRunning(capsuleID); err != nil {
 		h.logger.Warn("runtime: MarkRunning failed",
@@ -622,6 +832,9 @@ func (h *Handler) RollingUpdate(capsuleID, replicaID string, newSpec *CapsuleSpe
 	if len(newSpec.Command) > 0 {
 		createOpts = append(createOpts, WithCommand(newSpec.Command...))
 	}
+	if len(newSpec.DNSFlags) > 0 {
+		createOpts = append(createOpts, WithDNSFlags(newSpec.DNSFlags))
+	}
 
 	if err := h.runtime.Create(ctx, newCID, newSpec.Image, createOpts...); err != nil {
 		return fmt.Errorf("rolling update: create failed: %w", err)
@@ -717,6 +930,212 @@ func (h *Handler) RollingUpdate(capsuleID, replicaID string, newSpec *CapsuleSpe
 		zap.String("replica_id", replicaID))
 
 	return nil
+}
+
+// StreamingPuller is the capability interface a Runtime may optionally
+// implement to expose byte-level pull progress. The handler uses a type
+// assertion at pull time: runtimes that implement StreamingPuller (the
+// Podman REST runtime is the only production implementation today) feed
+// real (current, total) progress through the heartbeat; runtimes that do
+// not (the mock runtime, future containerd backend) keep the
+// progress-unknown fallback.
+type StreamingPuller interface {
+	// PullStreaming pulls image and invokes onProgress on every progress
+	// line emitted by the daemon. onProgress must not block — the handler
+	// rate-limits emission separately so the callback can fire on every
+	// daemon tick without flooding the event bus.
+	PullStreaming(ctx context.Context, image string, onProgress func(current, total int64), opts ...PullOption) error
+}
+
+// pullProgressMinEmitInterval is the minimum wall-clock gap between two
+// EmitPullProgress calls driven by the StreamingPuller callback. Without
+// this rate-limit a fast registry stream could fan out hundreds of
+// PullProgress events per second; the election manager only needs one
+// per second to extend the reservation deadline cleanly.
+const pullProgressMinEmitInterval = 1 * time.Second
+
+// pullWithHeartbeat wraps runtime.Pull so that long-running pulls emit
+// PullProgress heartbeats every h.pullHeartbeatTick on the configured
+// GroupEventEmitter. The election manager treats each heartbeat as
+// "alive, extend the capacity reservation deadline" so genuinely slow
+// pulls do not falsely trip the reservation watchdog.
+//
+// When the underlying runtime implements StreamingPuller the heartbeat
+// carries real (BytesRemaining, BytesPerSecond) derived from the
+// daemon's progress feed; emission is rate-limited to one per second so
+// the event bus is not flooded. Runtimes that do not implement
+// StreamingPuller (the mock runtime, custom backends) fall back to the
+// periodic "-1, 0" heartbeat — the election manager only needs liveness
+// in that case.
+//
+// A heartbeat is emitted immediately at start and on completion in
+// addition to the periodic ticks; this is what gives the election
+// manager an extension even for pulls that complete inside one tick.
+func (h *Handler) pullWithHeartbeat(ctx context.Context, capsuleID, image string, opts ...PullOption) error {
+	emit := h.groupEmitter
+	groupID := ""
+	if emit != nil && h.groupView != nil {
+		if info, ok := h.groupView.MemberInfo(capsuleID); ok {
+			groupID = info.GroupID
+		}
+	}
+
+	// Initial heartbeat. The emitter handles its own goroutine
+	// scheduling so this call is non-blocking from the runtime's
+	// perspective even if the event bus has a slow subscriber.
+	if emit != nil {
+		emit.EmitPullProgress(groupID, capsuleID, -1, 0)
+	}
+
+	tickCtx, tickCancel := context.WithCancel(ctx)
+	defer tickCancel()
+	done := make(chan struct{})
+
+	// Periodic-heartbeat fallback. Always running so liveness is
+	// reported even when the runtime supports streaming but the
+	// daemon's progress feed stalls between two emit ticks.
+	if emit != nil && h.pullHeartbeatTick > 0 {
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			ticker := time.NewTicker(h.pullHeartbeatTick)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-tickCtx.Done():
+					return
+				case <-done:
+					return
+				case <-ticker.C:
+					emit.EmitPullProgress(groupID, capsuleID, -1, 0)
+				}
+			}
+		}()
+	}
+
+	var err error
+	if streamer, ok := h.runtime.(StreamingPuller); ok && emit != nil {
+		var (
+			progressMu  sync.Mutex
+			lastCurrent int64
+			lastEmitTS  time.Time
+		)
+		onProgress := func(current, total int64) {
+			if current <= 0 || total <= 0 {
+				return // liveness-only line; the periodic ticker covers it
+			}
+			progressMu.Lock()
+			now := time.Now()
+			if !lastEmitTS.IsZero() && now.Sub(lastEmitTS) < pullProgressMinEmitInterval {
+				progressMu.Unlock()
+				return
+			}
+			deltaBytes := current - lastCurrent
+			deltaSecs := now.Sub(lastEmitTS).Seconds()
+			lastCurrent = current
+			lastEmitTS = now
+			progressMu.Unlock()
+
+			bytesRemaining := total - current
+			if bytesRemaining < 0 {
+				bytesRemaining = 0
+			}
+			var bps int64
+			if deltaSecs > 0 && deltaBytes > 0 {
+				bps = int64(float64(deltaBytes) / deltaSecs)
+			}
+			emit.EmitPullProgress(groupID, capsuleID, bytesRemaining, bps)
+		}
+		err = streamer.PullStreaming(ctx, image, onProgress, opts...)
+	} else {
+		err = h.runtime.Pull(ctx, image, opts...)
+	}
+	close(done)
+
+	// Completion heartbeat: signals the reservation watchdog one last
+	// time so the deadline reflects the actual pull duration.
+	if emit != nil {
+		emit.EmitPullProgress(groupID, capsuleID, 0, 0)
+	}
+
+	return err
+}
+
+// reportStartFailure routes a startup failure either to the
+// MemberPlacementFailed group-rollback path (when the capsule was
+// dispatched via StartGroup AND belongs to a same-node group AND a
+// GroupEventEmitter is wired) or to the per-replica
+// LifecycleNotifier.MarkFailed path (otherwise).
+//
+// The dispatch flag is the key distinguisher: a per-replica election
+// path also routes start failures here, but those failures must not
+// trigger group rollback — they should follow the per-replica
+// re-election flow. Same-node rollback is reserved for failures of
+// containers that were started as part of an atomic group placement.
+func (h *Handler) reportStartFailure(capsuleID, reason string) {
+	if h.groupEmitter != nil && h.groupView != nil && h.isGroupDispatched(capsuleID) {
+		info, ok := h.groupView.MemberInfo(capsuleID)
+		if ok && info.GroupID != "" {
+			mode, modeOK := h.groupView.Colocation(info.GroupID)
+			if modeOK && mode == ColocationSameNode {
+				h.logger.Warn("runtime: same-node group member start failed; emitting MemberPlacementFailed",
+					zap.String("group_id", info.GroupID),
+					zap.String("capsule_id", capsuleID),
+					zap.String("reason", reason))
+				// Clear the dispatch flag — rollback owns the next
+				// step; a stale flag would re-route a follow-up
+				// per-replica failure through the rollback path.
+				h.clearGroupDispatched(capsuleID)
+				h.groupEmitter.EmitMemberPlacementFailed(info.GroupID, capsuleID, reason)
+				return
+			}
+		}
+	}
+	if h.lifecycle != nil {
+		if err := h.lifecycle.MarkFailed(capsuleID, reason); err != nil {
+			h.logger.Warn("runtime: MarkFailed failed",
+				zap.String("capsule_id", capsuleID),
+				zap.Error(err))
+		}
+	}
+}
+
+// CancelGroupStarts purges any in-flight parked starts whose capsule
+// belongs to the given group ID AND clears the StartGroup dispatch
+// flag for every member of the group. Used by the node-side
+// MemberPlacementFailed rollback path so siblings parked on
+// dependency waits do NOT race a fresh GroupClaimWon by suddenly
+// firing their startContainer paths after the rollback has already
+// stopped them.
+//
+// Idempotent and safe to call when no parked entries match (returns
+// silently). Returns the number of parked entries cancelled — useful
+// for observability and test assertions.
+func (h *Handler) CancelGroupStarts(groupID string) int {
+	if h == nil {
+		return 0
+	}
+
+	// Clear every dispatched member for this group regardless of
+	// whether a parked entry was cancelled — a member already running
+	// startContainer (e.g. mid-Pull) would otherwise route a
+	// subsequent failure back through MemberPlacementFailed.
+	if h.groupView != nil {
+		h.mu.Lock()
+		for capsuleID := range h.groupDispatched {
+			info, ok := h.groupView.MemberInfo(capsuleID)
+			if !ok || info.GroupID != groupID {
+				continue
+			}
+			delete(h.groupDispatched, capsuleID)
+		}
+		h.mu.Unlock()
+	}
+
+	if h.group == nil {
+		return 0
+	}
+	return h.group.cancelGroup(groupID)
 }
 
 // StopContainer gracefully stops a running container (user-initiated).

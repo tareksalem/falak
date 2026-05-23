@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/tareksalem/falak/capsule"
+	"github.com/tareksalem/falak/capsule/enums"
 	"github.com/tareksalem/falak/capsule/scaling"
 	"github.com/tareksalem/falak/node/internal/events"
 )
@@ -193,7 +194,7 @@ func TestOnScaleEvent_ScaleUpFiresElection(t *testing.T) {
 	h.onScaleEvent(scaling.ScaleEvent{
 		CapsuleID: c.ID,
 		RuleName:  "cpu>70",
-		Action:    capsule.ScalingActionEnum.ScaleUp(),
+		Action:    enums.ScalingActionEnum.ScaleUp(),
 	})
 
 	req := waitForElectionRequested(t, sub, 2*time.Second)
@@ -223,7 +224,7 @@ func TestOnScaleEvent_ScaleDownDoesNotFireElection(t *testing.T) {
 	h.onScaleEvent(scaling.ScaleEvent{
 		CapsuleID: c.ID,
 		RuleName:  "cpu<10",
-		Action:    capsule.ScalingActionEnum.ScaleDown(),
+		Action:    enums.ScalingActionEnum.ScaleDown(),
 	})
 
 	select {

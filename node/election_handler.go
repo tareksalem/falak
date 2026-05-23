@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/tareksalem/falak/capsule"
+	"github.com/tareksalem/falak/capsule/enums"
 	"github.com/tareksalem/falak/election"
 	"github.com/tareksalem/falak/node/internal/events"
 	"github.com/tareksalem/falak/node/phonebook"
@@ -61,12 +62,19 @@ type electionCapsuleLookup struct {
 
 // NodesRunningCapsule returns the node IDs currently hosting any
 // replica of the named capsule, scoped to the given cluster.
+//
+// ListSnapshot (not List) is used so the Replicas slice we iterate is a
+// freshly-allocated copy. The live entry's slice header is being mutated
+// under the manager mutex by AssignReplica; reading the same backing
+// array here without coordination races under -race
+// (TestCapsuleGroup_SameNode_RecoverOnNodeJoined, surfaced in 11A.15
+// closeout, fixed under 11A.18 audit).
 func (l *electionCapsuleLookup) NodesRunningCapsule(clusterPath, capsuleName string) []string {
 	if l == nil || l.manager == nil {
 		return nil
 	}
 	var out []string
-	for _, c := range l.manager.List() {
+	for _, c := range l.manager.ListSnapshot() {
 		if c.ClusterID != clusterPath || c.Spec.Name != capsuleName {
 			continue
 		}
@@ -119,6 +127,62 @@ func (s *electionEventSink) EmitFailed(req election.Request, reason string) {
 		ClusterPath: req.ClusterPath,
 		Reason:      reason,
 	})
+}
+
+// groupClaimSinkAdapter implements election.GroupClaimSink by publishing
+// the outcome events onto the node's internal event bus. The runtime
+// handler subscribes to events.GroupClaimWon to start the group's
+// members in topological order on the winning node; observability
+// subscribers consume Lost/Failed.
+type groupClaimSinkAdapter struct {
+	bus    events.Bus
+	logger *zap.Logger
+}
+
+// EmitGroupWon publishes a GroupClaimWon event on the node bus.
+func (s *groupClaimSinkAdapter) EmitGroupWon(req election.GroupClaimRequest, nodeID string, score float64) {
+	memberIDs := make([]string, 0, len(req.MemberIDs))
+	for _, m := range req.MemberIDs {
+		memberIDs = append(memberIDs, string(m))
+	}
+	s.bus.Publish(events.GroupClaimWon{
+		BaseEvent:   events.NewBaseEvent(),
+		GroupID:     string(req.GroupID),
+		ClusterPath: req.ClusterPath,
+		MemberIDs:   memberIDs,
+		NodeID:      nodeID,
+		Score:       score,
+	})
+}
+
+// EmitGroupLost publishes a GroupClaimLost event on the node bus.
+func (s *groupClaimSinkAdapter) EmitGroupLost(req election.GroupClaimRequest, nodeID string) {
+	s.bus.Publish(events.GroupClaimLost{
+		BaseEvent:    events.NewBaseEvent(),
+		GroupID:      string(req.GroupID),
+		ClusterPath:  req.ClusterPath,
+		WinnerNodeID: nodeID,
+	})
+}
+
+// EmitGroupFailed publishes a GroupClaimFailed event on the node bus.
+func (s *groupClaimSinkAdapter) EmitGroupFailed(req election.GroupClaimRequest, reason string) {
+	s.bus.Publish(events.GroupClaimFailed{
+		BaseEvent:   events.NewBaseEvent(),
+		GroupID:     string(req.GroupID),
+		ClusterPath: req.ClusterPath,
+		Reason:      reason,
+	})
+}
+
+// NewGroupClaimSinkAdapter constructs the GroupClaimSink for wiring to
+// election.Manager. Exported so the node's main wiring can install it
+// via election.WithGroupClaimSink.
+func NewGroupClaimSinkAdapter(bus events.Bus, logger *zap.Logger) election.GroupClaimSink {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	return &groupClaimSinkAdapter{bus: bus, logger: logger}
 }
 
 // electionSigner implements election.Signer using the local node's
@@ -175,9 +239,10 @@ func (v *electionVerifier) Verify(senderID string, content, signature []byte) bo
 // The handler also owns the goroutine lifecycle for its event subscription,
 // stopping cleanly when the node shuts down.
 type ElectionHandler struct {
-	mgr      *election.Manager
-	bus      events.Bus
-	logger   *zap.Logger
+	mgr     *election.Manager
+	bus     events.Bus
+	logger  *zap.Logger
+	capsMgr *capsule.Manager // optional; used to clear group reservations
 
 	mu     sync.Mutex
 	ctx    context.Context
@@ -191,6 +256,17 @@ type ElectionHandlerOption func(*ElectionHandler)
 // WithElectionHandlerLogger sets the logger.
 func WithElectionHandlerLogger(logger *zap.Logger) ElectionHandlerOption {
 	return func(h *ElectionHandler) { h.logger = logger }
+}
+
+// WithElectionHandlerCapsuleManager wires the capsule manager used to
+// resolve group membership when CapsuleRunning events fire. The
+// handler uses it to detect when every member of a same-node group has
+// reached Running so the group reservation can be cleared before the
+// image-pull deadline elapses. When unset, the handler simply skips
+// the reservation-clear path; group reservations then rely on the
+// reservation watchdog's failure-emission semantics.
+func WithElectionHandlerCapsuleManager(m *capsule.Manager) ElectionHandlerOption {
+	return func(h *ElectionHandler) { h.capsMgr = m }
 }
 
 // NewElectionHandler constructs a handler bound to the given manager
@@ -216,10 +292,22 @@ func (h *ElectionHandler) Start(parent context.Context) {
 	}
 	h.ctx, h.cancel = context.WithCancel(parent)
 
-	h.wg.Add(1)
+	h.wg.Add(4)
 	go func() {
 		defer h.wg.Done()
 		h.loop()
+	}()
+	go func() {
+		defer h.wg.Done()
+		h.groupLoop()
+	}()
+	go func() {
+		defer h.wg.Done()
+		h.runningLoop()
+	}()
+	go func() {
+		defer h.wg.Done()
+		h.pullProgressLoop()
 	}()
 	h.logger.Info("election handler started")
 }
@@ -280,4 +368,224 @@ func (h *ElectionHandler) dispatch(ev events.ElectionRequested) {
 			zap.String("replica_id", ev.ReplicaID),
 			zap.Error(err))
 	}
+}
+
+// groupLoop subscribes to GroupClaimRequested and GroupReelectionRequested
+// events on the bus and translates each one into a GroupClaimRequest for
+// the election manager. The loop terminates when the context is cancelled.
+func (h *ElectionHandler) groupLoop() {
+	claimCh := h.bus.Subscribe(events.TypeGroupClaimRequested)
+	reelectCh := h.bus.Subscribe(events.TypeGroupReelectionRequested)
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case ev, ok := <-claimCh:
+			if !ok {
+				return
+			}
+			req, ok := ev.(events.GroupClaimRequested)
+			if !ok {
+				continue
+			}
+			h.dispatchGroup(req)
+		case ev, ok := <-reelectCh:
+			if !ok {
+				return
+			}
+			rev, ok := ev.(events.GroupReelectionRequested)
+			if !ok {
+				continue
+			}
+			h.dispatchGroupReelection(rev)
+		}
+	}
+}
+
+// dispatchGroup translates a GroupClaimRequested event into an
+// election.GroupClaimRequest and forwards it to the manager.
+func (h *ElectionHandler) dispatchGroup(ev events.GroupClaimRequested) {
+	memberIDs := make([]capsule.CapsuleID, 0, len(ev.MemberIDs))
+	for _, m := range ev.MemberIDs {
+		memberIDs = append(memberIDs, capsule.CapsuleID(m))
+	}
+	req := election.GroupClaimRequest{
+		GroupID:      capsule.CapsuleID(ev.GroupID),
+		MemberIDs:    memberIDs,
+		ClusterPath:  ev.ClusterPath,
+		Reason:       election.Reason(ev.Reason),
+		ExcludeNodes: append([]string(nil), ev.ExcludeNodes...),
+		Priority:     ev.Priority,
+		CreatedAt:    ev.OccurredAt,
+	}
+	if err := h.mgr.HandleGroupClaimRequest(req); err != nil {
+		h.logger.Warn("group claim dispatch failed",
+			zap.String("group_id", ev.GroupID),
+			zap.String("cluster", ev.ClusterPath),
+			zap.Error(err))
+	}
+}
+
+// dispatchGroupReelection translates a GroupReelectionRequested event into
+// a GroupClaimRequest. The exclude list is the union of FailedNodeID
+// (when non-empty: the holder that just died or the rollback winner
+// that just failed) and ExcludeNodes (cumulative history of prior
+// failed placement rounds populated by the 10.17 NodeJoined recovery
+// path). Behaves identically to dispatchGroup otherwise.
+func (h *ElectionHandler) dispatchGroupReelection(ev events.GroupReelectionRequested) {
+	memberIDs := make([]capsule.CapsuleID, 0, len(ev.MemberIDs))
+	for _, m := range ev.MemberIDs {
+		memberIDs = append(memberIDs, capsule.CapsuleID(m))
+	}
+	exclude := make([]string, 0, len(ev.ExcludeNodes)+1)
+	seen := make(map[string]struct{}, len(ev.ExcludeNodes)+1)
+	if ev.FailedNodeID != "" {
+		exclude = append(exclude, ev.FailedNodeID)
+		seen[ev.FailedNodeID] = struct{}{}
+	}
+	for _, id := range ev.ExcludeNodes {
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		exclude = append(exclude, id)
+	}
+	req := election.GroupClaimRequest{
+		GroupID:      capsule.CapsuleID(ev.GroupID),
+		MemberIDs:    memberIDs,
+		ClusterPath:  ev.ClusterPath,
+		Reason:       election.ReasonEnum.NodeFailure(),
+		ExcludeNodes: exclude,
+		CreatedAt:    ev.OccurredAt,
+	}
+	if err := h.mgr.HandleGroupClaimRequest(req); err != nil {
+		h.logger.Warn("group reelection dispatch failed",
+			zap.String("group_id", ev.GroupID),
+			zap.String("cluster", ev.ClusterPath),
+			zap.String("failed_node", ev.FailedNodeID),
+			zap.Error(err))
+	}
+}
+
+// runningLoop subscribes to events.TypeCapsuleRunning and, when the
+// running capsule is a group member whose siblings are all Running on
+// the local view, clears the group's capacity reservation on the
+// election manager. The clear is idempotent so duplicate Running
+// events (one per member) collapse onto a single Clear call.
+//
+// Without this hook, the reservation watchdog would fire a spurious
+// GroupClaimFailed verdict when its image-pull-derived deadline
+// expired even though every member had already started.
+func (h *ElectionHandler) runningLoop() {
+	if h.capsMgr == nil {
+		// Without a capsule manager we cannot resolve group membership
+		// or sibling state. Drain the subscription anyway so the bus
+		// does not accumulate undelivered events on this slot.
+		ch := h.bus.Subscribe(events.TypeCapsuleRunning)
+		for {
+			select {
+			case <-h.ctx.Done():
+				return
+			case _, ok := <-ch:
+				if !ok {
+					return
+				}
+			}
+		}
+	}
+	ch := h.bus.Subscribe(events.TypeCapsuleRunning)
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			running, ok := ev.(events.CapsuleRunning)
+			if !ok {
+				continue
+			}
+			h.onCapsuleRunning(running.CapsuleID)
+		}
+	}
+}
+
+// pullProgressLoop subscribes to events.TypePullProgress and forwards
+// each heartbeat to election.Manager.OnPullProgress. The election
+// manager keys reservations by group ID and extends the deadline on
+// every heartbeat; calls for capsules with no active reservation are
+// no-ops on the manager side.
+//
+// The loop is intentionally a thin pass-through — all rate-limiting
+// and bookkeeping live inside the manager. This is also why
+// OnPullProgress must be cheap and idempotent: a runtime emitting a
+// heartbeat every 10s for a 3-member group sees 3x the call rate
+// before any one member finishes its pull.
+func (h *ElectionHandler) pullProgressLoop() {
+	ch := h.bus.Subscribe(events.TypePullProgress)
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			progress, ok := ev.(events.PullProgress)
+			if !ok {
+				continue
+			}
+			if progress.GroupID == "" {
+				// Standalone capsule pulls do not carry a reservation;
+				// nothing for the election manager to extend.
+				continue
+			}
+			h.mgr.OnPullProgress(capsule.CapsuleID(progress.GroupID), progress.CapsuleID)
+		}
+	}
+}
+
+// onCapsuleRunning checks whether the capsule belongs to a same-node
+// group and, if every member of that group has reached Running on the
+// local view, clears the group's capacity reservation. Standalone
+// capsules and incomplete groups are silently skipped.
+func (h *ElectionHandler) onCapsuleRunning(capsuleID string) {
+	if h.capsMgr == nil {
+		return
+	}
+	c := h.capsMgr.Get(capsule.CapsuleID(capsuleID))
+	if c == nil || c.Spec.GroupID == "" {
+		return
+	}
+	groupID := c.Spec.GroupID
+	group, members := h.capsMgr.GetGroup(groupID)
+	if group == nil || group.Spec.Group == nil {
+		return
+	}
+	if group.Spec.Group.Colocation != capsule.ColocationModeEnum.SameNode() {
+		// Only same-node groups carry a capacity reservation.
+		return
+	}
+	if !h.mgr.HasReservation(groupID) {
+		// No reservation to clear (already cleared, or this node never
+		// won the group election).
+		return
+	}
+	for _, m := range members {
+		// Re-fetch via Get so reading m.Status does not race with
+		// concurrent lifecycle transitions writing the same field on
+		// the underlying capsule pointer.
+		snap := h.capsMgr.Get(m.ID)
+		if snap == nil || snap.Status != enums.CapsuleStatusEnum.Running() {
+			return
+		}
+	}
+	h.mgr.ClearGroupReservation(groupID)
+	h.logger.Info("group reservation cleared after all members running",
+		zap.String("group_id", groupID.String()),
+		zap.Int("members", len(members)))
 }

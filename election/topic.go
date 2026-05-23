@@ -43,6 +43,13 @@ type messageKey struct {
 	ReplicaID string
 }
 
+// groupKey identifies a single in-flight group election. Group claims use
+// a separate key space from per-capsule (capsule_id, replica_id) keys so
+// the two dispatch maps never collide.
+type groupKey struct {
+	GroupID string
+}
+
 // listener is a subscribe entry for an in-flight election. The Manager
 // creates one when it starts an election round and removes it when the
 // round ends. Messages dispatched to a closed listener are dropped.
@@ -58,6 +65,46 @@ func newListener(buffer int) *listener {
 		claims:   make(chan *electionpb.Claim, buffer),
 		failures: make(chan *electionpb.ElectionFailed, buffer),
 	}
+}
+
+// groupListener is the per-group analogue of listener. Only GroupClaim
+// messages flow through it. Failure broadcasts for groups reuse the
+// per-capsule ElectionFailed message keyed on the group ID in the
+// capsule_id slot — but for v1 the manager handles its own failure
+// path locally and does not gossip a failure, so the listener only
+// carries claims.
+type groupListener struct {
+	claims chan *electionpb.GroupClaim
+	closed bool
+	mu     sync.Mutex
+}
+
+func newGroupListener(buffer int) *groupListener {
+	return &groupListener{
+		claims: make(chan *electionpb.GroupClaim, buffer),
+	}
+}
+
+func (l *groupListener) dispatchGroupClaim(claim *electionpb.GroupClaim) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return
+	}
+	select {
+	case l.claims <- claim:
+	default:
+	}
+}
+
+func (l *groupListener) close() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return
+	}
+	l.closed = true
+	close(l.claims)
 }
 
 // dispatch delivers a claim or failure to the listener, never blocking.
@@ -110,6 +157,13 @@ type bufferedMessage struct {
 	failed     *electionpb.ElectionFailed // set for failure messages
 }
 
+// bufferedGroupMessage mirrors bufferedMessage for group elections. Held
+// in a separate map so per-capsule and per-group buffering stay isolated.
+type bufferedGroupMessage struct {
+	receivedAt time.Time
+	claim      *electionpb.GroupClaim
+}
+
 // bufferTTL is how long an unlistened-for message is kept before it's
 // garbage-collected. Chosen to be long enough for a delayed local
 // election to register its listener (typical delay: tens of milliseconds),
@@ -143,9 +197,11 @@ type ClusterTopic struct {
 	verifier    Verifier
 	logger      *zap.Logger
 
-	mu        sync.RWMutex
-	listeners map[messageKey]*listener
-	buffered  map[messageKey][]bufferedMessage
+	mu             sync.RWMutex
+	listeners      map[messageKey]*listener
+	buffered       map[messageKey][]bufferedMessage
+	groupListeners map[groupKey]*groupListener
+	groupBuffered  map[groupKey][]bufferedGroupMessage
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -182,18 +238,20 @@ func NewClusterTopic(
 
 	ctx, cancel := context.WithCancel(parent)
 	t := &ClusterTopic{
-		clusterPath: clusterPath,
-		nodeID:      nodeID,
-		ps:          ps,
-		topic:       topic,
-		sub:         sub,
-		signer:      signer,
-		verifier:    verifier,
-		logger:      logger,
-		listeners:   make(map[messageKey]*listener),
-		buffered:    make(map[messageKey][]bufferedMessage),
-		ctx:         ctx,
-		cancel:      cancel,
+		clusterPath:    clusterPath,
+		nodeID:         nodeID,
+		ps:             ps,
+		topic:          topic,
+		sub:            sub,
+		signer:         signer,
+		verifier:       verifier,
+		logger:         logger,
+		listeners:      make(map[messageKey]*listener),
+		buffered:       make(map[messageKey][]bufferedMessage),
+		groupListeners: make(map[groupKey]*groupListener),
+		groupBuffered:  make(map[groupKey][]bufferedGroupMessage),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 
 	t.wg.Add(2)
@@ -286,6 +344,61 @@ func (t *ClusterTopic) PublishFailure(ctx context.Context, failed *electionpb.El
 	return t.publish(ctx, "failed", failed)
 }
 
+// PublishGroupClaim signs and publishes a GroupClaim message. Same wire
+// envelope and signing scheme as PublishClaim — only the inner payload
+// type and dispatch keying differ.
+func (t *ClusterTopic) PublishGroupClaim(ctx context.Context, claim *electionpb.GroupClaim) error {
+	return t.publish(ctx, "group_claim", claim)
+}
+
+// ListenGroup registers a listener for GroupClaim messages addressed to
+// the given group_id. The returned channel receives every matching
+// GroupClaim until the returned cancel function is invoked.
+//
+// Like Listen, recently buffered group claims for the same key are
+// replayed synchronously before ListenGroup returns. This closes the
+// publish-before-listen race for group elections.
+func (t *ClusterTopic) ListenGroup(groupID string, bufferSize int) (claims <-chan *electionpb.GroupClaim, cancel func()) {
+	if bufferSize <= 0 {
+		bufferSize = 8
+	}
+	key := groupKey{GroupID: groupID}
+	l := newGroupListener(bufferSize)
+
+	t.mu.Lock()
+	if existing, ok := t.groupListeners[key]; ok {
+		existing.close()
+		t.logger.Debug("group election listener replaced",
+			zap.String("cluster", t.clusterPath),
+			zap.String("group_id", groupID))
+	}
+	t.groupListeners[key] = l
+	queued := t.groupBuffered[key]
+	delete(t.groupBuffered, key)
+	t.mu.Unlock()
+
+	if len(queued) > 0 {
+		t.logger.Debug("replaying buffered group election messages",
+			zap.String("cluster", t.clusterPath),
+			zap.String("group_id", groupID),
+			zap.Int("count", len(queued)))
+	}
+	for _, msg := range queued {
+		if msg.claim != nil {
+			l.dispatchGroupClaim(msg.claim)
+		}
+	}
+
+	return l.claims, func() {
+		t.mu.Lock()
+		if current, ok := t.groupListeners[key]; ok && current == l {
+			delete(t.groupListeners, key)
+		}
+		t.mu.Unlock()
+		l.close()
+	}
+}
+
 // publish is the shared serialization + sign + publish pipeline for
 // both Claim and ElectionFailed messages.
 func (t *ClusterTopic) publish(ctx context.Context, msgType string, payload proto.Message) error {
@@ -338,6 +451,11 @@ func (t *ClusterTopic) Stop() {
 	}
 	t.listeners = make(map[messageKey]*listener)
 	t.buffered = make(map[messageKey][]bufferedMessage)
+	for _, l := range t.groupListeners {
+		l.close()
+	}
+	t.groupListeners = make(map[groupKey]*groupListener)
+	t.groupBuffered = make(map[groupKey][]bufferedGroupMessage)
 	t.mu.Unlock()
 
 	t.logger.Info("election topic closed",
@@ -413,9 +531,45 @@ func (t *ClusterTopic) handle(data []byte) {
 		}
 		t.dispatchFailure(&failed)
 
+	case "group_claim":
+		var gc electionpb.GroupClaim
+		if err := proto.Unmarshal(envelope.Payload, &gc); err != nil {
+			t.logger.Debug("election: bad group claim payload", zap.Error(err))
+			return
+		}
+		t.dispatchGroupClaim(&gc)
+
 	default:
 		t.logger.Debug("election: unknown message type", zap.String("type", envelope.Type))
 	}
+}
+
+// dispatchGroupClaim routes an incoming GroupClaim to the listener for
+// its group_id, buffering when no listener has registered yet.
+func (t *ClusterTopic) dispatchGroupClaim(claim *electionpb.GroupClaim) {
+	key := groupKey{GroupID: claim.GroupId}
+	t.mu.Lock()
+	l := t.groupListeners[key]
+	if l == nil {
+		t.groupBuffered[key] = append(t.groupBuffered[key], bufferedGroupMessage{
+			receivedAt: time.Now(),
+			claim:      claim,
+		})
+		t.mu.Unlock()
+		t.logger.Debug("buffered group claim (no active listener)",
+			zap.String("cluster", t.clusterPath),
+			zap.String("group_id", claim.GroupId),
+			zap.String("sender", claim.NodeId),
+			zap.Float64("score", claim.GravityScore))
+		return
+	}
+	t.mu.Unlock()
+	t.logger.Debug("dispatching group claim",
+		zap.String("cluster", t.clusterPath),
+		zap.String("group_id", claim.GroupId),
+		zap.String("sender", claim.NodeId),
+		zap.Float64("score", claim.GravityScore))
+	l.dispatchGroupClaim(claim)
 }
 
 func (t *ClusterTopic) dispatchClaim(claim *electionpb.Claim) {
@@ -510,6 +664,21 @@ func (t *ClusterTopic) sweepBuffer() {
 			delete(t.buffered, key)
 		} else {
 			t.buffered[key] = kept
+		}
+	}
+	for key, msgs := range t.groupBuffered {
+		kept := msgs[:0]
+		for _, m := range msgs {
+			if m.receivedAt.After(cutoff) {
+				kept = append(kept, m)
+			} else {
+				dropped++
+			}
+		}
+		if len(kept) == 0 {
+			delete(t.groupBuffered, key)
+		} else {
+			t.groupBuffered[key] = kept
 		}
 	}
 	t.mu.Unlock()

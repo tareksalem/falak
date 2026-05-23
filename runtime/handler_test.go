@@ -238,6 +238,115 @@ func TestHandler_StopContainer(t *testing.T) {
 	}
 }
 
+// streamingRuntimeStub embeds a mock.Runtime to satisfy the rest of the
+// runtime.Runtime interface and adds a PullStreaming method that drives
+// onProgress with a canned sequence of (current, total) tuples. The
+// stub is local to this test so the mock package keeps its narrow
+// runtime.Runtime contract.
+type streamingRuntimeStub struct {
+	*mock.Runtime
+	progress []struct{ current, total int64 }
+}
+
+// PullStreaming implements runtime.StreamingPuller. The canned sequence
+// is delivered synchronously with a short sleep between calls so the
+// rate-limit window in pullWithHeartbeat trips on a subset of records,
+// exercising both the emission path AND the throttle.
+func (s *streamingRuntimeStub) PullStreaming(ctx context.Context, image string, onProgress func(current, total int64), opts ...runtime.PullOption) error {
+	for _, p := range s.progress {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		onProgress(p.current, p.total)
+		time.Sleep(1100 * time.Millisecond) // > pullProgressMinEmitInterval so every record passes the throttle
+	}
+	return s.Runtime.Pull(ctx, image, opts...)
+}
+
+// recordingEmitter captures every EmitPullProgress / EmitMemberPlacementFailed
+// call so the test can assert non-zero bytesRemaining emission.
+type recordingPullEmitter struct {
+	mu      sync.Mutex
+	pulls   []pullProgressCall
+	mpfs    int
+}
+
+type pullProgressCall struct {
+	groupID, capsuleID string
+	bytesRemaining     int64
+	bytesPerSecond     int64
+}
+
+func (e *recordingPullEmitter) EmitMemberPlacementFailed(_, _, _ string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mpfs++
+}
+
+func (e *recordingPullEmitter) EmitPullProgress(groupID, capsuleID string, bytesRemaining, bytesPerSecond int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.pulls = append(e.pulls, pullProgressCall{groupID, capsuleID, bytesRemaining, bytesPerSecond})
+}
+
+func (e *recordingPullEmitter) snapshot() []pullProgressCall {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]pullProgressCall, len(e.pulls))
+	copy(out, e.pulls)
+	return out
+}
+
+// TestHandler_PullWithHeartbeat_StreamingDeriverNonZeroBytes drives a
+// streaming-capable runtime through the runtime handler's cold-start
+// path and asserts that at least one PullProgress emission carries
+// non-zero bytesRemaining. Together with the periodic-tick "-1, 0"
+// liveness emissions, this is the contract the election manager
+// depends on for reservation extension.
+func TestHandler_PullWithHeartbeat_StreamingDeriverNonZeroBytes(t *testing.T) {
+	stub := &streamingRuntimeStub{
+		Runtime: mock.New(),
+		progress: []struct{ current, total int64 }{
+			{1024, 10240},
+			{5120, 10240},
+			{10240, 10240},
+		},
+	}
+	emitter := &recordingPullEmitter{}
+	lc := &stubLifecycle{}
+	store := &stubCapsuleStore{spec: defaultSpec()}
+
+	h := runtime.NewHandler(stub,
+		runtime.WithCapsuleStore(store),
+		runtime.WithLifecycleNotifier(lc),
+		runtime.WithGroupEventEmitter(emitter),
+		runtime.WithPullHeartbeatInterval(0), // disable periodic ticker; only streaming-derived emissions count
+	)
+	h.Start(context.Background())
+	defer h.Stop()
+
+	h.HandleElectionWon(runtime.ElectionWon{
+		CapsuleID: "cap-stream",
+		ReplicaID: "0",
+	})
+	lc.waitRunning(t, "cap-stream", 30*time.Second)
+
+	// Confirm at least one emission carried real bytes-remaining (i.e.
+	// the streaming path fired, not just the start/finish bookends).
+	sawNonZero := false
+	for _, p := range emitter.snapshot() {
+		if p.bytesRemaining > 0 {
+			sawNonZero = true
+			break
+		}
+	}
+	if !sawNonZero {
+		t.Fatalf("expected at least one non-zero bytesRemaining emission, got %+v", emitter.snapshot())
+	}
+}
+
 func TestHandler_CrashTriggersMarkFailed(t *testing.T) {
 	rt := mock.New()
 	lc := &stubLifecycle{}

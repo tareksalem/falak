@@ -6,12 +6,30 @@ option go_package = "github.com/tareksalem/falak/api/proto/v1alpha1pb";
 
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
+import "google/api/annotations.proto";
 
 service ClusterService {
-    rpc Join(JoinClusterRequest) returns (google.protobuf.Empty);
-    rpc Leave(LeaveClusterRequest) returns (google.protobuf.Empty);
-    rpc List(ListClustersRequest) returns (ListClustersResponse);
-    rpc Members(ClusterMembersRequest) returns (ClusterMembersResponse);
+    rpc Join(JoinClusterRequest) returns (google.protobuf.Empty) {
+        option (google.api.http) = {
+            post: "/v1alpha1/clusters"
+            body: "*"
+        };
+    }
+    rpc Leave(LeaveClusterRequest) returns (google.protobuf.Empty) {
+        option (google.api.http) = {
+            delete: "/v1alpha1/clusters/{path}"
+        };
+    }
+    rpc List(ListClustersRequest) returns (ListClustersResponse) {
+        option (google.api.http) = {
+            get: "/v1alpha1/clusters"
+        };
+    }
+    rpc Members(ClusterMembersRequest) returns (ClusterMembersResponse) {
+        option (google.api.http) = {
+            get: "/v1alpha1/clusters/{path}/members"
+        };
+    }
 }
 
 message JoinClusterRequest {

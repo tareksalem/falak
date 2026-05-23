@@ -22,6 +22,106 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// CapsuleKind discriminates standalone capsules from group-kind ones.
+type CapsuleKind int32
+
+const (
+	CapsuleKind_CAPSULE_KIND_UNSPECIFIED CapsuleKind = 0
+	CapsuleKind_CAPSULE_KIND_CAPSULE     CapsuleKind = 1
+	CapsuleKind_CAPSULE_KIND_GROUP       CapsuleKind = 2
+)
+
+// Enum value maps for CapsuleKind.
+var (
+	CapsuleKind_name = map[int32]string{
+		0: "CAPSULE_KIND_UNSPECIFIED",
+		1: "CAPSULE_KIND_CAPSULE",
+		2: "CAPSULE_KIND_GROUP",
+	}
+	CapsuleKind_value = map[string]int32{
+		"CAPSULE_KIND_UNSPECIFIED": 0,
+		"CAPSULE_KIND_CAPSULE":     1,
+		"CAPSULE_KIND_GROUP":       2,
+	}
+)
+
+func (x CapsuleKind) Enum() *CapsuleKind {
+	p := new(CapsuleKind)
+	*p = x
+	return p
+}
+
+func (x CapsuleKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (CapsuleKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_capsule_proto_capsule_proto_enumTypes[0].Descriptor()
+}
+
+func (CapsuleKind) Type() protoreflect.EnumType {
+	return &file_capsule_proto_capsule_proto_enumTypes[0]
+}
+
+func (x CapsuleKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use CapsuleKind.Descriptor instead.
+func (CapsuleKind) EnumDescriptor() ([]byte, []int) {
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{0}
+}
+
+// ColocationMode controls whether group members must share a node.
+type ColocationMode int32
+
+const (
+	ColocationMode_COLOCATION_MODE_UNSPECIFIED ColocationMode = 0
+	ColocationMode_COLOCATION_MODE_SAME_NODE   ColocationMode = 1
+	ColocationMode_COLOCATION_MODE_SAME_ORBIT  ColocationMode = 2
+)
+
+// Enum value maps for ColocationMode.
+var (
+	ColocationMode_name = map[int32]string{
+		0: "COLOCATION_MODE_UNSPECIFIED",
+		1: "COLOCATION_MODE_SAME_NODE",
+		2: "COLOCATION_MODE_SAME_ORBIT",
+	}
+	ColocationMode_value = map[string]int32{
+		"COLOCATION_MODE_UNSPECIFIED": 0,
+		"COLOCATION_MODE_SAME_NODE":   1,
+		"COLOCATION_MODE_SAME_ORBIT":  2,
+	}
+)
+
+func (x ColocationMode) Enum() *ColocationMode {
+	p := new(ColocationMode)
+	*p = x
+	return p
+}
+
+func (x ColocationMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ColocationMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_capsule_proto_capsule_proto_enumTypes[1].Descriptor()
+}
+
+func (ColocationMode) Type() protoreflect.EnumType {
+	return &file_capsule_proto_capsule_proto_enumTypes[1]
+}
+
+func (x ColocationMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ColocationMode.Descriptor instead.
+func (ColocationMode) EnumDescriptor() ([]byte, []int) {
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{1}
+}
+
 type CapsuleSpec struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Name           string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -38,6 +138,10 @@ type CapsuleSpec struct {
 	MomentumConfig *MomentumConfig        `protobuf:"bytes,13,opt,name=momentum_config,json=momentumConfig,proto3" json:"momentum_config,omitempty"`
 	ImageAlias     string                 `protobuf:"bytes,14,opt,name=image_alias,json=imageAlias,proto3" json:"image_alias,omitempty"`
 	Command        []string               `protobuf:"bytes,15,rep,name=command,proto3" json:"command,omitempty"`
+	Kind           CapsuleKind            `protobuf:"varint,16,opt,name=kind,proto3,enum=falak.capsule.CapsuleKind" json:"kind,omitempty"`   // default: CAPSULE_KIND_CAPSULE
+	GroupId        string                 `protobuf:"bytes,17,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`              // set on member capsules; empty otherwise
+	GroupMember    bool                   `protobuf:"varint,18,opt,name=group_member,json=groupMember,proto3" json:"group_member,omitempty"` // true on member capsules
+	Group          *GroupSpec             `protobuf:"bytes,19,opt,name=group,proto3" json:"group,omitempty"`                                 // set when kind == CAPSULE_KIND_GROUP
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -170,6 +274,219 @@ func (x *CapsuleSpec) GetCommand() []string {
 	return nil
 }
 
+func (x *CapsuleSpec) GetKind() CapsuleKind {
+	if x != nil {
+		return x.Kind
+	}
+	return CapsuleKind_CAPSULE_KIND_UNSPECIFIED
+}
+
+func (x *CapsuleSpec) GetGroupId() string {
+	if x != nil {
+		return x.GroupId
+	}
+	return ""
+}
+
+func (x *CapsuleSpec) GetGroupMember() bool {
+	if x != nil {
+		return x.GroupMember
+	}
+	return false
+}
+
+func (x *CapsuleSpec) GetGroup() *GroupSpec {
+	if x != nil {
+		return x.Group
+	}
+	return nil
+}
+
+// MemberDeps lists the names of other group members a member depends on.
+type MemberDeps struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	DependsOn     []string               `protobuf:"bytes,1,rep,name=depends_on,json=dependsOn,proto3" json:"depends_on,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MemberDeps) Reset() {
+	*x = MemberDeps{}
+	mi := &file_capsule_proto_capsule_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MemberDeps) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MemberDeps) ProtoMessage() {}
+
+func (x *MemberDeps) ProtoReflect() protoreflect.Message {
+	mi := &file_capsule_proto_capsule_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MemberDeps.ProtoReflect.Descriptor instead.
+func (*MemberDeps) Descriptor() ([]byte, []int) {
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *MemberDeps) GetDependsOn() []string {
+	if x != nil {
+		return x.DependsOn
+	}
+	return nil
+}
+
+// MemberSpec is a CapsuleSpec scoped to a group context. At admission time,
+// each MemberSpec is materialized into a full Capsule with kind set to
+// CAPSULE_KIND_CAPSULE and group_id pointing at the parent group.
+//
+// Fields 3 and 4 (discovers, replica_labels) are reserved for Phase 11.
+// Phase 10 admission rejects any input setting those fields with a clear
+// "feature not yet supported" error; reserving the IDs here keeps wire
+// compatibility when Phase 11 lands.
+type MemberSpec struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"` // member name (DNS-friendly)
+	Spec          *CapsuleSpec           `protobuf:"bytes,2,opt,name=spec,proto3" json:"spec,omitempty"` // full capsule spec; kind is forced to CAPSULE_KIND_CAPSULE at admission
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MemberSpec) Reset() {
+	*x = MemberSpec{}
+	mi := &file_capsule_proto_capsule_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MemberSpec) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MemberSpec) ProtoMessage() {}
+
+func (x *MemberSpec) ProtoReflect() protoreflect.Message {
+	mi := &file_capsule_proto_capsule_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MemberSpec.ProtoReflect.Descriptor instead.
+func (*MemberSpec) Descriptor() ([]byte, []int) {
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *MemberSpec) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *MemberSpec) GetSpec() *CapsuleSpec {
+	if x != nil {
+		return x.Spec
+	}
+	return nil
+}
+
+// GroupSpec is set on capsules with kind == CAPSULE_KIND_GROUP. It carries
+// the canonical member specs (for cascade), a dependency DAG keyed by
+// member name, the post-admission member capsule IDs, and the cascade
+// delete flag.
+type GroupSpec struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Colocation    ColocationMode         `protobuf:"varint,1,opt,name=colocation,proto3,enum=falak.capsule.ColocationMode" json:"colocation,omitempty"`
+	Members       []*MemberSpec          `protobuf:"bytes,2,rep,name=members,proto3" json:"members,omitempty"`                                                                     // canonical member specs for cascading
+	Deps          map[string]*MemberDeps `protobuf:"bytes,3,rep,name=deps,proto3" json:"deps,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // member_name -> dependencies
+	MemberIds     []string               `protobuf:"bytes,4,rep,name=member_ids,json=memberIds,proto3" json:"member_ids,omitempty"`                                                // populated after admission
+	CascadeDelete bool                   `protobuf:"varint,5,opt,name=cascade_delete,json=cascadeDelete,proto3" json:"cascade_delete,omitempty"`                                   // false leaves members standalone on group delete
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GroupSpec) Reset() {
+	*x = GroupSpec{}
+	mi := &file_capsule_proto_capsule_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GroupSpec) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GroupSpec) ProtoMessage() {}
+
+func (x *GroupSpec) ProtoReflect() protoreflect.Message {
+	mi := &file_capsule_proto_capsule_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GroupSpec.ProtoReflect.Descriptor instead.
+func (*GroupSpec) Descriptor() ([]byte, []int) {
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *GroupSpec) GetColocation() ColocationMode {
+	if x != nil {
+		return x.Colocation
+	}
+	return ColocationMode_COLOCATION_MODE_UNSPECIFIED
+}
+
+func (x *GroupSpec) GetMembers() []*MemberSpec {
+	if x != nil {
+		return x.Members
+	}
+	return nil
+}
+
+func (x *GroupSpec) GetDeps() map[string]*MemberDeps {
+	if x != nil {
+		return x.Deps
+	}
+	return nil
+}
+
+func (x *GroupSpec) GetMemberIds() []string {
+	if x != nil {
+		return x.MemberIds
+	}
+	return nil
+}
+
+func (x *GroupSpec) GetCascadeDelete() bool {
+	if x != nil {
+		return x.CascadeDelete
+	}
+	return false
+}
+
 type ResourceRequirements struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	CpuCores      int32                  `protobuf:"varint,1,opt,name=cpu_cores,json=cpuCores,proto3" json:"cpu_cores,omitempty"`
@@ -183,7 +500,7 @@ type ResourceRequirements struct {
 
 func (x *ResourceRequirements) Reset() {
 	*x = ResourceRequirements{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[1]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -195,7 +512,7 @@ func (x *ResourceRequirements) String() string {
 func (*ResourceRequirements) ProtoMessage() {}
 
 func (x *ResourceRequirements) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[1]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -208,7 +525,7 @@ func (x *ResourceRequirements) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResourceRequirements.ProtoReflect.Descriptor instead.
 func (*ResourceRequirements) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{1}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *ResourceRequirements) GetCpuCores() int32 {
@@ -257,7 +574,7 @@ type ReplicaConfig struct {
 
 func (x *ReplicaConfig) Reset() {
 	*x = ReplicaConfig{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[2]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -269,7 +586,7 @@ func (x *ReplicaConfig) String() string {
 func (*ReplicaConfig) ProtoMessage() {}
 
 func (x *ReplicaConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[2]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -282,7 +599,7 @@ func (x *ReplicaConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicaConfig.ProtoReflect.Descriptor instead.
 func (*ReplicaConfig) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{2}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ReplicaConfig) GetMin() int32 {
@@ -319,7 +636,7 @@ type ScalingRule struct {
 
 func (x *ScalingRule) Reset() {
 	*x = ScalingRule{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[3]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -331,7 +648,7 @@ func (x *ScalingRule) String() string {
 func (*ScalingRule) ProtoMessage() {}
 
 func (x *ScalingRule) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[3]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -344,7 +661,7 @@ func (x *ScalingRule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScalingRule.ProtoReflect.Descriptor instead.
 func (*ScalingRule) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{3}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ScalingRule) GetName() string {
@@ -396,7 +713,7 @@ type PlacementRule struct {
 
 func (x *PlacementRule) Reset() {
 	*x = PlacementRule{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[4]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -408,7 +725,7 @@ func (x *PlacementRule) String() string {
 func (*PlacementRule) ProtoMessage() {}
 
 func (x *PlacementRule) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[4]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -421,7 +738,7 @@ func (x *PlacementRule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlacementRule.ProtoReflect.Descriptor instead.
 func (*PlacementRule) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{4}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *PlacementRule) GetName() string {
@@ -482,7 +799,7 @@ type RuntimeConfig struct {
 
 func (x *RuntimeConfig) Reset() {
 	*x = RuntimeConfig{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[5]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -494,7 +811,7 @@ func (x *RuntimeConfig) String() string {
 func (*RuntimeConfig) ProtoMessage() {}
 
 func (x *RuntimeConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[5]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -507,7 +824,7 @@ func (x *RuntimeConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RuntimeConfig.ProtoReflect.Descriptor instead.
 func (*RuntimeConfig) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{5}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *RuntimeConfig) GetEnv() map[string]string {
@@ -576,7 +893,7 @@ type NetworkConfig struct {
 
 func (x *NetworkConfig) Reset() {
 	*x = NetworkConfig{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[6]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -588,7 +905,7 @@ func (x *NetworkConfig) String() string {
 func (*NetworkConfig) ProtoMessage() {}
 
 func (x *NetworkConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[6]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -601,7 +918,7 @@ func (x *NetworkConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkConfig.ProtoReflect.Descriptor instead.
 func (*NetworkConfig) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{6}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *NetworkConfig) GetMode() string {
@@ -630,7 +947,7 @@ type PortMapping struct {
 
 func (x *PortMapping) Reset() {
 	*x = PortMapping{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[7]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -642,7 +959,7 @@ func (x *PortMapping) String() string {
 func (*PortMapping) ProtoMessage() {}
 
 func (x *PortMapping) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[7]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -655,7 +972,7 @@ func (x *PortMapping) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PortMapping.ProtoReflect.Descriptor instead.
 func (*PortMapping) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{7}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *PortMapping) GetName() string {
@@ -701,7 +1018,7 @@ type HealthCheck struct {
 
 func (x *HealthCheck) Reset() {
 	*x = HealthCheck{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[8]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -713,7 +1030,7 @@ func (x *HealthCheck) String() string {
 func (*HealthCheck) ProtoMessage() {}
 
 func (x *HealthCheck) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[8]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -726,7 +1043,7 @@ func (x *HealthCheck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheck.ProtoReflect.Descriptor instead.
 func (*HealthCheck) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{8}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *HealthCheck) GetType() string {
@@ -789,7 +1106,7 @@ type FailurePolicy struct {
 
 func (x *FailurePolicy) Reset() {
 	*x = FailurePolicy{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[9]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -801,7 +1118,7 @@ func (x *FailurePolicy) String() string {
 func (*FailurePolicy) ProtoMessage() {}
 
 func (x *FailurePolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[9]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -814,7 +1131,7 @@ func (x *FailurePolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FailurePolicy.ProtoReflect.Descriptor instead.
 func (*FailurePolicy) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{9}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *FailurePolicy) GetRestartLimit() int32 {
@@ -848,7 +1165,7 @@ type LogRetention struct {
 
 func (x *LogRetention) Reset() {
 	*x = LogRetention{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[10]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -860,7 +1177,7 @@ func (x *LogRetention) String() string {
 func (*LogRetention) ProtoMessage() {}
 
 func (x *LogRetention) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[10]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -873,7 +1190,7 @@ func (x *LogRetention) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogRetention.ProtoReflect.Descriptor instead.
 func (*LogRetention) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{10}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *LogRetention) GetMaxFileSizeMb() int32 {
@@ -901,7 +1218,7 @@ type RegistryAuth struct {
 
 func (x *RegistryAuth) Reset() {
 	*x = RegistryAuth{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[11]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -913,7 +1230,7 @@ func (x *RegistryAuth) String() string {
 func (*RegistryAuth) ProtoMessage() {}
 
 func (x *RegistryAuth) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[11]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -926,7 +1243,7 @@ func (x *RegistryAuth) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegistryAuth.ProtoReflect.Descriptor instead.
 func (*RegistryAuth) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{11}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *RegistryAuth) GetUrl() string {
@@ -960,7 +1277,7 @@ type SnapshotConfig struct {
 
 func (x *SnapshotConfig) Reset() {
 	*x = SnapshotConfig{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[12]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -972,7 +1289,7 @@ func (x *SnapshotConfig) String() string {
 func (*SnapshotConfig) ProtoMessage() {}
 
 func (x *SnapshotConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[12]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -985,7 +1302,7 @@ func (x *SnapshotConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotConfig.ProtoReflect.Descriptor instead.
 func (*SnapshotConfig) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{12}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *SnapshotConfig) GetMaxPerCapsule() int32 {
@@ -1014,7 +1331,7 @@ type MomentumConfig struct {
 
 func (x *MomentumConfig) Reset() {
 	*x = MomentumConfig{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[13]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1026,7 +1343,7 @@ func (x *MomentumConfig) String() string {
 func (*MomentumConfig) ProtoMessage() {}
 
 func (x *MomentumConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[13]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1039,7 +1356,7 @@ func (x *MomentumConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MomentumConfig.ProtoReflect.Descriptor instead.
 func (*MomentumConfig) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{13}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *MomentumConfig) GetBase() int32 {
@@ -1087,7 +1404,7 @@ type Capsule struct {
 
 func (x *Capsule) Reset() {
 	*x = Capsule{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[14]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1099,7 +1416,7 @@ func (x *Capsule) String() string {
 func (*Capsule) ProtoMessage() {}
 
 func (x *Capsule) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[14]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1112,7 +1429,7 @@ func (x *Capsule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Capsule.ProtoReflect.Descriptor instead.
 func (*Capsule) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{14}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *Capsule) GetId() string {
@@ -1190,7 +1507,7 @@ type ReplicaState struct {
 
 func (x *ReplicaState) Reset() {
 	*x = ReplicaState{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[15]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1202,7 +1519,7 @@ func (x *ReplicaState) String() string {
 func (*ReplicaState) ProtoMessage() {}
 
 func (x *ReplicaState) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[15]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1215,7 +1532,7 @@ func (x *ReplicaState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicaState.ProtoReflect.Descriptor instead.
 func (*ReplicaState) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{15}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ReplicaState) GetReplicaId() string {
@@ -1257,7 +1574,7 @@ type MomentumState struct {
 
 func (x *MomentumState) Reset() {
 	*x = MomentumState{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[16]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1269,7 +1586,7 @@ func (x *MomentumState) String() string {
 func (*MomentumState) ProtoMessage() {}
 
 func (x *MomentumState) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[16]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1282,7 +1599,7 @@ func (x *MomentumState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MomentumState.ProtoReflect.Descriptor instead.
 func (*MomentumState) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{16}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *MomentumState) GetCurrent() int32 {
@@ -1320,7 +1637,7 @@ type OrbitMessage struct {
 
 func (x *OrbitMessage) Reset() {
 	*x = OrbitMessage{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[17]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1332,7 +1649,7 @@ func (x *OrbitMessage) String() string {
 func (*OrbitMessage) ProtoMessage() {}
 
 func (x *OrbitMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[17]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1345,7 +1662,7 @@ func (x *OrbitMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OrbitMessage.ProtoReflect.Descriptor instead.
 func (*OrbitMessage) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{17}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *OrbitMessage) GetType() string {
@@ -1394,7 +1711,7 @@ type CapsuleAnnouncement struct {
 
 func (x *CapsuleAnnouncement) Reset() {
 	*x = CapsuleAnnouncement{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[18]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1406,7 +1723,7 @@ func (x *CapsuleAnnouncement) String() string {
 func (*CapsuleAnnouncement) ProtoMessage() {}
 
 func (x *CapsuleAnnouncement) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[18]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1419,7 +1736,7 @@ func (x *CapsuleAnnouncement) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CapsuleAnnouncement.ProtoReflect.Descriptor instead.
 func (*CapsuleAnnouncement) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{18}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *CapsuleAnnouncement) GetCapsule() *Capsule {
@@ -1450,7 +1767,7 @@ type CapsuleStatusUpdate struct {
 
 func (x *CapsuleStatusUpdate) Reset() {
 	*x = CapsuleStatusUpdate{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[19]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1462,7 +1779,7 @@ func (x *CapsuleStatusUpdate) String() string {
 func (*CapsuleStatusUpdate) ProtoMessage() {}
 
 func (x *CapsuleStatusUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[19]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1475,7 +1792,7 @@ func (x *CapsuleStatusUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CapsuleStatusUpdate.ProtoReflect.Descriptor instead.
 func (*CapsuleStatusUpdate) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{19}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *CapsuleStatusUpdate) GetCapsuleId() string {
@@ -1524,7 +1841,7 @@ type CapsuleWithdrawal struct {
 
 func (x *CapsuleWithdrawal) Reset() {
 	*x = CapsuleWithdrawal{}
-	mi := &file_capsule_proto_capsule_proto_msgTypes[20]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1536,7 +1853,7 @@ func (x *CapsuleWithdrawal) String() string {
 func (*CapsuleWithdrawal) ProtoMessage() {}
 
 func (x *CapsuleWithdrawal) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_capsule_proto_msgTypes[20]
+	mi := &file_capsule_proto_capsule_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1549,7 +1866,7 @@ func (x *CapsuleWithdrawal) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CapsuleWithdrawal.ProtoReflect.Descriptor instead.
 func (*CapsuleWithdrawal) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{20}
+	return file_capsule_proto_capsule_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *CapsuleWithdrawal) GetCapsuleId() string {
@@ -1570,7 +1887,7 @@ var File_capsule_proto_capsule_proto protoreflect.FileDescriptor
 
 const file_capsule_proto_capsule_proto_rawDesc = "" +
 	"\n" +
-	"\x1bcapsule/proto/capsule.proto\x12\rfalak.capsule\x1a\x1fgoogle/protobuf/timestamp.proto\"\xc5\x05\n" +
+	"\x1bcapsule/proto/capsule.proto\x12\rfalak.capsule\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe3\x06\n" +
 	"\vCapsuleSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05image\x18\x02 \x01(\tR\x05image\x12!\n" +
@@ -1587,10 +1904,34 @@ const file_capsule_proto_capsule_proto_rawDesc = "" +
 	"\x0fmomentum_config\x18\r \x01(\v2\x1d.falak.capsule.MomentumConfigR\x0emomentumConfig\x12\x1f\n" +
 	"\vimage_alias\x18\x0e \x01(\tR\n" +
 	"imageAlias\x12\x18\n" +
-	"\acommand\x18\x0f \x03(\tR\acommand\x1a9\n" +
+	"\acommand\x18\x0f \x03(\tR\acommand\x12.\n" +
+	"\x04kind\x18\x10 \x01(\x0e2\x1a.falak.capsule.CapsuleKindR\x04kind\x12\x19\n" +
+	"\bgroup_id\x18\x11 \x01(\tR\agroupId\x12!\n" +
+	"\fgroup_member\x18\x12 \x01(\bR\vgroupMember\x12.\n" +
+	"\x05group\x18\x13 \x01(\v2\x18.falak.capsule.GroupSpecR\x05group\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\v\x10\f\"\xb1\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\v\x10\f\"+\n" +
+	"\n" +
+	"MemberDeps\x12\x1d\n" +
+	"\n" +
+	"depends_on\x18\x01 \x03(\tR\tdependsOn\"\\\n" +
+	"\n" +
+	"MemberSpec\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12.\n" +
+	"\x04spec\x18\x02 \x01(\v2\x1a.falak.capsule.CapsuleSpecR\x04specJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05\"\xd1\x02\n" +
+	"\tGroupSpec\x12=\n" +
+	"\n" +
+	"colocation\x18\x01 \x01(\x0e2\x1d.falak.capsule.ColocationModeR\n" +
+	"colocation\x123\n" +
+	"\amembers\x18\x02 \x03(\v2\x19.falak.capsule.MemberSpecR\amembers\x126\n" +
+	"\x04deps\x18\x03 \x03(\v2\".falak.capsule.GroupSpec.DepsEntryR\x04deps\x12\x1d\n" +
+	"\n" +
+	"member_ids\x18\x04 \x03(\tR\tmemberIds\x12%\n" +
+	"\x0ecascade_delete\x18\x05 \x01(\bR\rcascadeDelete\x1aR\n" +
+	"\tDepsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12/\n" +
+	"\x05value\x18\x02 \x01(\v2\x19.falak.capsule.MemberDepsR\x05value:\x028\x01\"\xb1\x01\n" +
 	"\x14ResourceRequirements\x12\x1b\n" +
 	"\tcpu_cores\x18\x01 \x01(\x05R\bcpuCores\x12\x1b\n" +
 	"\tmemory_mb\x18\x02 \x01(\x03R\bmemoryMb\x12\x17\n" +
@@ -1711,7 +2052,15 @@ const file_capsule_proto_capsule_proto_rawDesc = "" +
 	"\x11CapsuleWithdrawal\x12\x1d\n" +
 	"\n" +
 	"capsule_id\x18\x01 \x01(\tR\tcapsuleId\x12\x16\n" +
-	"\x06reason\x18\x02 \x01(\tR\x06reasonB5Z3github.com/tareksalem/falak/capsule/proto/capsulepbb\x06proto3"
+	"\x06reason\x18\x02 \x01(\tR\x06reason*]\n" +
+	"\vCapsuleKind\x12\x1c\n" +
+	"\x18CAPSULE_KIND_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14CAPSULE_KIND_CAPSULE\x10\x01\x12\x16\n" +
+	"\x12CAPSULE_KIND_GROUP\x10\x02*p\n" +
+	"\x0eColocationMode\x12\x1f\n" +
+	"\x1bCOLOCATION_MODE_UNSPECIFIED\x10\x00\x12\x1d\n" +
+	"\x19COLOCATION_MODE_SAME_NODE\x10\x01\x12\x1e\n" +
+	"\x1aCOLOCATION_MODE_SAME_ORBIT\x10\x02B5Z3github.com/tareksalem/falak/capsule/proto/capsulepbb\x06proto3"
 
 var (
 	file_capsule_proto_capsule_proto_rawDescOnce sync.Once
@@ -1725,68 +2074,82 @@ func file_capsule_proto_capsule_proto_rawDescGZIP() []byte {
 	return file_capsule_proto_capsule_proto_rawDescData
 }
 
-var file_capsule_proto_capsule_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
+var file_capsule_proto_capsule_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_capsule_proto_capsule_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
 var file_capsule_proto_capsule_proto_goTypes = []any{
-	(*CapsuleSpec)(nil),           // 0: falak.capsule.CapsuleSpec
-	(*ResourceRequirements)(nil),  // 1: falak.capsule.ResourceRequirements
-	(*ReplicaConfig)(nil),         // 2: falak.capsule.ReplicaConfig
-	(*ScalingRule)(nil),           // 3: falak.capsule.ScalingRule
-	(*PlacementRule)(nil),         // 4: falak.capsule.PlacementRule
-	(*RuntimeConfig)(nil),         // 5: falak.capsule.RuntimeConfig
-	(*NetworkConfig)(nil),         // 6: falak.capsule.NetworkConfig
-	(*PortMapping)(nil),           // 7: falak.capsule.PortMapping
-	(*HealthCheck)(nil),           // 8: falak.capsule.HealthCheck
-	(*FailurePolicy)(nil),         // 9: falak.capsule.FailurePolicy
-	(*LogRetention)(nil),          // 10: falak.capsule.LogRetention
-	(*RegistryAuth)(nil),          // 11: falak.capsule.RegistryAuth
-	(*SnapshotConfig)(nil),        // 12: falak.capsule.SnapshotConfig
-	(*MomentumConfig)(nil),        // 13: falak.capsule.MomentumConfig
-	(*Capsule)(nil),               // 14: falak.capsule.Capsule
-	(*ReplicaState)(nil),          // 15: falak.capsule.ReplicaState
-	(*MomentumState)(nil),         // 16: falak.capsule.MomentumState
-	(*OrbitMessage)(nil),          // 17: falak.capsule.OrbitMessage
-	(*CapsuleAnnouncement)(nil),   // 18: falak.capsule.CapsuleAnnouncement
-	(*CapsuleStatusUpdate)(nil),   // 19: falak.capsule.CapsuleStatusUpdate
-	(*CapsuleWithdrawal)(nil),     // 20: falak.capsule.CapsuleWithdrawal
-	nil,                           // 21: falak.capsule.CapsuleSpec.LabelsEntry
-	nil,                           // 22: falak.capsule.PlacementRule.LabelsEntry
-	nil,                           // 23: falak.capsule.RuntimeConfig.EnvEntry
-	(*timestamppb.Timestamp)(nil), // 24: google.protobuf.Timestamp
+	(CapsuleKind)(0),              // 0: falak.capsule.CapsuleKind
+	(ColocationMode)(0),           // 1: falak.capsule.ColocationMode
+	(*CapsuleSpec)(nil),           // 2: falak.capsule.CapsuleSpec
+	(*MemberDeps)(nil),            // 3: falak.capsule.MemberDeps
+	(*MemberSpec)(nil),            // 4: falak.capsule.MemberSpec
+	(*GroupSpec)(nil),             // 5: falak.capsule.GroupSpec
+	(*ResourceRequirements)(nil),  // 6: falak.capsule.ResourceRequirements
+	(*ReplicaConfig)(nil),         // 7: falak.capsule.ReplicaConfig
+	(*ScalingRule)(nil),           // 8: falak.capsule.ScalingRule
+	(*PlacementRule)(nil),         // 9: falak.capsule.PlacementRule
+	(*RuntimeConfig)(nil),         // 10: falak.capsule.RuntimeConfig
+	(*NetworkConfig)(nil),         // 11: falak.capsule.NetworkConfig
+	(*PortMapping)(nil),           // 12: falak.capsule.PortMapping
+	(*HealthCheck)(nil),           // 13: falak.capsule.HealthCheck
+	(*FailurePolicy)(nil),         // 14: falak.capsule.FailurePolicy
+	(*LogRetention)(nil),          // 15: falak.capsule.LogRetention
+	(*RegistryAuth)(nil),          // 16: falak.capsule.RegistryAuth
+	(*SnapshotConfig)(nil),        // 17: falak.capsule.SnapshotConfig
+	(*MomentumConfig)(nil),        // 18: falak.capsule.MomentumConfig
+	(*Capsule)(nil),               // 19: falak.capsule.Capsule
+	(*ReplicaState)(nil),          // 20: falak.capsule.ReplicaState
+	(*MomentumState)(nil),         // 21: falak.capsule.MomentumState
+	(*OrbitMessage)(nil),          // 22: falak.capsule.OrbitMessage
+	(*CapsuleAnnouncement)(nil),   // 23: falak.capsule.CapsuleAnnouncement
+	(*CapsuleStatusUpdate)(nil),   // 24: falak.capsule.CapsuleStatusUpdate
+	(*CapsuleWithdrawal)(nil),     // 25: falak.capsule.CapsuleWithdrawal
+	nil,                           // 26: falak.capsule.CapsuleSpec.LabelsEntry
+	nil,                           // 27: falak.capsule.GroupSpec.DepsEntry
+	nil,                           // 28: falak.capsule.PlacementRule.LabelsEntry
+	nil,                           // 29: falak.capsule.RuntimeConfig.EnvEntry
+	(*timestamppb.Timestamp)(nil), // 30: google.protobuf.Timestamp
 }
 var file_capsule_proto_capsule_proto_depIdxs = []int32{
-	21, // 0: falak.capsule.CapsuleSpec.labels:type_name -> falak.capsule.CapsuleSpec.LabelsEntry
-	1,  // 1: falak.capsule.CapsuleSpec.resources:type_name -> falak.capsule.ResourceRequirements
-	2,  // 2: falak.capsule.CapsuleSpec.replicas:type_name -> falak.capsule.ReplicaConfig
-	3,  // 3: falak.capsule.CapsuleSpec.scaling_rules:type_name -> falak.capsule.ScalingRule
-	4,  // 4: falak.capsule.CapsuleSpec.placement_rules:type_name -> falak.capsule.PlacementRule
-	5,  // 5: falak.capsule.CapsuleSpec.runtime:type_name -> falak.capsule.RuntimeConfig
-	13, // 6: falak.capsule.CapsuleSpec.momentum_config:type_name -> falak.capsule.MomentumConfig
-	22, // 7: falak.capsule.PlacementRule.labels:type_name -> falak.capsule.PlacementRule.LabelsEntry
-	23, // 8: falak.capsule.RuntimeConfig.env:type_name -> falak.capsule.RuntimeConfig.EnvEntry
-	6,  // 9: falak.capsule.RuntimeConfig.network:type_name -> falak.capsule.NetworkConfig
-	8,  // 10: falak.capsule.RuntimeConfig.health_check:type_name -> falak.capsule.HealthCheck
-	9,  // 11: falak.capsule.RuntimeConfig.failure_policy:type_name -> falak.capsule.FailurePolicy
-	10, // 12: falak.capsule.RuntimeConfig.log_retention:type_name -> falak.capsule.LogRetention
-	11, // 13: falak.capsule.RuntimeConfig.registry:type_name -> falak.capsule.RegistryAuth
-	12, // 14: falak.capsule.RuntimeConfig.snapshot:type_name -> falak.capsule.SnapshotConfig
-	7,  // 15: falak.capsule.NetworkConfig.ports:type_name -> falak.capsule.PortMapping
-	0,  // 16: falak.capsule.Capsule.spec:type_name -> falak.capsule.CapsuleSpec
-	15, // 17: falak.capsule.Capsule.replicas:type_name -> falak.capsule.ReplicaState
-	24, // 18: falak.capsule.Capsule.created_at:type_name -> google.protobuf.Timestamp
-	24, // 19: falak.capsule.Capsule.updated_at:type_name -> google.protobuf.Timestamp
-	16, // 20: falak.capsule.Capsule.momentum:type_name -> falak.capsule.MomentumState
-	24, // 21: falak.capsule.ReplicaState.started_at:type_name -> google.protobuf.Timestamp
-	24, // 22: falak.capsule.MomentumState.last_adjusted:type_name -> google.protobuf.Timestamp
-	24, // 23: falak.capsule.OrbitMessage.timestamp:type_name -> google.protobuf.Timestamp
-	14, // 24: falak.capsule.CapsuleAnnouncement.capsule:type_name -> falak.capsule.Capsule
-	15, // 25: falak.capsule.CapsuleStatusUpdate.replicas:type_name -> falak.capsule.ReplicaState
-	16, // 26: falak.capsule.CapsuleStatusUpdate.momentum:type_name -> falak.capsule.MomentumState
-	24, // 27: falak.capsule.CapsuleStatusUpdate.timestamp:type_name -> google.protobuf.Timestamp
-	28, // [28:28] is the sub-list for method output_type
-	28, // [28:28] is the sub-list for method input_type
-	28, // [28:28] is the sub-list for extension type_name
-	28, // [28:28] is the sub-list for extension extendee
-	0,  // [0:28] is the sub-list for field type_name
+	26, // 0: falak.capsule.CapsuleSpec.labels:type_name -> falak.capsule.CapsuleSpec.LabelsEntry
+	6,  // 1: falak.capsule.CapsuleSpec.resources:type_name -> falak.capsule.ResourceRequirements
+	7,  // 2: falak.capsule.CapsuleSpec.replicas:type_name -> falak.capsule.ReplicaConfig
+	8,  // 3: falak.capsule.CapsuleSpec.scaling_rules:type_name -> falak.capsule.ScalingRule
+	9,  // 4: falak.capsule.CapsuleSpec.placement_rules:type_name -> falak.capsule.PlacementRule
+	10, // 5: falak.capsule.CapsuleSpec.runtime:type_name -> falak.capsule.RuntimeConfig
+	18, // 6: falak.capsule.CapsuleSpec.momentum_config:type_name -> falak.capsule.MomentumConfig
+	0,  // 7: falak.capsule.CapsuleSpec.kind:type_name -> falak.capsule.CapsuleKind
+	5,  // 8: falak.capsule.CapsuleSpec.group:type_name -> falak.capsule.GroupSpec
+	2,  // 9: falak.capsule.MemberSpec.spec:type_name -> falak.capsule.CapsuleSpec
+	1,  // 10: falak.capsule.GroupSpec.colocation:type_name -> falak.capsule.ColocationMode
+	4,  // 11: falak.capsule.GroupSpec.members:type_name -> falak.capsule.MemberSpec
+	27, // 12: falak.capsule.GroupSpec.deps:type_name -> falak.capsule.GroupSpec.DepsEntry
+	28, // 13: falak.capsule.PlacementRule.labels:type_name -> falak.capsule.PlacementRule.LabelsEntry
+	29, // 14: falak.capsule.RuntimeConfig.env:type_name -> falak.capsule.RuntimeConfig.EnvEntry
+	11, // 15: falak.capsule.RuntimeConfig.network:type_name -> falak.capsule.NetworkConfig
+	13, // 16: falak.capsule.RuntimeConfig.health_check:type_name -> falak.capsule.HealthCheck
+	14, // 17: falak.capsule.RuntimeConfig.failure_policy:type_name -> falak.capsule.FailurePolicy
+	15, // 18: falak.capsule.RuntimeConfig.log_retention:type_name -> falak.capsule.LogRetention
+	16, // 19: falak.capsule.RuntimeConfig.registry:type_name -> falak.capsule.RegistryAuth
+	17, // 20: falak.capsule.RuntimeConfig.snapshot:type_name -> falak.capsule.SnapshotConfig
+	12, // 21: falak.capsule.NetworkConfig.ports:type_name -> falak.capsule.PortMapping
+	2,  // 22: falak.capsule.Capsule.spec:type_name -> falak.capsule.CapsuleSpec
+	20, // 23: falak.capsule.Capsule.replicas:type_name -> falak.capsule.ReplicaState
+	30, // 24: falak.capsule.Capsule.created_at:type_name -> google.protobuf.Timestamp
+	30, // 25: falak.capsule.Capsule.updated_at:type_name -> google.protobuf.Timestamp
+	21, // 26: falak.capsule.Capsule.momentum:type_name -> falak.capsule.MomentumState
+	30, // 27: falak.capsule.ReplicaState.started_at:type_name -> google.protobuf.Timestamp
+	30, // 28: falak.capsule.MomentumState.last_adjusted:type_name -> google.protobuf.Timestamp
+	30, // 29: falak.capsule.OrbitMessage.timestamp:type_name -> google.protobuf.Timestamp
+	19, // 30: falak.capsule.CapsuleAnnouncement.capsule:type_name -> falak.capsule.Capsule
+	20, // 31: falak.capsule.CapsuleStatusUpdate.replicas:type_name -> falak.capsule.ReplicaState
+	21, // 32: falak.capsule.CapsuleStatusUpdate.momentum:type_name -> falak.capsule.MomentumState
+	30, // 33: falak.capsule.CapsuleStatusUpdate.timestamp:type_name -> google.protobuf.Timestamp
+	3,  // 34: falak.capsule.GroupSpec.DepsEntry.value:type_name -> falak.capsule.MemberDeps
+	35, // [35:35] is the sub-list for method output_type
+	35, // [35:35] is the sub-list for method input_type
+	35, // [35:35] is the sub-list for extension type_name
+	35, // [35:35] is the sub-list for extension extendee
+	0,  // [0:35] is the sub-list for field type_name
 }
 
 func init() { file_capsule_proto_capsule_proto_init() }
@@ -1799,13 +2162,14 @@ func file_capsule_proto_capsule_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_capsule_proto_capsule_proto_rawDesc), len(file_capsule_proto_capsule_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   24,
+			NumEnums:      2,
+			NumMessages:   28,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_capsule_proto_capsule_proto_goTypes,
 		DependencyIndexes: file_capsule_proto_capsule_proto_depIdxs,
+		EnumInfos:         file_capsule_proto_capsule_proto_enumTypes,
 		MessageInfos:      file_capsule_proto_capsule_proto_msgTypes,
 	}.Build()
 	File_capsule_proto_capsule_proto = out.File

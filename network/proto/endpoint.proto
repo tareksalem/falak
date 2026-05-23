@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package falak.network;
+
+option go_package = "github.com/tareksalem/falak/network/proto/endpointpb";
+
+import "google/protobuf/timestamp.proto";
+
+// EndpointRecord is a single replica's reachability announcement on the
+// per-group endpoint topic. Multiple records may coexist for the same
+// capsule (one per replica).
+message EndpointRecord {
+    string cluster_path = 1;
+    string group_id     = 2;
+    string capsule_name = 3;
+    string replica_id   = 4;
+    string node_id      = 5;
+    string bridge_ip    = 6;
+    repeated NamedPort named_ports = 7;
+    // swim_state mirrors the publishing node's view of the replica:
+    // "alive", "suspect", or "dead". Subscribers filter on this value.
+    string swim_state   = 8;
+    google.protobuf.Timestamp emitted_at = 9;
+    // ttl_seconds is the receiver hint: keep this record around for at
+    // most TTL × 2 before treating it as expired.
+    int32  ttl_seconds  = 10;
+}
+
+// NamedPort maps a logical port name to its container-side numeric value
+// and IP protocol. DNS resolution by name uses these entries.
+message NamedPort {
+    string name           = 1;
+    uint32 container_port = 2;
+    // protocol is "tcp" or "udp"; empty implies tcp.
+    string protocol       = 3;
+}
+
+// EndpointWithdrawal removes an EndpointRecord for a specific replica.
+// Used on graceful container stop; the receiver also expires records
+// automatically via TTL when no withdrawal arrives.
+message EndpointWithdrawal {
+    string cluster_path = 1;
+    string group_id     = 2;
+    string capsule_name = 3;
+    string replica_id   = 4;
+    string node_id      = 5;
+    google.protobuf.Timestamp emitted_at = 6;
+}
+
+// Envelope wraps a record or withdrawal payload with a signature so
+// receivers can verify the message came from the claimed sender. The
+// sender's public key is looked up by node ID via the cluster phonebook.
+message Envelope {
+    // type is "record" or "withdrawal".
+    string type      = 1;
+    // payload is the marshalled EndpointRecord or EndpointWithdrawal.
+    bytes payload    = 2;
+    string sender_id = 3;
+    google.protobuf.Timestamp timestamp = 4;
+    bytes signature  = 5;
+}

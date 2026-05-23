@@ -11,7 +11,9 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/tareksalem/falak/capsule"
+	"github.com/tareksalem/falak/capsule/enums"
 	"github.com/tareksalem/falak/capsule/scaling"
+	"github.com/tareksalem/falak/network/dns"
 	"github.com/tareksalem/falak/node/internal/events"
 	falakrt "github.com/tareksalem/falak/runtime"
 	"github.com/tareksalem/falak/shared/secrets"
@@ -23,9 +25,18 @@ import (
 // expects. Keeps the runtime package free of capsule module imports.
 // If sek is non-nil, encrypted registry credentials in the capsule
 // spec are decrypted before being passed to the runtime handler.
+//
+// When injectDNS is true the adapter populates Spec.DNSFlags with the
+// per-group Podman DNS flags (--dns=169.254.169.250, dns-search="",
+// dns-option=ndots:0) for capsules that belong to a CapsuleGroup. The
+// runtime handler then forwards them to the container runtime so the
+// container's /etc/resolv.conf points at the link-local DNS responder.
+// Standalone capsules keep Podman's default DNS behaviour regardless
+// of this flag.
 type runtimeCapsuleStoreAdapter struct {
-	manager *capsule.Manager
-	sek     []byte // secrets encryption key; nil = no decryption
+	manager   *capsule.Manager
+	sek       []byte // secrets encryption key; nil = no decryption
+	injectDNS bool
 }
 
 func (a *runtimeCapsuleStoreAdapter) GetSpec(capsuleID string) (*falakrt.CapsuleSpec, error) {
@@ -66,9 +77,9 @@ func (a *runtimeCapsuleStoreAdapter) GetSpec(capsuleID string) (*falakrt.Capsule
 			InitialDelay: hc.InitialDelay,
 		}
 		switch hc.Type {
-		case capsule.HealthCheckTypeEnum.HTTP():
+		case enums.HealthCheckTypeEnum.HTTP():
 			spec.HealthCheck.Type = falakrt.HealthCheckTypeEnum.HTTP()
-		case capsule.HealthCheckTypeEnum.TCP():
+		case enums.HealthCheckTypeEnum.TCP():
 			spec.HealthCheck.Type = falakrt.HealthCheckTypeEnum.TCP()
 		}
 	}
@@ -94,7 +105,7 @@ func (a *runtimeCapsuleStoreAdapter) GetSpec(capsuleID string) (*falakrt.Capsule
 
 	// Map network mode.
 	switch s.Runtime.Network.Mode {
-	case capsule.NetworkModeEnum.Host():
+	case enums.NetworkModeEnum.Host():
 		spec.NetworkMode = falakrt.NetworkModeEnum.Host()
 	default:
 		spec.NetworkMode = falakrt.NetworkModeEnum.Bridge()
@@ -108,6 +119,15 @@ func (a *runtimeCapsuleStoreAdapter) GetSpec(capsuleID string) (*falakrt.Capsule
 			HostPort:      p.HostPort,
 			Protocol:      p.Protocol,
 		})
+	}
+
+	// Per-group DNS injection (Phase 11A.15): when the network manager
+	// is wired up and the capsule belongs to a CapsuleGroup, point its
+	// /etc/resolv.conf at the link-local DNS responder so capsule-name
+	// resolution flows through the per-bridge listener. Standalone
+	// capsules keep Podman's default DNS regardless of injectDNS.
+	if a.injectDNS && c.Spec.GroupID != "" {
+		spec.DNSFlags = dns.PodmanDNSFlags()
 	}
 
 	return spec, nil
@@ -163,13 +183,189 @@ func (a *runtimeLifecycleAdapter) MarkStopped(capsuleID string) error {
 	return nil
 }
 
+// runtimeGroupViewAdapter satisfies runtime.GroupView by translating
+// capsule.Manager group queries into the runtime package's narrow
+// MemberInfo / SiblingState shape. Keeps the runtime package free of
+// capsule module imports.
+//
+// The adapter is best-effort: when a member's parent group is not yet
+// known to the local manager (gossip ordering), MemberInfo returns
+// (zero, false) and the runtime handler treats the capsule as if it
+// has no group dependencies. The orphan reaper in capsule_handler.go
+// guards the case where the group never arrives.
+type runtimeGroupViewAdapter struct {
+	manager *capsule.Manager
+}
+
+// MemberInfo returns the dependency context for a capsule that is a
+// group member. Returns (zero, false) when the capsule is standalone or
+// when its parent group is not visible locally.
+func (a *runtimeGroupViewAdapter) MemberInfo(capsuleID string) (falakrt.MemberInfo, bool) {
+	if a == nil || a.manager == nil {
+		return falakrt.MemberInfo{}, false
+	}
+	c := a.manager.Get(capsule.CapsuleID(capsuleID))
+	if c == nil || c.Spec.GroupID == "" {
+		return falakrt.MemberInfo{}, false
+	}
+
+	group := a.manager.Get(c.Spec.GroupID)
+	if group == nil || group.Spec.Group == nil {
+		return falakrt.MemberInfo{}, false
+	}
+
+	// Find this capsule's member-name and DependsOn list inside the
+	// group spec. Members are matched by ID against the group's
+	// MemberIDs slice (positional with Members).
+	memberName := ""
+	var dependsOn []string
+	for i, mid := range group.Spec.Group.MemberIDs {
+		if mid != c.ID {
+			continue
+		}
+		if i < len(group.Spec.Group.Members) {
+			memberName = group.Spec.Group.Members[i].Name
+			dependsOn = append([]string(nil), group.Spec.Group.Members[i].DependsOn...)
+		}
+		break
+	}
+
+	// Build the siblings map: every member of this group keyed by name,
+	// with the current Running status of the local capsule view.
+	siblings := make(map[string]falakrt.SiblingState, len(group.Spec.Group.MemberIDs))
+	for i, mid := range group.Spec.Group.MemberIDs {
+		if i >= len(group.Spec.Group.Members) {
+			break
+		}
+		name := group.Spec.Group.Members[i].Name
+		sibling := a.manager.Get(mid)
+		if sibling == nil {
+			siblings[name] = falakrt.SiblingState{CapsuleID: mid.String()}
+			continue
+		}
+		siblings[name] = falakrt.SiblingState{
+			CapsuleID: mid.String(),
+			Running:   sibling.Status == enums.CapsuleStatusEnum.Running(),
+		}
+	}
+
+	return falakrt.MemberInfo{
+		GroupID:   c.Spec.GroupID.String(),
+		Name:      memberName,
+		DependsOn: dependsOn,
+		Siblings:  siblings,
+	}, true
+}
+
+// CapsuleIDByMemberName resolves a sibling member's name to its capsule
+// ID within the same group. Returns ("", false) if the group is not
+// known locally or the name is not in the group.
+func (a *runtimeGroupViewAdapter) CapsuleIDByMemberName(groupID, memberName string) (string, bool) {
+	if a == nil || a.manager == nil {
+		return "", false
+	}
+	group := a.manager.Get(capsule.CapsuleID(groupID))
+	if group == nil || group.Spec.Group == nil {
+		return "", false
+	}
+	for i, member := range group.Spec.Group.Members {
+		if member.Name != memberName {
+			continue
+		}
+		if i >= len(group.Spec.Group.MemberIDs) {
+			return "", false
+		}
+		return group.Spec.Group.MemberIDs[i].String(), true
+	}
+	return "", false
+}
+
+// Colocation returns the colocation mode for the given group capsule.
+// Returns ("", false) when the group is not visible locally or is not
+// a Kind=Group capsule. The string is the underlying capsule package's
+// canonical ColocationMode value; the runtime package compares it
+// against its local constant runtime.ColocationSameNode.
+func (a *runtimeGroupViewAdapter) Colocation(groupID string) (string, bool) {
+	if a == nil || a.manager == nil {
+		return "", false
+	}
+	group := a.manager.Get(capsule.CapsuleID(groupID))
+	if group == nil || group.Spec.Group == nil {
+		return "", false
+	}
+	return string(group.Spec.Group.Colocation), true
+}
+
+// runtimeGroupEventEmitter satisfies runtime.GroupEventEmitter by
+// publishing MemberPlacementFailed and PullProgress events onto the
+// node event bus. Keeps the runtime package free of node-internal
+// imports.
+//
+// The emitter is a thin translation layer — every call publishes
+// exactly one event. The election manager subscribes to PullProgress
+// (to extend the reservation deadline) and the capsule handler
+// subscribes to MemberPlacementFailed (to drive same-node rollback).
+type runtimeGroupEventEmitter struct {
+	bus         events.Bus
+	nodeID      string
+	clusterPath string
+}
+
+// EmitMemberPlacementFailed publishes events.MemberPlacementFailed on
+// the node bus. capsuleID is the failing member; groupID is its
+// parent. reason is a human-readable explanation surfaced in logs and
+// observability dashboards.
+func (e *runtimeGroupEventEmitter) EmitMemberPlacementFailed(groupID, capsuleID, reason string) {
+	if e == nil || e.bus == nil {
+		return
+	}
+	e.bus.Publish(events.MemberPlacementFailed{
+		BaseEvent:   events.NewBaseEvent(),
+		GroupID:     groupID,
+		CapsuleID:   capsuleID,
+		NodeID:      e.nodeID,
+		ClusterPath: e.clusterPath,
+		Reason:      reason,
+	})
+}
+
+// EmitPullProgress publishes events.PullProgress on the node bus.
+// groupID is empty for standalone capsules. BytesRemaining=-1 and
+// BytesPerSecond=0 signal "alive, progress unknown" (the v1 mode);
+// real progress values land in 10.16b.
+func (e *runtimeGroupEventEmitter) EmitPullProgress(groupID, capsuleID string, bytesRemaining, bytesPerSecond int64) {
+	if e == nil || e.bus == nil {
+		return
+	}
+	e.bus.Publish(events.PullProgress{
+		BaseEvent:      events.NewBaseEvent(),
+		GroupID:        groupID,
+		CapsuleID:      capsuleID,
+		NodeID:         e.nodeID,
+		ClusterPath:    e.clusterPath,
+		BytesRemaining: bytesRemaining,
+		BytesPerSecond: bytesPerSecond,
+	})
+}
+
+// NewRuntimeGroupEventEmitter constructs an emitter suitable for
+// wiring into runtime.NewHandler via runtime.WithGroupEventEmitter.
+// nodeID is the local node ID; clusterPath identifies the cluster
+// the event applies to (carried for cross-cluster observability
+// even when a single node hosts multiple clusters).
+func NewRuntimeGroupEventEmitter(bus events.Bus, nodeID, clusterPath string) *runtimeGroupEventEmitter {
+	return &runtimeGroupEventEmitter{bus: bus, nodeID: nodeID, clusterPath: clusterPath}
+}
+
 // RuntimeBridge subscribes to ElectionWon events on the node event bus
-// and dispatches them to the runtime.Handler. It is the glue between
-// the election subsystem and the container runtime.
+// and dispatches them to the runtime.Handler. It also forwards
+// CapsuleRunning events to the handler's group dependency coordinator
+// so parked starts can release once their dependencies reach Running.
 type RuntimeBridge struct {
-	handler  *falakrt.Handler
-	eventBus events.Bus
-	logger   *zap.Logger
+	handler    *falakrt.Handler
+	eventBus   events.Bus
+	logger     *zap.Logger
+	capsuleMgr *capsule.Manager // optional; required for group-claim FSM advancement
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -182,6 +378,18 @@ type RuntimeBridgeOption func(*RuntimeBridge)
 // WithRuntimeBridgeLogger sets the logger.
 func WithRuntimeBridgeLogger(logger *zap.Logger) RuntimeBridgeOption {
 	return func(b *RuntimeBridge) { b.logger = logger }
+}
+
+// WithRuntimeBridgeCapsuleManager wires the capsule manager used by
+// the group-claim path to advance member capsules through the
+// Announced → Assigned lifecycle states before StartGroup runs. The
+// per-replica election path advances state through the election
+// manager; the group-claim path bypasses it, so the bridge drives
+// the transitions explicitly. Optional: without it, group members
+// will fail MarkRunning because the runtime's lifecycle adapter
+// cannot transition from Announced directly to Running.
+func WithRuntimeBridgeCapsuleManager(m *capsule.Manager) RuntimeBridgeOption {
+	return func(b *RuntimeBridge) { b.capsuleMgr = m }
 }
 
 // NewRuntimeBridge creates a bridge between the event bus and the
@@ -198,20 +406,24 @@ func NewRuntimeBridge(handler *falakrt.Handler, bus events.Bus, opts ...RuntimeB
 	return b
 }
 
-// Start begins listening for ElectionWon events.
+// Start begins listening for ElectionWon, CapsuleRunning, and
+// GroupClaimWon events.
 func (b *RuntimeBridge) Start(ctx context.Context) {
 	b.ctx, b.cancel = context.WithCancel(ctx)
-	b.wg.Add(1)
-	go b.loop()
+	b.wg.Add(3)
+	go b.electionLoop()
+	go b.runningLoop()
+	go b.groupLoop()
 }
 
-// Stop cancels the listener and waits for clean exit.
+// Stop cancels the listeners and waits for clean exit.
 func (b *RuntimeBridge) Stop() {
 	b.cancel()
 	b.wg.Wait()
 }
 
-func (b *RuntimeBridge) loop() {
+// electionLoop dispatches ElectionWon events to the runtime handler.
+func (b *RuntimeBridge) electionLoop() {
 	defer b.wg.Done()
 	ch := b.eventBus.Subscribe(events.TypeElectionWon)
 	for {
@@ -237,6 +449,111 @@ func (b *RuntimeBridge) loop() {
 				Score:       won.Score,
 				NodeID:      won.NodeID,
 			})
+		}
+	}
+}
+
+// runningLoop forwards CapsuleRunning events to the handler's group
+// dependency coordinator so parked sibling starts can release. The
+// coordinator filters non-group capsules internally; this loop fans
+// every Running event to it without filtering on the bridge side.
+func (b *RuntimeBridge) runningLoop() {
+	defer b.wg.Done()
+	ch := b.eventBus.Subscribe(events.TypeCapsuleRunning)
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			running, ok := ev.(events.CapsuleRunning)
+			if !ok {
+				continue
+			}
+			b.handler.OnDependencyRunning(running.CapsuleID)
+		}
+	}
+}
+
+// groupLoop translates GroupClaimWon events from the node bus into the
+// runtime package's GroupClaimWon shape and dispatches them to
+// Handler.StartGroup. The runtime package stays free of node-internal
+// imports; the bridge owns the translation.
+//
+// Before dispatching StartGroup the bridge advances each member's
+// lifecycle through Announced → Electing → Assigned so the runtime
+// adapter's later MarkRunning(Executing → Running) transition does
+// not reject from an invalid prior state. The per-replica election
+// path does this through the election manager's WinElection call;
+// the group-claim path bypasses per-replica elections, so the
+// bridge drives the same transitions explicitly here. Failures are
+// logged at debug level and ignored — they typically indicate the
+// FSM is already past Assigned (e.g. when StartGroup is re-driven
+// after a transient failure).
+func (b *RuntimeBridge) groupLoop() {
+	defer b.wg.Done()
+	ch := b.eventBus.Subscribe(events.TypeGroupClaimWon)
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			won, ok := ev.(events.GroupClaimWon)
+			if !ok {
+				continue
+			}
+			b.logger.Info("runtime bridge: dispatching GroupClaimWon",
+				zap.String("group_id", won.GroupID),
+				zap.String("cluster", won.ClusterPath),
+				zap.Int("members", len(won.MemberIDs)))
+
+			b.advanceGroupMembersToAssigned(won)
+
+			b.handler.StartGroup(falakrt.GroupClaimWon{
+				GroupID:     won.GroupID,
+				ClusterPath: won.ClusterPath,
+				MemberIDs:   append([]string(nil), won.MemberIDs...),
+				NodeID:      won.NodeID,
+				Score:       won.Score,
+			})
+		}
+	}
+}
+
+// advanceGroupMembersToAssigned walks each member of a same-node group
+// through the Announced → Electing → Assigned lifecycle transitions
+// using the capsule manager. The runtime's MarkRunning path expects
+// the capsule to be in Executing state (which it can advance to from
+// Assigned via StartExecution); without this advancement the runtime
+// silently fails to publish CapsuleRunning and dependent siblings
+// stay parked forever.
+//
+// Each transition is best-effort: SyncStatus rebuilds the FSM at the
+// target state regardless of validation rules, so even capsules in
+// unexpected states converge. Replica assignment is recorded so the
+// per-replica node-failure detection path can still observe orphans
+// if the runtime ever crashes mid-start.
+func (b *RuntimeBridge) advanceGroupMembersToAssigned(won events.GroupClaimWon) {
+	mgr := b.capsuleMgr
+	if mgr == nil {
+		return
+	}
+	for _, mid := range won.MemberIDs {
+		id := capsule.CapsuleID(mid)
+		if err := mgr.SyncStatus(id, enums.CapsuleStatusEnum.Assigned()); err != nil {
+			b.logger.Debug("group bridge: sync member to Assigned failed",
+				zap.String("capsule_id", mid), zap.Error(err))
+		}
+		if err := mgr.AssignReplica(id, capsule.ReplicaID("0"), won.NodeID); err != nil {
+			b.logger.Debug("group bridge: AssignReplica failed",
+				zap.String("capsule_id", mid),
+				zap.String("node_id", won.NodeID),
+				zap.Error(err))
 		}
 	}
 }

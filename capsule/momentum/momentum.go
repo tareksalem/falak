@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/tareksalem/falak/capsule"
+	"github.com/tareksalem/falak/capsule/enums"
 )
 
 // Tracker manages the momentum state for a capsule.
@@ -97,7 +98,7 @@ func NewTracker(config capsule.MomentumConfig, opts ...TrackerOption) *Tracker {
 }
 
 // NewTrackerFromTier creates a tracker using tier defaults.
-func NewTrackerFromTier(tier capsule.Tier, opts ...TrackerOption) *Tracker {
+func NewTrackerFromTier(tier enums.Tier, opts ...TrackerOption) *Tracker {
 	return NewTracker(capsule.MomentumConfig{
 		Base:           tier.BaseMomentum(),
 		BoostOnTraffic: true,

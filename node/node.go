@@ -20,6 +20,7 @@ import (
 
 	"github.com/tareksalem/falak/capsule"
 	"github.com/tareksalem/falak/election"
+	"github.com/tareksalem/falak/network/proxy"
 	falakrt "github.com/tareksalem/falak/runtime"
 	"github.com/tareksalem/falak/shared"
 	"github.com/tareksalem/falak/shared/secrets"
@@ -150,6 +151,22 @@ type Node struct {
 	runtimeHandler   *falakrt.Handler
 	containerRuntime falakrt.Runtime // injected via WithRuntime option
 
+	// Network handler (created at Start when network.enabled=true and
+	// a NetworkManagerFactory is wired). Bridges node event bus to the
+	// per-cluster network.Manager. Tests omit the factory and the
+	// handler short-circuits to a no-op.
+	networkHandler        *NetworkHandler
+	networkConfig         NetworkConfig
+	networkManagerFactory NetworkManagerFactory
+	networkConfigured     bool
+
+	// Service handler (created at Start when service.enabled=true).
+	// Owns the service.Manager, gossip publisher/subscriber, and the
+	// proxy manager. Default disabled — opt in via WithServiceConfig.
+	serviceHandler   *ServiceHandler
+	serviceConfig    ServiceConfig
+	serviceConfigured bool
+
 	// Snapshot store + discovery (created alongside runtime handler).
 	snapshotStore     *snapshot.Store
 	snapshotDiscovery *snapshot.Discovery
@@ -170,6 +187,12 @@ type Node struct {
 
 	// Testing flags
 	rejectAllAuth bool
+
+	// placementRetryCap, when set positive, overrides the capsule
+	// handler's default same-node group placement retry cap. Used by
+	// integration tests that need to drive cap exhaustion with a
+	// small node count.
+	placementRetryCap int
 }
 
 // ClusterConfig holds configuration for joining a cluster.
@@ -290,6 +313,53 @@ func WithShutdownTimeout(d time.Duration) Option {
 func WithLogger(logger *zap.Logger) Option {
 	return func(n *Node) {
 		n.logger = logger
+	}
+}
+
+// WithPlacementRetryCap overrides the same-node group placement
+// retry cap on the embedded CapsuleHandler. Non-positive values are
+// ignored. Exposed for integration tests that need to drive cap
+// exhaustion deterministically with a small node count.
+func WithPlacementRetryCap(n int) Option {
+	return func(node *Node) {
+		if n > 0 {
+			node.placementRetryCap = n
+		}
+	}
+}
+
+// WithNetworkConfig wires the per-cluster network subsystem
+// configuration onto this node. The configuration is consumed when the
+// network handler is built in Start; calling this multiple times
+// replaces the prior value. When omitted the network subsystem stays
+// disabled regardless of WithNetworkManagerFactory.
+func WithNetworkConfig(cfg NetworkConfig) Option {
+	return func(n *Node) {
+		n.networkConfig = cfg
+		n.networkConfigured = true
+	}
+}
+
+// WithNodeNetworkManagerFactory injects the factory the network handler
+// uses to construct the underlying network.Manager. Production wires a
+// builder that pulls bridge / overlay / DNS / endpoint dependencies
+// together; tests pass a stub that returns a fake manager. Omitting it
+// leaves the network subsystem disabled even when WithNetworkConfig
+// requests it.
+func WithNodeNetworkManagerFactory(f NetworkManagerFactory) Option {
+	return func(n *Node) { n.networkManagerFactory = f }
+}
+
+// WithServiceConfig enables the Service (traffic-management) subsystem
+// on this node with the given configuration. Omit to leave the
+// subsystem off — capsules still run, but no Service control plane
+// comes up. The handler is constructed in Start after the network
+// handler so the per-group bridge gateway map is available for the
+// proxy manager to consult.
+func WithServiceConfig(cfg ServiceConfig) Option {
+	return func(n *Node) {
+		n.serviceConfig = cfg
+		n.serviceConfigured = true
 	}
 }
 
@@ -481,6 +551,20 @@ func (n *Node) Start() error {
 		return fmt.Errorf("failed to start capsule handler: %w", err)
 	}
 
+	// 12a. Create and start the per-cluster NetworkHandler. The handler
+	// bridges the node event bus to the network.Manager (bridge,
+	// overlay, DNS, endpoint gossip). When the factory is unwired the
+	// handler logs a warning and skips, leaving the runtime fully
+	// functional with Podman's default networking. Must come before
+	// the runtime handler so per-group bridges exist when containers
+	// start.
+	n.initializeNetworkHandler()
+
+	// 12b. Create and start the Service handler. Sits on top of the
+	// network handler so the proxy manager can see the bridge gateway
+	// map. Disabled by default — opt in via WithServiceConfig.
+	n.initializeServiceHandler()
+
 	// 13. Create and start the election manager. Depends on metrics
 	// (state provider), capsules (lifecycle + store), pubsub, and
 	// the phonebook (for verifying election claim signatures).
@@ -605,6 +689,24 @@ func (n *Node) cleanup() {
 	}
 	if n.electionManager != nil {
 		n.electionManager.Stop()
+	}
+
+	// Stop service handler BEFORE the network handler: the proxy
+	// listeners owned by the service subsystem bind to bridge gateway
+	// IPs that the network handler will tear down.
+	if n.serviceHandler != nil {
+		if err := n.serviceHandler.Stop(); err != nil {
+			n.logger.Warn("service handler stop returned error", zap.Error(err))
+		}
+	}
+
+	// Stop network handler BEFORE the capsule handler: bridge teardown
+	// callbacks need the event bus alive so withdraw / leave events
+	// propagate through the manager's subscriptions one last time.
+	if n.networkHandler != nil {
+		if err := n.networkHandler.Stop(); err != nil {
+			n.logger.Warn("network handler stop returned error", zap.Error(err))
+		}
 	}
 
 	// Stop capsule handler (it depends on pubsub, eventbus, phonebook)
@@ -995,7 +1097,7 @@ func (n *Node) PrivateKey() crypto.PrivKey {
 }
 
 // Capsules returns the node's capsule manager for capsule CRUD operations.
-// This is the primary entry point for the gRPC API and falakctl.
+// This is the primary entry point for the gRPC API and falak CLI.
 func (n *Node) Capsules() *capsule.Manager {
 	if n.capsuleHandler == nil {
 		return nil
@@ -1200,11 +1302,14 @@ func (n *Node) initializeElectionManager() error {
 	// the strategy is the election protocol.
 	delayStrat := delay.New(delay.WithLogger(n.logger.Named("election.delay")))
 
+	groupSink := NewGroupClaimSinkAdapter(n.eventBus, n.logger.Named("election.group.sink"))
+
 	mgr := election.NewManager(delayStrat,
 		election.WithLogger(n.logger.Named("election")),
 		election.WithCapsuleStore(store),
 		election.WithLifecycleController(lifecycle),
 		election.WithEventSink(sink),
+		election.WithGroupClaimSink(groupSink),
 		election.WithNodeID(n.id.String()),
 		election.WithCalculator(calc),
 		election.WithStateProvider(provider),
@@ -1218,6 +1323,7 @@ func (n *Node) initializeElectionManager() error {
 	n.electionManager = mgr
 	n.electionHandler = NewElectionHandler(mgr, n.eventBus,
 		WithElectionHandlerLogger(n.logger.Named("election.handler")),
+		WithElectionHandlerCapsuleManager(capsMgr),
 	)
 	n.electionHandler.Start(n.ctx)
 
@@ -1272,7 +1378,18 @@ func (n *Node) initializeSnapshotStore() error {
 func (n *Node) initializeRuntimeHandler() {
 	capsMgr := n.capsuleHandler.Manager()
 
-	capsuleStore := &runtimeCapsuleStoreAdapter{manager: capsMgr, sek: n.secretsKey}
+	// injectDNS turns on per-group DNS flag injection only when the
+	// network handler actually came up. Standalone nodes (no factory
+	// wired, network.enabled=false, or build failed) skip the injection
+	// so containers keep Podman's default networking — otherwise they
+	// would point at a DNS listener that does not exist.
+	injectDNS := n.networkHandler != nil && n.networkHandler.Enabled()
+
+	capsuleStore := &runtimeCapsuleStoreAdapter{
+		manager:   capsMgr,
+		sek:       n.secretsKey,
+		injectDNS: injectDNS,
+	}
 	lifecycle := &runtimeLifecycleAdapter{
 		manager:  capsMgr,
 		eventBus: n.eventBus,
@@ -1283,6 +1400,8 @@ func (n *Node) initializeRuntimeHandler() {
 		falakrt.WithHandlerLogger(n.logger.Named("runtime")),
 		falakrt.WithCapsuleStore(capsuleStore),
 		falakrt.WithLifecycleNotifier(lifecycle),
+		falakrt.WithGroupView(&runtimeGroupViewAdapter{manager: capsMgr}),
+		falakrt.WithGroupEventEmitter(NewRuntimeGroupEventEmitter(n.eventBus, n.id.String(), "")),
 	}
 
 	// Wire snapshot adapters if we have a snapshot store. The store is
@@ -1319,13 +1438,181 @@ func (n *Node) initializeRuntimeHandler() {
 	h.Start(n.ctx)
 	n.runtimeHandler = h
 
+	// Allow the capsule handler to cancel parked-starts in the runtime
+	// during same-node group rollback. Wired post-construction because
+	// the runtime handler is built after the capsule handler.
+	if n.capsuleHandler != nil {
+		n.capsuleHandler.SetRuntimeRollback(h)
+	}
+
 	// Bridge ElectionWon events from the event bus to the runtime handler.
 	bridge := NewRuntimeBridge(h, n.eventBus,
 		WithRuntimeBridgeLogger(n.logger.Named("runtime.bridge")),
+		WithRuntimeBridgeCapsuleManager(capsMgr),
 	)
 	bridge.Start(n.ctx)
 
 	n.logger.Debug("runtime handler initialized")
+}
+
+// initializeNetworkHandler wires the per-cluster network subsystem
+// (bridge, overlay, DNS, endpoint gossip) onto the running node. The
+// handler is best-effort: when no factory is wired OR Enabled is false
+// the call is a structured-log no-op, leaving the rest of the node
+// running normally. The factory is invoked once per Node lifetime and
+// the resulting manager is torn down in cleanup before the capsule
+// handler so bridge teardowns observe live subscriptions.
+func (n *Node) initializeNetworkHandler() {
+	cfg := n.networkConfig
+	if !n.networkConfigured {
+		cfg = NetworkConfig{Enabled: false}
+	}
+	if cfg.LocalNodeID == "" {
+		cfg.LocalNodeID = n.id.String()
+	}
+	if cfg.BridgeSubnetPool == "" {
+		cfg.BridgeSubnetPool = DefaultBridgeSubnetPool
+	}
+	if cfg.DependencyTimeout <= 0 {
+		cfg.DependencyTimeout = DefaultGroupDependencyTimeout
+	}
+	if cfg.RetryCap <= 0 {
+		cfg.RetryCap = DefaultNetworkRetryCap
+	}
+
+	h := NewNetworkHandler(
+		WithNetworkEnabled(cfg.Enabled),
+		WithNetworkClusterPath(cfg.ClusterPath),
+		WithNetworkLocalNodeID(cfg.LocalNodeID),
+		WithNetworkLocalIP(cfg.LocalIP),
+		WithNetworkClusterRootKey(cfg.ClusterRootKey),
+		WithNetworkStatePath(cfg.StatePath),
+		WithNetworkBridgePool(cfg.BridgeSubnetPool),
+		WithNetworkDependencyTimeout(cfg.DependencyTimeout),
+		WithNetworkRetryCap(cfg.RetryCap),
+		WithNetworkHandlerEventBus(n.eventBus),
+		WithNetworkHandlerLogger(n.logger.Named("network")),
+		WithNetworkManagerFactory(n.networkManagerFactory),
+	)
+	if err := h.Start(n.ctx); err != nil {
+		n.logger.Warn("network handler start failed; node continues without network subsystem",
+			zap.String("cluster", cfg.ClusterPath), zap.Error(err))
+		return
+	}
+	n.networkHandler = h
+	n.logger.Debug("network handler initialized",
+		zap.String("cluster", cfg.ClusterPath),
+		zap.Bool("enabled", h.Enabled()))
+}
+
+// initializeServiceHandler wires the Service (traffic-management)
+// subsystem onto the running node.
+//
+// Wiring order (matches Stop unwinding):
+//
+//  1. Construct the ServiceHandler with the capsule manager (lookup
+//     adapter for backend resolution).
+//  2. Build the proxy.ProxyManager when the network handler has
+//     surfaced a bridge provider — selector/resolver/source-resolver
+//     are derived from it; the handler itself becomes the proxy's
+//     StrategyGetter.
+//  3. Register the proxy as a bridge listener so per-group bridge
+//     add / remove events drive listener bind / unbind.
+//  4. Hand the proxy + the (still-nil-for-now) publisher/subscriber to
+//     the handler; gossip wiring is completed per-cluster in
+//     joinServiceCluster after the node has joined a cluster.
+//
+// Default disabled: when the operator did not call WithServiceConfig
+// the handler is built with Enabled false and Start short-circuits to
+// a log line. Failures at any step downgrade the subsystem rather
+// than blocking node startup.
+func (n *Node) initializeServiceHandler() {
+	cfg := n.serviceConfig
+	if !n.serviceConfigured {
+		cfg = ServiceConfig{Enabled: false}
+	}
+
+	if n.capsuleHandler == nil {
+		n.logger.Debug("service handler skipped: capsule handler not initialised")
+		return
+	}
+
+	opts := []ServiceHandlerOption{
+		WithServiceHandlerEnabled(cfg.Enabled),
+		WithServiceHandlerLogger(n.logger.Named("service")),
+		WithServiceHandlerCapsuleManager(n.capsuleHandler.Manager()),
+	}
+
+	h := NewServiceHandler(opts...)
+	if cfg.Enabled {
+		if proxyMgr := n.buildServiceProxy(h); proxyMgr != nil {
+			// Install via option-pattern so the handler keeps its
+			// existing single-source-of-truth for state.
+			WithServiceHandlerProxyManager(proxyMgr)(h)
+		}
+	}
+	if err := h.Start(n.ctx); err != nil {
+		n.logger.Warn("service handler start failed; node continues without service subsystem",
+			zap.Error(err))
+		return
+	}
+	n.serviceHandler = h
+	// Cross-wire the capsule handler so capsule receipts / deletes fan
+	// out to identity binding without going through the node bus
+	// (which would be observable but adds a hop).
+	if n.capsuleHandler != nil {
+		n.capsuleHandler.SetServiceHandler(h)
+	}
+	n.logger.Debug("service handler initialized", zap.Bool("enabled", cfg.Enabled))
+}
+
+// buildServiceProxy assembles the proxy.ProxyManager for the service
+// handler when the network handler has surfaced a bridge provider.
+// Returns nil when the dependencies are not in place — the handler
+// still owns its strategy registry and event flow; only the routing
+// layer is degraded.
+func (n *Node) buildServiceProxy(h *ServiceHandler) *proxy.ProxyManager {
+	if n.networkHandler == nil {
+		n.logger.Debug("service proxy skipped: network handler not wired")
+		return nil
+	}
+	bp := n.networkHandler.NetworkBridgeProvider()
+	if bp == nil {
+		n.logger.Debug("service proxy skipped: network manager exposes no bridge provider")
+		return nil
+	}
+	registry := bp.EndpointRegistry()
+	if registry == nil {
+		n.logger.Debug("service proxy skipped: network manager has no endpoint registry")
+		return nil
+	}
+	stats := proxy.NewStatsRegistry()
+	selectorFor := func(_ string) *proxy.Selector {
+		return proxy.NewSelector(proxy.WithRegistry(registry))
+	}
+	resolverFor := func(serviceID string) proxy.ServiceResolver {
+		return &serviceResolverAdapter{handler: h, registry: registry, serviceID: serviceID}
+	}
+	pm := proxy.NewProxyManager(
+		proxy.WithManagerLogger(n.logger.Named("service.proxy")),
+		proxy.WithManagerStats(stats),
+		proxy.WithManagerSelectorBuilder(selectorFor),
+		proxy.WithManagerResolverBuilder(resolverFor),
+		proxy.WithManagerRegistry(registry),
+		proxy.WithManagerStrategies(h),
+		proxy.WithManagerSourceResolver(bridgeSourceResolver{bp: bp}),
+		proxy.WithManagerBridgeGateways(bp.BridgeGateways),
+	)
+	bp.RegisterBridgeListener(&proxyBridgeListener{proxy: pm, logger: n.logger.Named("service.proxy.bridge")})
+	return pm
+}
+
+// ServiceHandler returns the wired ServiceHandler. May be nil when
+// disabled or when initialization failed.
+func (n *Node) ServiceHandler() *ServiceHandler {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.serviceHandler
 }
 
 // initializeCapsuleHandler creates the capsule manager (with persistent SQLite store)
@@ -1351,14 +1638,18 @@ func (n *Node) initializeCapsuleHandler() error {
 		capsule.WithManagerLogger(n.logger.Named("capsule.manager")),
 	)
 
-	n.capsuleHandler = NewCapsuleHandler(manager,
+	handlerOpts := []CapsuleHandlerOption{
 		WithCapsuleHandlerLogger(n.logger.Named("capsule.handler")),
 		WithCapsuleHandlerEventBus(n.eventBus),
 		WithCapsuleHandlerNodeID(n.id.String()),
 		WithCapsuleHandlerPubSub(n.pubsub),
 		WithCapsuleHandlerPrivateKey(n.privateKey),
 		WithCapsuleHandlerPhonebook(n.phonebook),
-	)
+	}
+	if n.placementRetryCap > 0 {
+		handlerOpts = append(handlerOpts, WithCapsuleHandlerPlacementRetryCap(n.placementRetryCap))
+	}
+	n.capsuleHandler = NewCapsuleHandler(manager, handlerOpts...)
 	n.capsuleHandler.Start(n.ctx)
 
 	n.logger.Debug("capsule handler initialized", zap.String("store", dbPath))

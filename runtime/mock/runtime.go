@@ -32,13 +32,14 @@ type Runtime struct {
 	pulled     map[string]bool // image -> pulled
 
 	// Injected behaviors for testing.
-	pullErr       error
-	createErr     error
-	startErr      error
-	stopErr       error
-	checkpointErr error
-	restoreErr    error
-	removeErr     error
+	pullErr        error
+	pullErrByImage map[string]error
+	createErr      error
+	startErr       error
+	stopErr        error
+	checkpointErr  error
+	restoreErr     error
+	removeErr      error
 
 	// Events records every method call for assertion in tests.
 	Events []Event
@@ -59,6 +60,19 @@ type Option func(*Runtime)
 // WithPullError injects an error on every Pull call.
 func WithPullError(err error) Option {
 	return func(r *Runtime) { r.pullErr = err }
+}
+
+// WithPullErrorForImage injects an error returned only when Pull is
+// called with the matching image string. Useful for tests that need
+// one specific member of a group to fail while the others succeed.
+// Multiple calls accumulate per image.
+func WithPullErrorForImage(image string, err error) Option {
+	return func(r *Runtime) {
+		if r.pullErrByImage == nil {
+			r.pullErrByImage = make(map[string]error)
+		}
+		r.pullErrByImage[image] = err
+	}
 }
 
 // WithCreateError injects an error on every Create call.
@@ -108,11 +122,17 @@ func (r *Runtime) record(method, id, image, path string) {
 	})
 }
 
-// Pull simulates pulling an OCI image.
+// Pull simulates pulling an OCI image. If a per-image override is
+// registered via WithPullErrorForImage it takes precedence over the
+// global WithPullError; otherwise the call succeeds and records the
+// image as pulled.
 func (r *Runtime) Pull(_ context.Context, image string, opts ...runtime.PullOption) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.record("Pull", "", image, "")
+	if err, ok := r.pullErrByImage[image]; ok {
+		return err
+	}
 	if r.pullErr != nil {
 		return r.pullErr
 	}
@@ -317,6 +337,23 @@ func (r *Runtime) HasPulled(image string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.pulled[image]
+}
+
+// SetPullErrorForImage registers (or clears, via nil) a Pull error
+// for the given image after the mock has been constructed. Used by
+// tests that need to toggle the failure behaviour mid-flight (e.g.
+// fail the first attempt, succeed the retry).
+func (r *Runtime) SetPullErrorForImage(image string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pullErrByImage == nil {
+		r.pullErrByImage = make(map[string]error)
+	}
+	if err == nil {
+		delete(r.pullErrByImage, image)
+		return
+	}
+	r.pullErrByImage[image] = err
 }
 
 // SimulateCrash changes a running container's status to Failed and

@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	enums "github.com/tareksalem/falak/capsule/enums"
 )
 
 // --- CapsuleStatus Enum Tests ---
@@ -11,18 +13,18 @@ import (
 func TestCapsuleStatusEnum(t *testing.T) {
 	tests := []struct {
 		name   string
-		status CapsuleStatus
+		status enums.CapsuleStatus
 		valid  bool
 	}{
-		{"created", CapsuleStatusEnum.Created(), true},
-		{"announced", CapsuleStatusEnum.Announced(), true},
-		{"electing", CapsuleStatusEnum.Electing(), true},
-		{"assigned", CapsuleStatusEnum.Assigned(), true},
-		{"executing", CapsuleStatusEnum.Executing(), true},
-		{"running", CapsuleStatusEnum.Running(), true},
-		{"stopping", CapsuleStatusEnum.Stopping(), true},
-		{"stopped", CapsuleStatusEnum.Stopped(), true},
-		{"invalid", CapsuleStatus("invalid"), false},
+		{"created", enums.CapsuleStatusEnum.Created(), true},
+		{"announced", enums.CapsuleStatusEnum.Announced(), true},
+		{"electing", enums.CapsuleStatusEnum.Electing(), true},
+		{"assigned", enums.CapsuleStatusEnum.Assigned(), true},
+		{"executing", enums.CapsuleStatusEnum.Executing(), true},
+		{"running", enums.CapsuleStatusEnum.Running(), true},
+		{"stopping", enums.CapsuleStatusEnum.Stopping(), true},
+		{"stopped", enums.CapsuleStatusEnum.Stopped(), true},
+		{"invalid", enums.CapsuleStatus("invalid"), false},
 	}
 
 	for _, tt := range tests {
@@ -37,19 +39,19 @@ func TestCapsuleStatusEnum(t *testing.T) {
 // --- Tier Enum Tests ---
 
 func TestTierEnum(t *testing.T) {
-	if TierEnum.Critical().BaseMomentum() != 90 {
+	if enums.TierEnum.Critical().BaseMomentum() != 90 {
 		t.Error("critical tier should have base momentum 90")
 	}
-	if TierEnum.Standard().BaseMomentum() != 50 {
+	if enums.TierEnum.Standard().BaseMomentum() != 50 {
 		t.Error("standard tier should have base momentum 50")
 	}
-	if TierEnum.Background().BaseMomentum() != 20 {
+	if enums.TierEnum.Background().BaseMomentum() != 20 {
 		t.Error("background tier should have base momentum 20")
 	}
-	if !TierEnum.Critical().Valid() {
+	if !enums.TierEnum.Critical().Valid() {
 		t.Error("critical tier should be valid")
 	}
-	if Tier("invalid").Valid() {
+	if enums.Tier("invalid").Valid() {
 		t.Error("invalid tier should not be valid")
 	}
 }
@@ -138,7 +140,7 @@ func TestDefaultSpec(t *testing.T) {
 	}
 	DefaultSpec(&spec)
 
-	if spec.Tier != TierEnum.Standard() {
+	if spec.Tier != enums.TierEnum.Standard() {
 		t.Errorf("tier should default to standard, got %s", spec.Tier)
 	}
 	if spec.Replicas.Min != 1 || spec.Replicas.Max != 1 {
@@ -147,7 +149,7 @@ func TestDefaultSpec(t *testing.T) {
 	if spec.MomentumConfig.Base != 50 {
 		t.Errorf("momentum base should default to 50 (standard tier), got %d", spec.MomentumConfig.Base)
 	}
-	if spec.Runtime.Network.Mode != NetworkModeEnum.Bridge() {
+	if spec.Runtime.Network.Mode != enums.NetworkModeEnum.Bridge() {
 		t.Errorf("network mode should default to bridge, got %s", spec.Runtime.Network.Mode)
 	}
 	if spec.Runtime.FailurePolicy.RestartLimit != 3 {
@@ -160,7 +162,7 @@ func TestValidateSpec_Valid(t *testing.T) {
 		Name:  "test",
 		Image: "test:latest",
 		Orbit: "api",
-		Tier:  TierEnum.Standard(),
+		Tier:  enums.TierEnum.Standard(),
 		Replicas: ReplicaConfig{
 			Min: 1,
 			Max: 3,
@@ -220,7 +222,7 @@ func TestValidateSpec_InvalidPlacement(t *testing.T) {
 	spec := CapsuleSpec{
 		Name: "test", Image: "test:latest", Orbit: "api",
 		PlacementRules: []PlacementRule{
-			{Type: PlacementTypeEnum.Capsule(), Mode: ""},
+			{Type: enums.PlacementTypeEnum.Capsule(), Mode: ""},
 		},
 	}
 	DefaultSpec(&spec)
@@ -235,9 +237,9 @@ func TestValidateSpec_ScalingRule(t *testing.T) {
 		ScalingRules: []ScalingRule{
 			{
 				Name:       "high load",
-				Trigger:    TriggerModeEnum.All(),
+				Trigger:    enums.TriggerModeEnum.All(),
 				Conditions: []string{"cpu > 70%"},
-				Action:     ScalingActionEnum.ScaleUp(),
+				Action:     enums.ScalingActionEnum.ScaleUp(),
 				Cooldown:   60 * time.Second,
 			},
 		},
@@ -259,7 +261,7 @@ func TestStoreCRUD(t *testing.T) {
 	c := &Capsule{
 		ID:     NewCapsuleID(),
 		Spec:   spec,
-		Status: CapsuleStatusEnum.Created(),
+		Status: enums.CapsuleStatusEnum.Created(),
 	}
 
 	// Create
@@ -288,12 +290,12 @@ func TestStoreCRUD(t *testing.T) {
 	}
 
 	// Update
-	c.Status = CapsuleStatusEnum.Running()
+	c.Status = enums.CapsuleStatusEnum.Running()
 	if err := store.Update(c); err != nil {
 		t.Fatalf("Update failed: %v", err)
 	}
 	got = store.Get(c.ID)
-	if got.Status != CapsuleStatusEnum.Running() {
+	if got.Status != enums.CapsuleStatusEnum.Running() {
 		t.Error("status not updated")
 	}
 
@@ -318,7 +320,7 @@ func TestStoreListByOrbit(t *testing.T) {
 	for _, orbit := range []string{"api", "api", "workers"} {
 		spec := CapsuleSpec{Name: "cap-" + orbit, Image: "img", Orbit: orbit}
 		DefaultSpec(&spec)
-		c := &Capsule{ID: NewCapsuleID(), Spec: spec, Status: CapsuleStatusEnum.Created()}
+		c := &Capsule{ID: NewCapsuleID(), Spec: spec, Status: enums.CapsuleStatusEnum.Created()}
 		store.Create(c)
 	}
 
@@ -341,8 +343,8 @@ func TestStoreListByLabels(t *testing.T) {
 	DefaultSpec(&spec1)
 	DefaultSpec(&spec2)
 
-	store.Create(&Capsule{ID: NewCapsuleID(), Spec: spec1, Status: CapsuleStatusEnum.Created()})
-	store.Create(&Capsule{ID: NewCapsuleID(), Spec: spec2, Status: CapsuleStatusEnum.Created()})
+	store.Create(&Capsule{ID: NewCapsuleID(), Spec: spec1, Status: enums.CapsuleStatusEnum.Created()})
+	store.Create(&Capsule{ID: NewCapsuleID(), Spec: spec2, Status: enums.CapsuleStatusEnum.Created()})
 
 	// Filter by team
 	backend := store.ListByLabels(Labels{"team": "backend"})
@@ -383,10 +385,10 @@ func TestManagerCreate(t *testing.T) {
 	}
 	// Create auto-announces the capsule so the election subsystem picks it
 	// up — so the post-Create status is Announced, not Created.
-	if c.Status != CapsuleStatusEnum.Announced() {
+	if c.Status != enums.CapsuleStatusEnum.Announced() {
 		t.Errorf("status should be announced, got %s", c.Status)
 	}
-	if c.Spec.Tier != TierEnum.Standard() {
+	if c.Spec.Tier != enums.TierEnum.Standard() {
 		t.Errorf("tier should default to standard, got %s", c.Spec.Tier)
 	}
 	if c.Momentum.Base != 50 {
@@ -396,10 +398,18 @@ func TestManagerCreate(t *testing.T) {
 		t.Errorf("cluster ID should be test/dc1/cluster1, got %s", c.ClusterID)
 	}
 
-	// Create emits CapsuleCreated, then auto-announces (which emits
-	// CapsuleAnnounced). We assert both events arrived in order.
-	if len(received) < 1 || received[0].Type != EventCapsuleCreated {
-		t.Error("should have received CapsuleCreated as first event")
+	// Create auto-announces BEFORE emitting EventCapsuleCreated so that
+	// downstream subscribers (orbit announcer, election kickoff) observe
+	// the capsule already at Announced. Therefore the manager emits
+	// EventCapsuleAnnounced first, then EventCapsuleCreated.
+	if len(received) < 2 {
+		t.Fatalf("expected at least 2 events (announced, created), got %d", len(received))
+	}
+	if received[0].Type != EventCapsuleAnnounced {
+		t.Errorf("first event should be %s, got %s", EventCapsuleAnnounced, received[0].Type)
+	}
+	if received[1].Type != EventCapsuleCreated {
+		t.Errorf("second event should be %s, got %s", EventCapsuleCreated, received[1].Type)
 	}
 }
 
@@ -462,7 +472,7 @@ func TestManagerReceive(t *testing.T) {
 	c := &Capsule{
 		ID:     NewCapsuleID(),
 		Spec:   CapsuleSpec{Name: "remote", Image: "img", Orbit: "api"},
-		Status: CapsuleStatusEnum.Announced(),
+		Status: enums.CapsuleStatusEnum.Announced(),
 	}
 
 	if err := mgr.Receive(c); err != nil {
@@ -485,13 +495,13 @@ func TestManagerReceive(t *testing.T) {
 	}
 
 	// Update existing via Receive
-	c.Status = CapsuleStatusEnum.Running()
+	c.Status = enums.CapsuleStatusEnum.Running()
 	if err := mgr.Receive(c); err != nil {
 		t.Fatalf("Receive update failed: %v", err)
 	}
 
 	got := mgr.Get(c.ID)
-	if got.Status != CapsuleStatusEnum.Running() {
+	if got.Status != enums.CapsuleStatusEnum.Running() {
 		t.Error("status should be updated after second receive")
 	}
 }

@@ -8,13 +8,14 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/tareksalem/falak/capsule"
+	"github.com/tareksalem/falak/capsule/enums"
 )
 
 // ScaleEvent is emitted when a scaling rule triggers.
 type ScaleEvent struct {
 	CapsuleID capsule.CapsuleID
 	RuleName  string
-	Action    capsule.ScalingAction
+	Action    enums.ScalingAction
 	Timestamp time.Time
 }
 

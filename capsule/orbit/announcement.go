@@ -104,6 +104,10 @@ func (a *Announcer) Announce(ctx context.Context, c *capsule.Capsule) error {
 	}
 
 	if err := a.manager.Publish(ctx, c.Spec.Orbit, data); err != nil {
+		a.logger.Error("Capsule announcement failed",
+			zap.String("capsule_id", c.ID.String()),
+			zap.String("name", c.Spec.Name),
+			zap.String("cluster", c.ClusterID), zap.String("orbit", c.Spec.Orbit))
 		return fmt.Errorf("failed to publish announcement: %w", err)
 	}
 
@@ -338,6 +342,75 @@ func specToProto(s *capsule.CapsuleSpec) *capsulePb.CapsuleSpec {
 		})
 	}
 
+	// Group fields (Phase 10). Kind defaults to UNSPECIFIED when the Go
+	// CapsuleKind is empty; receivers treat that as Capsule.
+	pb.Kind = capsuleKindToProto(s.Kind)
+	pb.GroupId = s.GroupID.String()
+	pb.GroupMember = s.GroupMember
+	if s.Group != nil {
+		pb.Group = groupSpecToProto(s.Group)
+	}
+
+	return pb
+}
+
+// capsuleKindToProto maps the Go CapsuleKind enum onto the proto enum
+// values. Empty Go-side maps to UNSPECIFIED (receivers default to
+// Capsule), preserving backward compatibility with rows persisted
+// before the Phase 10 schema migration.
+func capsuleKindToProto(k capsule.CapsuleKind) capsulePb.CapsuleKind {
+	switch k {
+	case capsule.CapsuleKindEnum.Group():
+		return capsulePb.CapsuleKind_CAPSULE_KIND_GROUP
+	case capsule.CapsuleKindEnum.Capsule():
+		return capsulePb.CapsuleKind_CAPSULE_KIND_CAPSULE
+	default:
+		return capsulePb.CapsuleKind_CAPSULE_KIND_UNSPECIFIED
+	}
+}
+
+// colocationToProto maps the Go ColocationMode onto the proto enum.
+// Empty Go-side maps to UNSPECIFIED.
+func colocationToProto(m capsule.ColocationMode) capsulePb.ColocationMode {
+	switch m {
+	case capsule.ColocationModeEnum.SameNode():
+		return capsulePb.ColocationMode_COLOCATION_MODE_SAME_NODE
+	case capsule.ColocationModeEnum.SameOrbit():
+		return capsulePb.ColocationMode_COLOCATION_MODE_SAME_ORBIT
+	default:
+		return capsulePb.ColocationMode_COLOCATION_MODE_UNSPECIFIED
+	}
+}
+
+// groupSpecToProto converts a Go GroupSpec to its proto representation.
+// Members are converted via specToProto (recursive — but a member's
+// CapsuleSpec is Kind=Capsule and has no Group, so recursion terminates).
+func groupSpecToProto(g *capsule.GroupSpec) *capsulePb.GroupSpec {
+	if g == nil {
+		return nil
+	}
+	pb := &capsulePb.GroupSpec{
+		Colocation:    colocationToProto(g.Colocation),
+		CascadeDelete: g.CascadeDelete,
+	}
+	for _, mid := range g.MemberIDs {
+		pb.MemberIds = append(pb.MemberIds, mid.String())
+	}
+	for _, m := range g.Members {
+		mPb := &capsulePb.MemberSpec{
+			Name: m.Name,
+			Spec: specToProto(&m.Spec),
+		}
+		pb.Members = append(pb.Members, mPb)
+		if len(m.DependsOn) > 0 {
+			if pb.Deps == nil {
+				pb.Deps = make(map[string]*capsulePb.MemberDeps)
+			}
+			pb.Deps[m.Name] = &capsulePb.MemberDeps{
+				DependsOn: append([]string(nil), m.DependsOn...),
+			}
+		}
+	}
 	return pb
 }
 

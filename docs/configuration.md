@@ -30,7 +30,7 @@ clusters: {
 ### 2. Run the node
 
 ```bash
-falakd --config=node1.cue
+falak daemon start --config=node1.cue
 ```
 
 Or with air (development):
@@ -95,6 +95,42 @@ All health settings are optional with sensible defaults. Thresholds are automati
 | `quarantine_check_interval` | duration | `"5s"` | How often to check quarantined nodes for timeout. |
 | `quarantine_probe_interval` | duration | `"10s"` | How often to publish probe requests for quarantined peers. |
 
+### Network
+
+Falak's network subsystem provisions one Linux bridge per capsule group, an
+encrypted VXLAN overlay between hosting nodes (transport-mode IPsec with
+AES-GCM), and a per-bridge DNS responder that serves bare capsule names from
+a gossip-fed endpoint registry. The entire subsystem is **Linux-only** in
+Phase 11A.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `network.enabled` | bool | `true` | Master switch for the network subsystem. Set `false` to disable bridges, overlay, and the DNS responder (containers fall back to whatever Podman wires by default). |
+| `network.bridge_subnet_pool` | CIDR | `"10.88.0.0/16"` | IPv4 super-pool carved into `/24` subnets, one per group. The pool MUST NOT overlap any underlay or VPN network on the host. |
+| `network.bridge_mtu` | int | autodetect | Bridge MTU. When unset, the daemon derives it as `underlay_mtu - 110` (VXLAN+IPsec headroom). Override only when the default fails (e.g. unusual encapsulation). |
+| `network.underlay_mtu` | int | autodetect | MTU of the default-route interface. Read from `/proc/net/route` + `/sys/class/net/<iface>/mtu` on Linux. Override on hosts where autodetection picks the wrong NIC. |
+| `network.iptables_takeover` | bool | `false` | Opt-in: when `true`, the daemon installs its FORWARD rules even when firewalld/ufw/nftables is detected as the iptables manager. Use only when you have coordinated with the host's firewall management. |
+| `network.endpoint_ttl` | duration | `"30s"` | Publisher TTL stamped on every endpoint gossip record. Receivers evict records past `2 × ttl`. Lower values surface dead replicas faster at the cost of more gossip traffic. |
+
+#### Linux requirements
+
+Falak requires the following on every node when `network.enabled=true`:
+
+- **Linux kernel modules**: `vxlan` (VXLAN device) and `esp4` + `xfrm` (IPsec
+  transport mode). the daemon refuses to start if any are missing.
+- **Capabilities**: `CAP_NET_ADMIN` to manage netlink, FDB entries, XFRM
+  state, and iptables rules. Run the daemon as root or set capabilities on the
+  binary.
+- **rp_filter**: `/proc/sys/net/ipv4/conf/all/rp_filter` must be `1`
+  (strict mode). the daemon refuses to start otherwise; override only in dev
+  builds via the manager's `WithRPFilterCheckDisabled` option.
+- **Iptables management**: no other manager (firewalld, ufw, nftables) may
+  own the FORWARD chain unless `network.iptables_takeover` is `true`.
+
+When any of these checks fail, the daemon refuses to start with a clear,
+actionable error. The subsystem is binary: either everything is wired or
+nothing is — there is no degraded "no network" mode.
+
 ---
 
 ## Examples
@@ -113,7 +149,7 @@ clusters: {
 ```
 
 ```bash
-falakd --config=node1.cue
+falak daemon start --config=node1.cue
 ```
 
 ### Joining an Existing Cluster
@@ -135,7 +171,7 @@ clusters: {
 ```
 
 ```bash
-falakd --config=node2.cue
+falak daemon start --config=node2.cue
 ```
 
 ### Multi-Cluster Node
@@ -211,13 +247,13 @@ The `--config` flag loads all settings from a CUE file. CLI flags still work for
 
 ```bash
 # Config file (recommended for multi-cluster or production)
-falakd --config=node.cue
+falak daemon start --config=node.cue
 
 # CLI flags (quick single-cluster use)
-falakd --name=node1 --port=4001 --cluster=test/dc1 --psk=mysecretkey1234567890123456789012
+falak daemon start --name=node1 --port=4001 --cluster=test/dc1 --psk=mysecretkey1234567890123456789012
 
 # CLI flags with external CA
-falakd --name=node1 --port=4001 --cluster=prod/dc1 \
+falak daemon start --name=node1 --port=4001 --cluster=prod/dc1 \
     --psk=mysecretkey1234567890123456789012 \
     --ca-cert=/path/ca.crt --ca-key=/path/ca.key \
     --bootstrap=/ip4/10.0.0.1/tcp/4001/p2p/12D3KooW...

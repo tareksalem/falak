@@ -98,6 +98,13 @@ import "strings"
 	// be gossiped to the rest of the mesh via the orbit.
 	capsules?: [string]: #Capsule
 
+	// services defines the Falak Services to auto-create in this cluster
+	// after joining. The key is the Service name; the value matches
+	// #Service. Services declare traffic-management on top of capsules
+	// (weighted split, canary, blue-green). Independent lifecycle from
+	// the underlying capsules — see plans/service-networking.md.
+	services?: [string]: #Service
+
 	// election configures the election subsystem for this cluster: which
 	// algorithm to use, timeouts, and gravity weight overrides. All fields
 	// are optional; omitting the block uses built-in defaults (delay-based
@@ -162,13 +169,30 @@ import "strings"
 	node_key?: string
 }
 
-// #Capsule defines a deployable application specification.
+// #Capsule defines a deployable workload OR a CapsuleGroup. The kind
+// discriminator selects which fields are required and which are
+// forbidden. Default kind is "capsule" (a standalone workload).
+//
+// Standalone capsule (kind="capsule"):
+//   - image and orbit are required
+//   - resources/replicas/scaling/placement/runtime/advanced apply to the workload
+//
+// Group capsule (kind="group"):
+//   - image and orbit MUST be empty (groups are coordination-only)
+//   - the group block defines members + colocation + cascade delete
+//   - workload fields (resources, replicas, scaling, runtime) are NOT permitted
+//     at the group level — each member declares its own.
 #Capsule: {
-	// name is the unique identifier for this capsule.
+	// name is the unique identifier for this capsule (or group).
 	name: string & strings.MinRunes(1)
 
-	// image is the container image reference.
-	image: string & strings.MinRunes(1)
+	// kind discriminates standalone capsules from group-kind capsules.
+	// Default "capsule". Set "group" to define a CapsuleGroup.
+	kind: "capsule" | "group" | *"capsule"
+
+	// image is the container image reference. Required when kind=capsule;
+	// must be omitted when kind=group.
+	image?: string
 
 	// image_alias is the original tag the user provided (for display).
 	image_alias?: string
@@ -179,33 +203,100 @@ import "strings"
 	// command overrides the container entrypoint. Empty = use image default.
 	command?: [...string]
 
-	// orbit is the flat-named topic where this capsule travels.
-	orbit: string & strings.MinRunes(1)
+	// orbit is the flat-named topic where this capsule travels. Required
+	// when kind=capsule; must be omitted when kind=group.
+	orbit?: string
 
 	// tier sets the priority level. Determines default momentum.
 	// critical=90, standard=50, background=20.
 	tier: "critical" | "standard" | "background" | *"standard"
 
-	// labels are key-value metadata for this capsule.
+	// labels are key-value metadata for this capsule (or group). Group
+	// labels are inherited by every member; member labels override on key.
 	labels?: [string]: string
 
-	// resources defines minimum resource requirements.
+	// resources defines minimum resource requirements (kind=capsule only).
 	resources?: #Resources
 
-	// replicas defines how many instances to run.
+	// replicas defines how many instances to run (kind=capsule only).
 	replicas?: #Replicas
 
-	// scaling defines autoscaling rules.
+	// scaling defines autoscaling rules (kind=capsule only).
 	scaling?: #Scaling
 
 	// placement defines where the capsule should be deployed.
 	placement?: [...#PlacementRule]
 
-	// runtime configures the container execution.
+	// runtime configures the container execution (kind=capsule only).
 	runtime?: #Runtime
 
-	// advanced contains optional momentum tuning.
+	// advanced contains optional momentum tuning (kind=capsule only).
 	advanced?: #Advanced
+
+	// group declares the CapsuleGroup spec. Required when kind=group;
+	// must be absent when kind=capsule.
+	group?: #Group
+}
+
+// #Group defines a CapsuleGroup spec — a set of related capsules that
+// share lifecycle, colocation, and an optional dependency DAG.
+#Group: {
+	// colocation controls how members are placed.
+	//   "same-orbit" (default): members are placed independently by gravity;
+	//     a per-group bridge connects them across nodes (Phase 11A overlay).
+	//   "same-node": all members must land atomically on a single node;
+	//     used for tight sidecar pairs.
+	colocation: "same-orbit" | "same-node" | *"same-orbit"
+
+	// cascade_delete controls what happens to members when the group is
+	// deleted. Default true: members are removed alongside the group.
+	// false: members keep running as standalone capsules with GroupID
+	// cleared.
+	cascade_delete: bool | *true
+
+	// members declares the per-member specs keyed by member name.
+	// Names must be DNS-friendly (lowercase letters, digits, hyphens;
+	// 1–63 chars, no leading/trailing hyphen).
+	members: [Name=string]: #CapsuleMember & {name: Name}
+}
+
+// #CapsuleMember is a capsule spec scoped to a CapsuleGroup. The member
+// `name` is injected from the map key in #Group.members; it must satisfy
+// the same DNS-label rules used elsewhere. Workload fields (image,
+// orbit, resources, etc.) behave as on a standalone #Capsule.
+//
+// Members declare runtime ordering via depends_on (other member names
+// in the same group). The dependency DAG must be acyclic; cycles are
+// rejected at admission.
+//
+// Phase 11+ fields (replica_labels, discovers) are deliberately NOT
+// declared here yet — Phase 10 admission rejects them with a clear
+// "feature not yet supported" error.
+#CapsuleMember: {
+	// name is injected from the map key in #Group.members. Operators
+	// usually do not set it explicitly.
+	name: string & strings.MinRunes(1)
+
+	// image, orbit, etc. — same shape as the per-member workload.
+	image: string & strings.MinRunes(1)
+	image_alias?:  string
+	image_digest?: string
+	command?: [...string]
+	orbit: string & strings.MinRunes(1)
+	tier:  "critical" | "standard" | "background" | *"standard"
+	labels?: [string]: string
+	resources?: #Resources
+	replicas?:  #Replicas
+	scaling?:   #Scaling
+	placement?: [...#PlacementRule]
+	runtime?:   #Runtime
+	advanced?:  #Advanced
+
+	// depends_on lists the names of other members in THIS group whose
+	// Running state must be reached before this member starts. The DAG
+	// is validated at admission; cycles are rejected. First-boot only —
+	// once a member reaches Running, dependents are released permanently.
+	depends_on?: [...string]
 }
 
 // #Resources defines resource constraints for a capsule.
@@ -436,4 +527,131 @@ import "strings"
 
 	// quarantine_probe_interval is how often to publish probe requests for quarantined peers.
 	quarantine_probe_interval: string | *"10s"
+}
+
+// #Service is the operator-authored shape of a Falak Service — a logical
+// name decoupled from any single capsule. Services declare exposed
+// ports, a visibility scope, a list of weighted backends, and an
+// optional traffic-management strategy. Deleting a Service stops
+// routing only; capsules are never touched.
+//
+// See `.claude/plans/service-networking.md` for the locked design and
+// validation rules. The `kind` discriminator is implicit — only
+// Services live under `services:` (unlike #Capsule which uses kind to
+// distinguish standalone capsules from groups).
+#Service: {
+	// name is the logical service name; clients connect using
+	// "<name>:<port>". Must be DNS-friendly (the lower layer enforces).
+	name: string & strings.MinRunes(1)
+
+	// visibility controls who may resolve and connect to this Service.
+	//   group   — only capsules in the same group as the backends.
+	//   cluster — any capsule in the cluster (default).
+	// "external" is reserved and rejected at admission.
+	visibility: "group" | "cluster" | *"cluster"
+
+	// group is the owning group when visibility is "group". When omitted
+	// and visibility=group, auto-derives from a single-group backend set
+	// at the admission layer.
+	group?: string
+
+	// ports declares the ingress port set the Service exposes to callers.
+	// At least one port is required; each port maps to a backend
+	// container port via the backend's port_map.
+	ports: [...#ServicePort]
+
+	// backends lists the capsules that fulfill this Service with a
+	// weight each. Lenient resolution: backends referencing capsules
+	// that don't exist yet are admitted and start routing as soon as
+	// the capsule appears.
+	backends: [...#ServiceBackend]
+
+	// strategy selects the traffic-management variant applied to the
+	// weight map. Default is static weighted (no rollout).
+	strategy?: #Strategy
+
+	// timeouts overrides the per-Service connection timeouts.
+	timeouts?: {
+		idle?:    string  // close after no traffic (default "5m")
+		connect?: string  // proxy → backend dial bound (default "5s")
+	}
+}
+
+// #ServicePort declares one ingress port exposed by a Service.
+#ServicePort: {
+	// name is the DNS-friendly handle for the port (e.g. "http").
+	name: string & strings.MinRunes(1)
+
+	// port is the TCP/UDP port number callers connect to.
+	port: int & >0 & <=65535
+
+	// protocol selects the transport. v1 admits tcp + udp.
+	protocol: "tcp" | "udp" | *"tcp"
+}
+
+// #ServiceBackend references one capsule by name with a weight and an
+// optional port-name remap. Backends bind by name and capture the
+// resolved capsule ID at first resolve — identity changes require an
+// explicit `falak service rebind`.
+#ServiceBackend: {
+	// capsule is the bare capsule name the operator wrote.
+	capsule: string & strings.MinRunes(1)
+
+	// port_map remaps Service port-name → capsule named-port. Omit
+	// to use identity mapping when names match (e.g. both call it "http").
+	port_map?: [string]: string
+
+	// weight is the SWRR weight; 0 excludes the backend. Default 100.
+	weight: int & >=0 & <=10000 | *100
+}
+
+// #Strategy is the top-level traffic-management variant. The `type`
+// field selects which of `canary` / `blue_green` is populated.
+#Strategy: {
+	// type selects the strategy variant. Default static = pure weighted.
+	type: "static" | "canary" | "blue-green" | *"static"
+
+	// canary parameterises a canary rollout (set when type=canary).
+	canary?: #CanaryStrategy
+
+	// blue_green parameterises a blue-green flip (set when type=blue-green).
+	blue_green?: #BlueGreenStrategy
+}
+
+// #CanaryStrategy declares an in-progress canary rollout. Mode is
+// implicit by which of {interval, success_criteria} is set.
+#CanaryStrategy: {
+	// target is the backend traffic moves toward.
+	target: string
+
+	// from is the backend traffic moves away from.
+	from: string
+
+	// step is the percentage moved per progression tick (1–100).
+	step: int & >0 & <=100
+
+	// interval is the wait between progression ticks (e.g. "5m");
+	//   set + no success_criteria → auto progression
+	//   set + success_criteria     → gated progression
+	//   unset                       → manual progression
+	interval?: string
+
+	// success_criteria are metric expressions; canary only advances
+	// when every condition currently holds.
+	success_criteria?: [...string]
+
+	// abort_on are metric expressions; canary fully reverts when any
+	// condition matches.
+	abort_on?: [...string]
+}
+
+// #BlueGreenStrategy declares the active backend and drain window.
+#BlueGreenStrategy: {
+	// active is the backend currently serving traffic. Flip the value
+	// and re-apply to perform a blue-green cutover.
+	active: string
+
+	// drain is the post-flip grace window for in-flight connections.
+	// Default "30s".
+	drain?: string
 }

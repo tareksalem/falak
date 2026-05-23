@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/tareksalem/falak/capsule"
+	"github.com/tareksalem/falak/capsule/enums"
 )
 
 // joinOrbitOrFail subscribes the node to the named orbit on a cluster, failing the test on error.
@@ -73,7 +74,7 @@ func TestCapsuleLifecycle_3Node(t *testing.T) {
 		Name:  "test-api",
 		Image: "registry.test/api:v1",
 		Orbit: "api",
-		Tier:  capsule.TierEnum.Standard(),
+		Tier:  enums.TierEnum.Standard(),
 		Labels: capsule.Labels{
 			"app":  "test-api",
 			"team": "backend",

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/tareksalem/falak/capsule"
+	"github.com/tareksalem/falak/capsule/enums"
 )
 
 // fakeProvider is a test MetricsProvider returning fixed values.
@@ -127,11 +128,11 @@ func TestMonitor_UsesRegistry(t *testing.T) {
 	rules := []Rule{
 		{
 			Name:    "high cpu",
-			Trigger: capsule.TriggerModeEnum.All(),
+			Trigger: enums.TriggerModeEnum.All(),
 			Conditions: []Condition{
 				{Metric: "cpu", Operator: ">", Value: 70},
 			},
-			Action: capsule.ScalingActionEnum.ScaleUp(),
+			Action: enums.ScalingActionEnum.ScaleUp(),
 		},
 	}
 
@@ -151,7 +152,7 @@ func TestMonitor_UsesRegistry(t *testing.T) {
 	if lastEvent == nil {
 		t.Fatal("monitor should fire after provider registered")
 	}
-	if lastEvent.Action != capsule.ScalingActionEnum.ScaleUp() {
+	if lastEvent.Action != enums.ScalingActionEnum.ScaleUp() {
 		t.Errorf("expected ScaleUp, got %s", lastEvent.Action)
 	}
 }

@@ -5,20 +5,21 @@ import (
 	"time"
 
 	"github.com/tareksalem/falak/capsule"
+	enums "github.com/tareksalem/falak/capsule/enums"
 )
 
 func TestTrackerDefaults(t *testing.T) {
-	tracker := NewTrackerFromTier(capsule.TierEnum.Critical())
+	tracker := NewTrackerFromTier(enums.TierEnum.Critical())
 	if tracker.Current() != 90 {
 		t.Errorf("critical tier should start at 90, got %d", tracker.Current())
 	}
 
-	tracker = NewTrackerFromTier(capsule.TierEnum.Standard())
+	tracker = NewTrackerFromTier(enums.TierEnum.Standard())
 	if tracker.Current() != 50 {
 		t.Errorf("standard tier should start at 50, got %d", tracker.Current())
 	}
 
-	tracker = NewTrackerFromTier(capsule.TierEnum.Background())
+	tracker = NewTrackerFromTier(enums.TierEnum.Background())
 	if tracker.Current() != 20 {
 		t.Errorf("background tier should start at 20, got %d", tracker.Current())
 	}

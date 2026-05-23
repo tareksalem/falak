@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/qmuntal/stateless"
+	"github.com/tareksalem/falak/capsule/enums"
 	"go.uber.org/zap"
 )
 
@@ -25,13 +26,20 @@ const (
 	TriggerNodeFailed       = "node_failed"
 	TriggerScaleUpNeeded    = "scale_up_needed"
 	TriggerScaleDownNeeded  = "scale_down_needed"
+
+	// TriggerMembersAdmitted advances a group-kind capsule from Announced to
+	// Running once every member has been admitted (materialized + persisted)
+	// by the originator. The FSM accepts this trigger from any kind; the
+	// Manager is responsible for kind-gating so non-group capsules cannot
+	// fire it. See Manager.Fire and Manager.MarkGroupRunning.
+	TriggerMembersAdmitted = "members_admitted"
 )
 
 // LifecycleEvent is emitted on state transitions.
 type LifecycleEvent struct {
 	CapsuleID CapsuleID
-	From      CapsuleStatus
-	To        CapsuleStatus
+	From      enums.CapsuleStatus
+	To        enums.CapsuleStatus
 	Trigger   string
 }
 
@@ -49,7 +57,7 @@ type Lifecycle struct {
 	handler     LifecycleHandler
 	logger      *zap.Logger
 	lastTrigger string
-	prevState   CapsuleStatus
+	prevState   enums.CapsuleStatus
 }
 
 // LifecycleOption configures a Lifecycle.
@@ -71,7 +79,7 @@ func WithLifecycleHandler(h LifecycleHandler) LifecycleOption {
 
 // WithLifecycleInitialState overrides the starting state (default: Created).
 // Used when restoring a capsule from persistent storage.
-func WithLifecycleInitialState(state CapsuleStatus) LifecycleOption {
+func WithLifecycleInitialState(state enums.CapsuleStatus) LifecycleOption {
 	return func(l *Lifecycle) {
 		l.prevState = state
 	}
@@ -88,7 +96,7 @@ func NewLifecycle(capsuleID CapsuleID, opts ...LifecycleOption) *Lifecycle {
 		opt(l)
 	}
 
-	initial := CapsuleStatusEnum.Created()
+	initial := enums.CapsuleStatusEnum.Created()
 	if l.prevState != "" && l.prevState.Valid() {
 		initial = l.prevState
 	}
@@ -97,11 +105,11 @@ func NewLifecycle(capsuleID CapsuleID, opts ...LifecycleOption) *Lifecycle {
 }
 
 // State returns the current lifecycle state.
-func (l *Lifecycle) State() CapsuleStatus {
+func (l *Lifecycle) State() enums.CapsuleStatus {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	state, _ := l.machine.State(context.Background())
-	if cs, ok := state.(CapsuleStatus); ok {
+	if cs, ok := state.(enums.CapsuleStatus); ok {
 		return cs
 	}
 	return ""
@@ -113,7 +121,7 @@ func (l *Lifecycle) Fire(trigger string) error {
 	l.mu.Lock()
 	// Capture state before the transition so onEntry can report From.
 	current, _ := l.machine.State(context.Background())
-	if cs, ok := current.(CapsuleStatus); ok {
+	if cs, ok := current.(enums.CapsuleStatus); ok {
 		l.prevState = cs
 	}
 	l.lastTrigger = trigger
@@ -133,15 +141,15 @@ func (l *Lifecycle) CanFire(trigger string) bool {
 	return can
 }
 
-func (l *Lifecycle) buildMachine(initial CapsuleStatus) *stateless.StateMachine {
-	created := CapsuleStatusEnum.Created()
-	announced := CapsuleStatusEnum.Announced()
-	electing := CapsuleStatusEnum.Electing()
-	assigned := CapsuleStatusEnum.Assigned()
-	executing := CapsuleStatusEnum.Executing()
-	running := CapsuleStatusEnum.Running()
-	stopping := CapsuleStatusEnum.Stopping()
-	stopped := CapsuleStatusEnum.Stopped()
+func (l *Lifecycle) buildMachine(initial enums.CapsuleStatus) *stateless.StateMachine {
+	created := enums.CapsuleStatusEnum.Created()
+	announced := enums.CapsuleStatusEnum.Announced()
+	electing := enums.CapsuleStatusEnum.Electing()
+	assigned := enums.CapsuleStatusEnum.Assigned()
+	executing := enums.CapsuleStatusEnum.Executing()
+	running := enums.CapsuleStatusEnum.Running()
+	stopping := enums.CapsuleStatusEnum.Stopping()
+	stopped := enums.CapsuleStatusEnum.Stopped()
 
 	sm := stateless.NewStateMachine(initial)
 
@@ -150,9 +158,13 @@ func (l *Lifecycle) buildMachine(initial CapsuleStatus) *stateless.StateMachine 
 		Permit(TriggerAnnounce, announced).
 		OnEntry(l.onEntry(created))
 
-	// Announced → Electing
+	// Announced → Electing (capsules) or Running (groups, on members admitted).
+	// The FSM permits both transitions from Announced; Manager.Fire enforces
+	// per-kind gating so groups never fire election triggers and capsules
+	// never fire MembersAdmitted.
 	sm.Configure(announced).
 		Permit(TriggerElectionStarted, electing).
+		Permit(TriggerMembersAdmitted, running).
 		OnEntry(l.onEntry(announced))
 
 	// Electing → Assigned or back to Announced
@@ -194,7 +206,7 @@ func (l *Lifecycle) buildMachine(initial CapsuleStatus) *stateless.StateMachine 
 	return sm
 }
 
-func (l *Lifecycle) onEntry(state CapsuleStatus) stateless.ActionFunc {
+func (l *Lifecycle) onEntry(state enums.CapsuleStatus) stateless.ActionFunc {
 	return func(_ context.Context, _ ...any) error {
 		l.mu.RLock()
 		from := l.prevState

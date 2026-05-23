@@ -2,6 +2,7 @@ package gravity
 
 import (
 	"github.com/tareksalem/falak/capsule"
+	capsuleEnums "github.com/tareksalem/falak/capsule/enums"
 )
 
 // factorContribution is the unweighted result of a single factor function.
@@ -124,10 +125,10 @@ func factorAffinityProximity(c *capsule.Capsule, node NodeState, lookup CapsuleT
 	}
 	var total, satisfied int
 	for _, rule := range c.Spec.PlacementRules {
-		if rule.Type != capsule.PlacementTypeEnum.Capsule() {
+		if rule.Type != capsuleEnums.PlacementTypeEnum.Capsule() {
 			continue
 		}
-		if rule.Mode != capsule.PlacementModeEnum.Near() {
+		if rule.Mode != capsuleEnums.PlacementModeEnum.Near() {
 			continue
 		}
 		total++

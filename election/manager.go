@@ -45,6 +45,19 @@ func (noopSink) EmitWon(Request, string, float64) {}
 func (noopSink) EmitLost(Request, string)         {}
 func (noopSink) EmitFailed(Request, string)       {}
 
+// defaultGroupImagePullTimeout bounds the per-member image-pull window
+// the manager assumes when computing the capacity-reservation deadline.
+// 5 minutes covers typical container image sizes on a healthy network;
+// configurable via WithGroupImagePullTimeout. The actual heartbeat
+// extension based on PullProgress is deferred to Phase 10.16.
+const defaultGroupImagePullTimeout = 5 * time.Minute
+
+// defaultGroupReservationSlack is the constant slack added on top of
+// N*image_pull_timeout when computing the reservation deadline. It
+// covers fixed-cost runtime overhead (container start, healthcheck
+// settling) that does not scale with member count.
+const defaultGroupReservationSlack = 30 * time.Second
+
 // StrategyRegistry maps cluster paths to the strategy they use.
 //
 // Every cluster uses the default strategy unless a per-cluster override
@@ -94,6 +107,32 @@ type inflightEntry struct {
 	cancel context.CancelFunc
 }
 
+// groupInflightEntry tracks the state of one in-flight group election.
+// Separate from inflightEntry because a group election's key is the
+// group ID alone (no replica dimension).
+type groupInflightEntry struct {
+	cancel context.CancelFunc
+}
+
+// groupReservation records the capacity a node has tentatively committed
+// to a group while members are being pulled and started. Both the winning
+// node (which actually starts the members) and observing nodes record the
+// reservation locally: observers use it to refuse a concurrent group
+// claim that would over-commit the same node, the winner uses it as the
+// per-group deadline for the "all members must reach Running" gate.
+type groupReservation struct {
+	GroupID     capsule.CapsuleID
+	MemberIDs   []capsule.CapsuleID
+	ClusterPath string
+	NodeID      string
+	Deadline    time.Time
+	// cancel terminates the deadline watchdog goroutine. Set when the
+	// reservation is recorded; called when the reservation is cleared
+	// (either because the deadline fires or because the runtime reports
+	// every member running — wiring deferred to Phase 10.15).
+	cancel context.CancelFunc
+}
+
 // Manager is the central election orchestrator. It owns the cluster
 // election topics, dispatches incoming requests to strategies, runs the
 // distributed protocol (publish + tiebreak + timeout), and translates
@@ -107,6 +146,7 @@ type Manager struct {
 	store     CapsuleStore
 	lifecycle LifecycleController
 	sink      EventSink
+	groupSink GroupClaimSink
 	logger    *zap.Logger
 	nodeID    string
 
@@ -124,19 +164,42 @@ type Manager struct {
 	publishTimeout         time.Duration
 	electionTimeout        time.Duration
 	tiebreakWindow         time.Duration
+	groupImagePullTimeout  time.Duration
 	perClusterTimeout      map[string]time.Duration
 
-	inflight map[inflightKey]*inflightEntry
+	inflight      map[inflightKey]*inflightEntry
+	groupInflight map[capsule.CapsuleID]*groupInflightEntry
 
-	// localClaims records which (cluster, capsule_name) pairs the local
-	// node has already published a claim for. Multi-replica elections
-	// fire in parallel; without a local guard, the best-fit node would
-	// publish a claim for every replica simultaneously. After the first
-	// successful publish this map marks the capsule as claimed so
-	// subsequent rounds on the same node short-circuit to
-	// waitForRemoteVerdict instead of publishing a duplicate claim.
-	localClaims   map[string]bool
-	localClaimsMu sync.Mutex
+	// localClaims records which capsule_id values the local node has
+	// already published a claim for. Multi-replica elections fire in
+	// parallel; without a local guard, the best-fit node would publish a
+	// claim for every replica simultaneously. After the first successful
+	// publish this map marks the capsule as claimed so subsequent rounds
+	// on the same node defer their publish.
+	//
+	// claimReleased[capsuleID] is broadcast-style channel pattern: a fresh
+	// channel is stored per capsule, closed (not deleted) when the slot is
+	// released. Any goroutine waiting for the slot watches this channel
+	// and retries on close. The closed channel is then replaced with a
+	// fresh one inside tryClaimCapsule on the next acquisition so future
+	// waiters synchronise on the new generation.
+	localClaims     map[string]bool
+	claimReleased   map[string]chan struct{}
+	localClaimsMu   sync.Mutex
+
+	// localGroupClaims dedupes parallel group-claim rounds for the same
+	// group ID on the local node. Without this guard, two concurrent
+	// HandleGroupClaimRequest calls for the same group would both
+	// publish, doubling cluster traffic and confusing the tiebreak.
+	localGroupClaims   map[capsule.CapsuleID]bool
+	localGroupClaimsMu sync.Mutex
+
+	// pendingReservations records group capacity reservations on the
+	// local node. The winning node records its own reservation; observer
+	// nodes that received a remote winning claim also record one so a
+	// second group election cannot over-commit the same node.
+	pendingReservations   map[capsule.CapsuleID]*groupReservation
+	pendingReservationsMu sync.Mutex
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -166,6 +229,28 @@ func WithLifecycleController(lc LifecycleController) ManagerOption {
 // WithEventSink wires the sink for outcome events.
 func WithEventSink(s EventSink) ManagerOption {
 	return func(m *Manager) { m.sink = s }
+}
+
+// WithGroupClaimSink wires the sink for group-claim outcome events.
+// Used by the node bridge to publish GroupClaimWon/Lost/Failed events
+// onto the node event bus when an election round resolves.
+func WithGroupClaimSink(s GroupClaimSink) ManagerOption {
+	return func(m *Manager) { m.groupSink = s }
+}
+
+// WithGroupImagePullTimeout sets the assumed per-member image-pull
+// timeout used to compute the capacity-reservation deadline. The
+// effective deadline is N*timeout + 30s where N is the number of
+// members. Default 5 minutes.
+//
+// PullProgress-driven extension of the reservation (so genuinely slow
+// pulls do not falsely time out) is deferred to Phase 10.16.
+func WithGroupImagePullTimeout(d time.Duration) ManagerOption {
+	return func(m *Manager) {
+		if d > 0 {
+			m.groupImagePullTimeout = d
+		}
+	}
 }
 
 // WithNodeID sets the local node ID.
@@ -221,17 +306,23 @@ func WithTiebreakWindow(d time.Duration) ManagerOption {
 // options.
 func NewManager(defaultStrategy Strategy, opts ...ManagerOption) *Manager {
 	m := &Manager{
-		registry:          NewStrategyRegistry(defaultStrategy),
-		logger:            zap.NewNop(),
-		sink:              noopSink{},
-		topics:            make(map[string]*ClusterTopic),
-		inflight:          make(map[inflightKey]*inflightEntry),
-		localClaims:       make(map[string]bool),
-		perClusterCalc:    make(map[string]*gravity.Calculator),
-		perClusterTimeout: make(map[string]time.Duration),
-		publishTimeout:    3 * time.Second,
-		electionTimeout:   10 * time.Second,
-		tiebreakWindow:    300 * time.Millisecond,
+		registry:              NewStrategyRegistry(defaultStrategy),
+		logger:                zap.NewNop(),
+		sink:                  noopSink{},
+		groupSink:             noopGroupSink{},
+		topics:                make(map[string]*ClusterTopic),
+		inflight:              make(map[inflightKey]*inflightEntry),
+		groupInflight:         make(map[capsule.CapsuleID]*groupInflightEntry),
+		localClaims:           make(map[string]bool),
+		claimReleased:         make(map[string]chan struct{}),
+		localGroupClaims:      make(map[capsule.CapsuleID]bool),
+		pendingReservations:   make(map[capsule.CapsuleID]*groupReservation),
+		perClusterCalc:        make(map[string]*gravity.Calculator),
+		perClusterTimeout:     make(map[string]time.Duration),
+		publishTimeout:        3 * time.Second,
+		electionTimeout:       10 * time.Second,
+		tiebreakWindow:        300 * time.Millisecond,
+		groupImagePullTimeout: defaultGroupImagePullTimeout,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -381,12 +472,29 @@ func (m *Manager) Stop() {
 		e.cancel()
 	}
 	m.inflight = make(map[inflightKey]*inflightEntry)
+	for _, e := range m.groupInflight {
+		e.cancel()
+	}
+	m.groupInflight = make(map[capsule.CapsuleID]*groupInflightEntry)
 	topics := make([]*ClusterTopic, 0, len(m.topics))
 	for _, t := range m.topics {
 		topics = append(topics, t)
 	}
 	m.topics = make(map[string]*ClusterTopic)
 	m.mu.Unlock()
+
+	// Cancel every reservation watchdog. The reservation map is held
+	// behind its own mutex; cancelling under that lock is safe because
+	// the watchdogs only need the cancel function to exit, not any
+	// manager-wide state.
+	m.pendingReservationsMu.Lock()
+	for id, r := range m.pendingReservations {
+		if r.cancel != nil {
+			r.cancel()
+		}
+		delete(m.pendingReservations, id)
+	}
+	m.pendingReservationsMu.Unlock()
 
 	m.wg.Wait()
 	for _, t := range topics {
@@ -490,16 +598,39 @@ func (m *Manager) runElection(ctx context.Context, req Request, c *capsule.Capsu
 
 	// Self-anti-affinity short-circuit for multi-replica capsules. If
 	// this node has already published a claim for another replica of
-	// the same capsule in this manager's lifetime, give up and wait
-	// for the remote verdict. This guard is what prevents the
-	// best-fit node from winning every replica of a multi-replica
-	// capsule in a parallel fire.
+	// the same capsule, wait for that claim's outcome before deciding.
+	// On Win the slot stays held: the next caller will see hasLocalClaim
+	// still true and step aside. On Lose/Failed the slot is released and
+	// this round retries the publish itself, so the same node can take a
+	// different replica when its earlier sibling didn't win.
+	//
+	// This is what prevents the best-fit node from winning every replica
+	// of a multi-replica capsule in a parallel fire — without leaving
+	// some replicas un-published when sibling rounds release their slots.
 	if m.hasLocalClaim(req.CapsuleID) {
-		m.logger.Debug("local node already claimed this capsule; stepping aside",
+		m.logger.Debug("local node has in-flight claim for this capsule; awaiting outcome",
 			zap.String("capsule_id", string(req.CapsuleID)),
 			zap.String("replica_id", req.ReplicaID))
-		m.waitForRemoteVerdict(ctx, req, deadline, claimsCh, failuresCh)
-		return
+		if !m.waitForCapsuleClaimReleased(ctx, req.CapsuleID, deadline) {
+			// Sibling round won (or context cancelled / deadline hit) —
+			// step aside. The remote verdict listener will report Lost
+			// when a peer's claim arrives, or Failed on overall timeout.
+			m.waitForRemoteVerdict(ctx, req, deadline, claimsCh, failuresCh)
+			return
+		}
+		// Slot released — sibling round lost or failed. Re-evaluate
+		// eligibility against the latest store state: if a sibling
+		// already recorded this node as a runner of this capsule, we
+		// must not publish again. Recomputing decision is cheap.
+		decision = strategy.Decide(ctx, req, c, calc, m.provider)
+		if !decision.Eligible {
+			m.logger.Debug("no longer eligible after sibling round resolved; awaiting remote verdict",
+				zap.String("capsule_id", string(req.CapsuleID)),
+				zap.String("replica_id", req.ReplicaID),
+				zap.String("reason", decision.Reason))
+			m.waitForRemoteVerdict(ctx, req, deadline, claimsCh, failuresCh)
+			return
+		}
 	}
 
 	// Ours is eligible — wait until PublishAt, but if a better remote
@@ -527,14 +658,30 @@ func (m *Manager) runElection(ctx context.Context, req Request, c *capsule.Capsu
 	}
 
 	// Reserve the local claim slot before publishing. If another
-	// goroutine beat us to it, fall back to waitForRemoteVerdict —
-	// that round will see our own claim and resolve as OutcomeLost.
-	if !m.tryClaimCapsule(req.CapsuleID) {
-		m.logger.Debug("local claim slot taken while waiting; stepping aside",
+	// goroutine on this node beat us to it, wait for that sibling's
+	// outcome. On release we re-evaluate eligibility and retry the
+	// publish — that's what lets a node pick up a different replica
+	// after its earlier sibling round lost.
+	for !m.tryClaimCapsule(req.CapsuleID) {
+		m.logger.Debug("local claim slot taken while waiting; awaiting sibling outcome",
 			zap.String("capsule_id", string(req.CapsuleID)),
 			zap.String("replica_id", req.ReplicaID))
-		m.waitForRemoteVerdict(ctx, req, deadline, claimsCh, failuresCh)
-		return
+		if !m.waitForCapsuleClaimReleased(ctx, req.CapsuleID, deadline) {
+			m.waitForRemoteVerdict(ctx, req, deadline, claimsCh, failuresCh)
+			return
+		}
+		// Slot released — re-decide. If we are no longer eligible
+		// (sibling round won and recorded us, or rules now exclude us)
+		// fall through to waiting for the remote verdict.
+		decision = strategy.Decide(ctx, req, c, calc, m.provider)
+		if !decision.Eligible {
+			m.logger.Debug("no longer eligible after sibling round resolved; awaiting remote verdict",
+				zap.String("capsule_id", string(req.CapsuleID)),
+				zap.String("replica_id", req.ReplicaID),
+				zap.String("reason", decision.Reason))
+			m.waitForRemoteVerdict(ctx, req, deadline, claimsCh, failuresCh)
+			return
+		}
 	}
 
 	publishedAt := time.Now()
@@ -766,8 +913,8 @@ func (m *Manager) hasLocalClaim(id capsule.CapsuleID) bool {
 
 // tryClaimCapsule atomically sets the local claim flag for a capsule
 // and returns true if this caller was the one who set it. Subsequent
-// callers for the same capsule receive false and must fall through to
-// waitForRemoteVerdict.
+// callers for the same capsule receive false; they should wait via
+// waitForCapsuleClaimReleased before retrying or stepping aside.
 func (m *Manager) tryClaimCapsule(id capsule.CapsuleID) bool {
 	m.localClaimsMu.Lock()
 	defer m.localClaimsMu.Unlock()
@@ -775,16 +922,70 @@ func (m *Manager) tryClaimCapsule(id capsule.CapsuleID) bool {
 		return false
 	}
 	m.localClaims[string(id)] = true
+	// Install (or reset) the release channel for this generation. Any
+	// previous waiters were unblocked by the most recent release; the new
+	// channel is what the next set of waiters will park on.
+	if _, ok := m.claimReleased[string(id)]; !ok {
+		m.claimReleased[string(id)] = make(chan struct{})
+	}
 	return true
 }
 
 // releaseCapsuleClaim clears the local claim flag for a capsule so a
 // later round can retry. Called when a publish fails or the node ends
 // up losing the round after publishing (rival with better score).
+//
+// Closing the per-capsule release channel wakes every goroutine
+// currently blocked in waitForCapsuleClaimReleased. The channel is
+// dropped from the map; the next tryClaimCapsule that succeeds will
+// allocate a fresh one for the next generation of waiters.
 func (m *Manager) releaseCapsuleClaim(id capsule.CapsuleID) {
 	m.localClaimsMu.Lock()
 	defer m.localClaimsMu.Unlock()
 	delete(m.localClaims, string(id))
+	if ch, ok := m.claimReleased[string(id)]; ok {
+		close(ch)
+		delete(m.claimReleased, string(id))
+	}
+}
+
+// waitForCapsuleClaimReleased blocks until the local claim slot for
+// capsule id is released, ctx is cancelled, or the deadline passes.
+// Returns true when the slot was released (caller may retry); false on
+// cancellation or timeout (caller should step aside).
+//
+// The wait is broadcast: every goroutine parked here for the same
+// capsule wakes when the slot is released. Each then retries
+// tryClaimCapsule independently — only one will succeed and the
+// remainder will park again on the next generation channel.
+func (m *Manager) waitForCapsuleClaimReleased(ctx context.Context, id capsule.CapsuleID, deadline time.Time) bool {
+	m.localClaimsMu.Lock()
+	if !m.localClaims[string(id)] {
+		// Already released between the caller's tryClaim and this wait.
+		m.localClaimsMu.Unlock()
+		return true
+	}
+	ch, ok := m.claimReleased[string(id)]
+	if !ok {
+		// Defensive: the holder didn't install a channel. Treat as
+		// released so the caller retries immediately.
+		m.localClaimsMu.Unlock()
+		return true
+	}
+	m.localClaimsMu.Unlock()
+
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-ch:
+		return true
+	case <-time.After(remaining):
+		return false
+	}
 }
 
 // ForgetCapsule removes every piece of Manager-local state associated
@@ -796,4 +997,24 @@ func (m *Manager) releaseCapsuleClaim(id capsule.CapsuleID) {
 // entries are silently ignored.
 func (m *Manager) ForgetCapsule(id capsule.CapsuleID) {
 	m.releaseCapsuleClaim(id)
+	m.releaseLocalGroupClaim(id)
+	m.clearReservation(id)
+}
+
+// CancelGroupInFlight cancels any in-flight group election round for
+// the given group. Used by the capsule handler's node-failure path:
+// when the failed node was the group's reservation holder, the
+// follow-up GroupReelectionRequested must not be deduped by the
+// still-running original round. Idempotent for groups with no
+// in-flight entry.
+func (m *Manager) CancelGroupInFlight(id capsule.CapsuleID) {
+	m.mu.Lock()
+	entry, ok := m.groupInflight[id]
+	if ok {
+		delete(m.groupInflight, id)
+	}
+	m.mu.Unlock()
+	if ok && entry.cancel != nil {
+		entry.cancel()
+	}
 }

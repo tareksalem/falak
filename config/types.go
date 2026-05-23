@@ -72,6 +72,13 @@ type ClusterConfig struct {
 	// Keys are the capsule name; values are the spec.
 	Capsules map[string]CapsuleConfig `json:"capsules,omitempty"`
 
+	// Services defines the Falak Services to auto-create in this cluster
+	// after joining. Keys are the Service name; values are the spec.
+	// Mirrors the cluster-level `services:` block in cue/falak.cue and
+	// is converted to a service.ServiceSpec on node startup via
+	// ServiceConfig.ToServiceSpec.
+	Services map[string]ServiceConfig `json:"services,omitempty"`
+
 	// Election configures the election subsystem for this cluster: which
 	// strategy to use, the election timeout, and gravity factor weight
 	// overrides. Omit to use built-in defaults.
@@ -112,13 +119,15 @@ type ElectionWeights struct {
 
 // CapsuleConfig is the declarative capsule spec loaded from CUE configuration.
 // It mirrors the #Capsule schema in cue/falak.cue and is converted to a
-// capsule.CapsuleSpec at node startup.
+// capsule.CapsuleSpec (kind=capsule) or a capsule.GroupSpec (kind=group)
+// at node startup.
 type CapsuleConfig struct {
 	Name        string            `json:"name"`
-	Image       string            `json:"image"`
+	Kind        string            `json:"kind,omitempty"` // "capsule" (default) | "group"
+	Image       string            `json:"image,omitempty"`
 	ImageAlias  string            `json:"image_alias,omitempty"`
 	ImageDigest string            `json:"image_digest,omitempty"`
-	Orbit       string            `json:"orbit"`
+	Orbit       string            `json:"orbit,omitempty"`
 	Tier        string            `json:"tier,omitempty"`
 	Labels      map[string]string `json:"labels,omitempty"`
 	Command     []string          `json:"command,omitempty"`
@@ -128,6 +137,49 @@ type CapsuleConfig struct {
 	Placement   []PlacementConfig `json:"placement,omitempty"`
 	Runtime     *RuntimeCfg       `json:"runtime,omitempty"`
 	Advanced    *AdvancedConfig   `json:"advanced,omitempty"`
+	Group       *GroupConfig      `json:"group,omitempty"`
+}
+
+// GroupConfig is the declarative CapsuleGroup spec loaded from CUE.
+// It mirrors the #Group schema in cue/falak.cue.
+type GroupConfig struct {
+	// Colocation: "same-orbit" (default) or "same-node".
+	Colocation string `json:"colocation,omitempty"`
+
+	// CascadeDelete defaults to true. JSON unmarshalling treats absent
+	// as zero-value (false), so the converter applies the default
+	// explicitly when the field was not present.
+	CascadeDelete *bool `json:"cascade_delete,omitempty"`
+
+	// Members are the per-member capsule specs keyed by member name.
+	Members map[string]CapsuleMemberConfig `json:"members,omitempty"`
+}
+
+// CapsuleMemberConfig is the declarative per-member spec inside a group.
+// Mirrors #CapsuleMember in cue/falak.cue.
+type CapsuleMemberConfig struct {
+	Name        string            `json:"name"`
+	Image       string            `json:"image,omitempty"`
+	ImageAlias  string            `json:"image_alias,omitempty"`
+	ImageDigest string            `json:"image_digest,omitempty"`
+	Orbit       string            `json:"orbit,omitempty"`
+	Tier        string            `json:"tier,omitempty"`
+	Labels      map[string]string `json:"labels,omitempty"`
+	Command     []string          `json:"command,omitempty"`
+	Resources   *ResourcesConfig  `json:"resources,omitempty"`
+	Replicas    *ReplicasConfig   `json:"replicas,omitempty"`
+	Scaling     *ScalingConfig    `json:"scaling,omitempty"`
+	Placement   []PlacementConfig `json:"placement,omitempty"`
+	Runtime     *RuntimeCfg       `json:"runtime,omitempty"`
+	Advanced    *AdvancedConfig   `json:"advanced,omitempty"`
+	DependsOn   []string          `json:"depends_on,omitempty"`
+
+	// Phase 11+ fields — admission rejects them in Phase 10 with a
+	// clear "feature not yet supported" error. Declared here so JSON
+	// decoding doesn't silently drop the data; the validator at
+	// admission inspects the raw JSON shape (see config/group.go).
+	ReplicaLabels []map[string]string `json:"replica_labels,omitempty"`
+	Discovers     []string            `json:"discovers,omitempty"`
 }
 
 // ResourcesConfig defines capsule resource constraints.

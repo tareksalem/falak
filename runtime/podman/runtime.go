@@ -149,6 +149,97 @@ func (r *Runtime) Pull(ctx context.Context, image string, opts ...runtime.PullOp
 	return nil
 }
 
+// PullStreaming fetches an OCI image via Podman's libpod pull endpoint and
+// invokes onProgress for every JSON-Lines progress record returned by the
+// daemon. progressDetail.current and progressDetail.total are forwarded as
+// (current, total) on each call. Records without numeric progress (e.g.
+// the terminal "stream":"..." status line) yield a (0, 0) call so callers
+// can implement rate-limited heartbeats without inspecting the payload.
+//
+// onProgress is called synchronously from the parser goroutine; it must
+// not block. The method returns when the daemon closes the response body
+// or the context is cancelled. Network and protocol errors are wrapped
+// with %w so callers can use errors.Is.
+//
+// When onProgress is nil, PullStreaming degrades to a plain Pull (no
+// callback overhead). The method always drains the response body before
+// returning so the underlying HTTP connection can be reused.
+func (r *Runtime) PullStreaming(ctx context.Context, image string, onProgress func(current, total int64), opts ...runtime.PullOption) error {
+	cfg := runtime.ApplyPullOptions(opts...)
+	r.logger.Info("podman: streaming pull", zap.String("image", image))
+
+	q := url.Values{"reference": {image}}
+	if cfg.ForcePull {
+		q.Set("policy", "always")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL("/images/pull", q), nil)
+	if err != nil {
+		return fmt.Errorf("podman pull: %w", err)
+	}
+	if cfg.Username != "" {
+		req.SetBasicAuth(cfg.Username, cfg.Password)
+	}
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("podman pull: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("podman pull: status %d", resp.StatusCode)
+	}
+
+	if onProgress == nil {
+		io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+
+	if err := parsePullProgress(resp.Body, onProgress); err != nil {
+		return fmt.Errorf("podman pull: stream: %w", err)
+	}
+	return nil
+}
+
+// parsePullProgress reads the Podman pull endpoint's JSON-Lines progress
+// feed from r and invokes onProgress for every record. Each record carries
+// an optional `progressDetail` object with `current` and `total` byte
+// counts; records without that object pass (0, 0) so the caller still
+// observes liveness. EOF and io.ErrUnexpectedEOF are treated as the
+// daemon's clean close of the stream.
+//
+// Pulled out as a free function so the test suite can drive it from a
+// canned buffer without standing up an HTTP fixture.
+func parsePullProgress(r io.Reader, onProgress func(current, total int64)) error {
+	dec := json.NewDecoder(r)
+	dec.UseNumber()
+	for {
+		var record struct {
+			ProgressDetail *struct {
+				Current json.Number `json:"current"`
+				Total   json.Number `json:"total"`
+			} `json:"progressDetail"`
+		}
+		if err := dec.Decode(&record); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return nil
+			}
+			return err
+		}
+		var current, total int64
+		if record.ProgressDetail != nil {
+			if v, parseErr := record.ProgressDetail.Current.Int64(); parseErr == nil {
+				current = v
+			}
+			if v, parseErr := record.ProgressDetail.Total.Int64(); parseErr == nil {
+				total = v
+			}
+		}
+		onProgress(current, total)
+	}
+}
+
 // Create sets up a container without starting it.
 func (r *Runtime) Create(ctx context.Context, id string, image string, opts ...runtime.CreateOption) error {
 	cfg := runtime.ApplyCreateOptions(opts...)

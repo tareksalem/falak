@@ -293,6 +293,13 @@ type CreateConfig struct {
 	WorkingDir   string
 	Command      []string
 	LogRetention LogRetention
+
+	// DNSFlags carries opaque Podman create flags ("--dns=...",
+	// "--dns-search=", "--dns-option=...") that the per-group network
+	// manager injects so the container's /etc/resolv.conf points at the
+	// link-local DNS responder (169.254.169.250). Empty for standalone
+	// capsules.
+	DNSFlags []string
 }
 
 // WithNetworkMode sets the container's network isolation mode.
@@ -333,6 +340,21 @@ func WithCommand(cmd ...string) CreateOption {
 // WithLogRetention sets the log rotation policy for the container.
 func WithLogRetention(retention LogRetention) CreateOption {
 	return func(c *CreateConfig) { c.LogRetention = retention }
+}
+
+// WithDNSFlags carries opaque Podman create flags ("--dns=...",
+// "--dns-search=", "--dns-option=...") that the per-group network
+// manager injects so the container's /etc/resolv.conf points at the
+// link-local DNS responder. A nil or empty slice is a no-op: standalone
+// capsules retain Podman's default networking. The flags are copied
+// defensively so callers can reuse their slice.
+func WithDNSFlags(flags []string) CreateOption {
+	return func(c *CreateConfig) {
+		if len(flags) == 0 {
+			return
+		}
+		c.DNSFlags = append(c.DNSFlags[:0:0], flags...)
+	}
 }
 
 // ApplyCreateOptions applies the given options and returns the resolved config.
