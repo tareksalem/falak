@@ -17,6 +17,7 @@ type Subscriber struct {
 	phonebook IPhonebook
 	eventBus  events.Bus
 	logger    *zap.Logger
+	selfID    string // optional — when an announcement targets self, skip PendingAuth
 	parentCtx context.Context // Set via WithContext option
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -53,6 +54,16 @@ func WithEventBus(bus events.Bus) SubscriberOption {
 func WithSubscriberLogger(logger *zap.Logger) SubscriberOption {
 	return func(s *Subscriber) {
 		s.logger = logger
+	}
+}
+
+// WithSubscriberSelfID tells the subscriber which peer ID belongs to us.
+// When an inbound announcement names self (e.g. the first-node bootstrap
+// path that re-publishes our own entry), the subscriber adds it as Active
+// instead of PendingAuth — we are by definition already authenticated.
+func WithSubscriberSelfID(id string) SubscriberOption {
+	return func(s *Subscriber) {
+		s.selfID = id
 	}
 }
 
@@ -118,6 +129,10 @@ func (s *Subscriber) Stop() {
 }
 
 // handleNewMemberAnnounced processes NewMemberAnnounced events (we authenticated a new member).
+// New entries enter PendingAuth: the voucher just signed the cert but the
+// joiner's libp2p mesh / ping handler may not be ready yet, so SWIM
+// should hold off probing until the grace window elapses or the auth
+// handler explicitly promotes (Bug #13).
 func (s *Subscriber) handleNewMemberAnnounced(ch <-chan events.Event) {
 	for {
 		select {
@@ -133,12 +148,15 @@ func (s *Subscriber) handleNewMemberAnnounced(ch <-chan events.Event) {
 				continue
 			}
 
-			s.addOrUpdateEntry(e.NodeID, e.ClusterPath, e.Addresses, e.PublicKey, e.Capabilities)
+			s.addOrUpdateEntry(e.NodeID, e.ClusterPath, e.Addresses, e.PublicKey, e.Capabilities, NodeStatusEnum.PendingAuth())
 		}
 	}
 }
 
-// handleNewMemberReceived processes NewMemberReceived events (received via PubSub).
+// handleNewMemberReceived processes NewMemberReceived events (received via
+// the gossipsub Step 2 broadcast). The announcement is voucher-signed but
+// we have no direct libp2p connection to the new member yet, so SWIM
+// probes would fail until libp2p dials. Hence PendingAuth (Bug #13).
 func (s *Subscriber) handleNewMemberReceived(ch <-chan events.Event) {
 	for {
 		select {
@@ -154,12 +172,18 @@ func (s *Subscriber) handleNewMemberReceived(ch <-chan events.Event) {
 				continue
 			}
 
-			s.addOrUpdateEntry(e.NodeID, e.ClusterPath, e.Addresses, e.PublicKey, e.Capabilities)
+			s.addOrUpdateEntry(e.NodeID, e.ClusterPath, e.Addresses, e.PublicKey, e.Capabilities, NodeStatusEnum.PendingAuth())
 		}
 	}
 }
 
-// handleClusterMembersReceived processes ClusterMembersReceived events (after authentication).
+// handleClusterMembersReceived processes ClusterMembersReceived events
+// emitted by the joiner side after a successful auth handshake. These
+// members come from the voucher's AuthComplete payload — the cluster has
+// authenticated them, and we hold a working libp2p connection to the
+// voucher itself. Adding them as Active lets the syncer's GetBestPeers
+// pick the voucher for the initial post-join sync; using PendingAuth here
+// would starve the syncer until the SWIM grace window expired.
 func (s *Subscriber) handleClusterMembersReceived(ch <-chan events.Event) {
 	for {
 		select {
@@ -176,7 +200,7 @@ func (s *Subscriber) handleClusterMembersReceived(ch <-chan events.Event) {
 			}
 
 			for _, member := range e.Members {
-				s.addOrUpdateEntry(member.NodeID, e.ClusterPath, member.Addresses, member.PublicKey, member.Capabilities)
+				s.addOrUpdateEntry(member.NodeID, e.ClusterPath, member.Addresses, member.PublicKey, member.Capabilities, NodeStatusEnum.Active())
 			}
 
 			s.logger.Info("stored cluster members",
@@ -186,8 +210,17 @@ func (s *Subscriber) handleClusterMembersReceived(ch <-chan events.Event) {
 	}
 }
 
-// addOrUpdateEntry adds or updates a phonebook entry.
-func (s *Subscriber) addOrUpdateEntry(nodeID, clusterPath string, addresses []string, publicKey []byte, caps *events.Capabilities) {
+// MetadataKeyNodeName is the well-known capabilities.Metadata key
+// carrying the operator-assigned friendly node name. Kept in sync with
+// auth.MetadataKeyNodeName — duplicated here to avoid pulling the auth
+// package into the phonebook subscriber's import graph.
+const MetadataKeyNodeName = "node_name"
+
+// addOrUpdateEntry adds or updates a phonebook entry. initialStatus is the
+// status used when the row is freshly inserted; updates always preserve the
+// existing row's status (so a stale re-announcement can never demote an
+// already-promoted peer).
+func (s *Subscriber) addOrUpdateEntry(nodeID, clusterPath string, addresses []string, publicKey []byte, caps *events.Capabilities, initialStatus NodeStatus) {
 	cp, _ := shared.ParseClusterPath(clusterPath)
 
 	entry := &Entry{
@@ -199,7 +232,14 @@ func (s *Subscriber) addOrUpdateEntry(nodeID, clusterPath string, addresses []st
 		Datacenter:  cp.Datacenter,
 		FirstSeen:   time.Now(),
 		LastSeen:    time.Now(),
-		Status:      NodeStatusEnum.Active(),
+		Status:      initialStatus,
+	}
+
+	// Self is, by definition, already authenticated — don't park our
+	// own entry in PendingAuth (which SWIM would skip forever since
+	// it never probes self).
+	if s.selfID != "" && nodeID == s.selfID {
+		entry.Status = NodeStatusEnum.Active()
 	}
 
 	if caps != nil {
@@ -211,10 +251,29 @@ func (s *Subscriber) addOrUpdateEntry(nodeID, clusterPath string, addresses []st
 			Tags:       caps.Tags,
 			Metadata:   caps.Metadata,
 		}
+		if name, ok := caps.Metadata[MetadataKeyNodeName]; ok {
+			entry.Name = name
+		}
 	}
 
-	exists, _ := s.phonebook.Exists(nodeID, clusterPath)
-	if exists {
+	existing, _ := s.phonebook.Get(nodeID, clusterPath)
+	if existing != nil {
+		// Preserve fields that the announcement doesn't carry. Critical
+		// for Status: a re-announcement (delta sync, periodic gossip)
+		// must not flip an Active peer back to PendingAuth, nor undo a
+		// Departed marker — those are derived from local observation,
+		// not the announcement payload.
+		entry.Status = existing.Status
+		entry.FirstSeen = existing.FirstSeen
+		entry.ReliabilityScore = existing.ReliabilityScore
+		entry.LastProbeTime = existing.LastProbeTime
+		entry.LastProbeSuccess = existing.LastProbeSuccess
+		entry.ConnectionAttempts = existing.ConnectionAttempts
+		entry.ConnectionSuccess = existing.ConnectionSuccess
+		entry.SuccessRate = existing.SuccessRate
+		entry.ConsecutiveFails = existing.ConsecutiveFails
+		entry.LastConnected = existing.LastConnected
+		entry.IsConnected = existing.IsConnected
 		if err := s.phonebook.Update(entry); err != nil {
 			s.logger.Error("failed to update phonebook entry",
 				zap.String("nodeId", nodeID),

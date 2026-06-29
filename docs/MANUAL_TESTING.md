@@ -20,7 +20,20 @@ export CLUSTER=test/dc1/prod
 
 Some layers need **Linux + root** (VXLAN, IPsec, iptables). Without root you'll get most of Layers 1–6 cleanly; Layer 7's overlay path degrades.
 
-For container layers (4 onwards) you need **Podman** installed and a running rootless or system Podman socket.
+For container layers (4 onwards) you need:
+
+- **Podman** installed with a running rootless or system socket:
+  ```bash
+  systemctl --user start podman.socket
+  systemctl --user enable podman.socket
+  ```
+- **CRIU** installed for the snapshot fast-restore path (locked Podman +
+  CRIU runtime architecture). Without CRIU containers still cold-start
+  but the daemon logs `snapshot capture failed` per capsule.
+  ```bash
+  sudo apt install -y criu          # or dnf / pacman
+  sudo criu check                   # last line: "Looks good."
+  ```
 
 ---
 
@@ -127,7 +140,7 @@ capsule: {
 }
 EOF
 
-/tmp/falak --insecure capsule create -f /tmp/cap-api.cue
+/tmp/falak --insecure capsule create -f /tmp/cap-api.cue --cluster=$CLUSTER
 ```
 
 **Expected:**
@@ -172,7 +185,12 @@ capsule: {
 }
 EOF
 
-/tmp/falak --insecure capsule create -f /tmp/grp-stack.cue
+# NOTE: `capsule create -f` rejects `kind: "group"` today — only standalone
+# capsules go through the gRPC Create surface. Until the daemon grows a
+# CreateGroup RPC, deploy groups via the node config's `capsules:` block
+# and restart the daemon with --config=node-with-stack.cue.
+/tmp/falak daemon stop
+/tmp/falak daemon start --name=node1 --port=4001 --config=node-with-stack.cue
 ```
 
 **Expected:**
@@ -218,7 +236,10 @@ capsule: {
 }
 EOF
 
-/tmp/falak --insecure capsule create -f /tmp/grp-tight.cue
+# Same constraint as Layer 5 — declare the group under the daemon
+# `capsules:` config block and restart with --config=node-with-sidecar.cue.
+/tmp/falak daemon stop
+/tmp/falak daemon start --name=node1 --port=4001 --config=node-with-sidecar.cue
 ```
 
 **Expected:**
@@ -256,8 +277,8 @@ EOF
 cp /tmp/cap-v1.cue /tmp/cap-v2.cue
 sed -i 's/payments-v1/payments-v2/' /tmp/cap-v2.cue
 
-/tmp/falak --insecure capsule create -f /tmp/cap-v1.cue
-/tmp/falak --insecure capsule create -f /tmp/cap-v2.cue
+/tmp/falak --insecure capsule create -f /tmp/cap-v1.cue --cluster=$CLUSTER
+/tmp/falak --insecure capsule create -f /tmp/cap-v2.cue --cluster=$CLUSTER
 ```
 
 ### 7.2 Define the Service (90/10 split)

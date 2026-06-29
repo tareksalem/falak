@@ -90,6 +90,20 @@ type CreateCapsuleRequest struct {
 	RegistryURL      string
 	RegistryUsername string
 	RegistryPassword string
+
+	// Network ports — container/host mappings sourced from CUE
+	// runtime.network.ports. host=0 lets the runtime pick a free port.
+	Ports []PortMapping
+}
+
+// PortMapping describes a single container-to-host port binding. Mirrors
+// capsule.PortMapping at the API layer so CreateCapsule can carry the
+// runtime.network.ports section of a CUE file end-to-end.
+type PortMapping struct {
+	Name      string
+	Container int32
+	Host      int32
+	Protocol  string
 }
 
 // GetCapsuleRequest is the input for Core.GetCapsule.
@@ -148,6 +162,7 @@ type CapsuleSpecView struct {
 	Env         map[string]string
 	Command     []string
 	NetworkMode string
+	Ports       []PortMapping
 }
 
 // CapsuleStatusView is the read-only view of capsule status in API responses.
@@ -213,6 +228,14 @@ type NodeStatusView struct {
 	MemoryMB   int64
 	Datacenter string
 	Region     string
+
+	// SWIM-derived live health fields. Populated from the phonebook
+	// entry's LastProbeTime/LastProbeSuccess/ReliabilityScore columns
+	// (which the health monitor's probeResultPersistLoop updates on
+	// every probe). Powers `falak node health`.
+	LastProbeTime    time.Time
+	LastProbeSuccess bool
+	ReliabilityScore float64
 }
 
 // --- System types --------------------------------------------------------

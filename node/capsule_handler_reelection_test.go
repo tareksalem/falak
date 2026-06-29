@@ -182,6 +182,125 @@ func TestOnNodeFailed_FiresOneEventPerOrphanedReplica(t *testing.T) {
 	}
 }
 
+// --- Container crash re-election (O3) ----------------------------------
+
+// TestOnContainerCrash_ClearsBindingThenFiresElection verifies the O3 fix:
+// when a container bound to the local node crashes/is removed, the handler
+// clears the stale replica binding (so self-anti-affinity stops excluding the
+// node) AND fires a re-election for the same replica. Order matters — the
+// binding must already be cleared by the time the election round evaluates
+// eligibility — so this test asserts the binding is empty after onContainerCrash
+// returns (it is cleared synchronously) and an ElectionRequested was fired.
+func TestOnContainerCrash_ClearsBindingThenFiresElection(t *testing.T) {
+	h, bus := newReelectionHandler(t)
+
+	const (
+		cluster   = "test/dc1/c"
+		capsName  = "crash-app"
+		replicaID = "0"
+	)
+	// Bind the replica to the LOCAL node — the crash path only acts on
+	// replicas this node was running.
+	c := seedCapsuleWithReplica(t, h, cluster, capsName, replicaID, "local-node")
+
+	// Precondition: the replica is bound to the local node.
+	before := h.manager.Get(c.ID)
+	if len(before.Replicas) != 1 || before.Replicas[0].NodeID != "local-node" {
+		t.Fatalf("precondition: expected replica bound to local-node, got %+v", before.Replicas)
+	}
+
+	// Drive the capsule-level FSM all the way to Running, mirroring a placed
+	// capsule, so the crash path's MarkNodeFailed downgrade (O6) is exercised
+	// against the real Running → Announced transition (not a no-op rejection).
+	for _, step := range []struct {
+		name string
+		fn   func(capsule.CapsuleID) error
+	}{
+		{"StartElection", h.manager.StartElection},
+		{"WinElection", h.manager.WinElection},
+		{"StartExecution", h.manager.StartExecution},
+		{"MarkRunning", h.manager.MarkRunning},
+	} {
+		if err := step.fn(c.ID); err != nil {
+			t.Fatalf("setup: %s failed: %v", step.name, err)
+		}
+	}
+	if got, _ := h.manager.Status(c.ID); got != enums.CapsuleStatusEnum.Running() {
+		t.Fatalf("setup: expected Running before crash, got %s", got)
+	}
+
+	sub := bus.Subscribe(events.TypeElectionRequested)
+
+	h.onContainerCrash(events.CapsuleExecutionFailed{
+		BaseEvent: events.NewBaseEvent(),
+		CapsuleID: c.ID.String(),
+		Reason:    "container exited",
+	})
+
+	// UnassignReplica is synchronous, so by the time onContainerCrash
+	// returns the binding is already cleared.
+	after := h.manager.Get(c.ID)
+	if len(after.Replicas) != 1 {
+		t.Fatalf("replica slot should be preserved, got %d replicas", len(after.Replicas))
+	}
+	if after.Replicas[0].NodeID != "" {
+		t.Errorf("binding should be cleared before re-election, got NodeID %q", after.Replicas[0].NodeID)
+	}
+
+	// O6: the capsule-level FSM must be downgraded Running → Announced so the
+	// re-election round's forward transitions are valid.
+	if got, _ := h.manager.Status(c.ID); got != enums.CapsuleStatusEnum.Announced() {
+		t.Errorf("FSM should be downgraded to Announced after crash, got %s", got)
+	}
+
+	req := waitForElectionRequested(t, sub, 2*time.Second)
+	if req.CapsuleID != c.ID.String() {
+		t.Errorf("CapsuleID = %q, want %q", req.CapsuleID, c.ID.String())
+	}
+	if req.ReplicaID != replicaID {
+		t.Errorf("ReplicaID = %q, want %q", req.ReplicaID, replicaID)
+	}
+	if req.Reason != events.ElectionReasonEnum.NodeFailure() {
+		t.Errorf("Reason = %q, want %q", req.Reason, events.ElectionReasonEnum.NodeFailure())
+	}
+	if req.Priority != priorityNodeFailure {
+		t.Errorf("Priority = %d, want %d", req.Priority, priorityNodeFailure)
+	}
+}
+
+// TestOnContainerCrash_SkipsReplicaOnOtherNode verifies the crash handler
+// ignores replicas hosted on a different node — only the local node's own
+// containers crash through this path, and a remote-bound replica must keep its
+// binding and not trigger a local re-election.
+func TestOnContainerCrash_SkipsReplicaOnOtherNode(t *testing.T) {
+	h, bus := newReelectionHandler(t)
+
+	c := seedCapsuleWithReplica(t, h, "test/dc1/c", "remote-app", "0", "other-node")
+
+	sub := bus.Subscribe(events.TypeElectionRequested)
+
+	h.onContainerCrash(events.CapsuleExecutionFailed{
+		BaseEvent: events.NewBaseEvent(),
+		CapsuleID: c.ID.String(),
+		Reason:    "container exited",
+	})
+
+	// Remote-bound replica must remain bound.
+	after := h.manager.Get(c.ID)
+	if after.Replicas[0].NodeID != "other-node" {
+		t.Errorf("remote replica binding should be untouched, got %q", after.Replicas[0].NodeID)
+	}
+
+	select {
+	case ev := <-sub:
+		if _, ok := ev.(events.ElectionRequested); ok {
+			t.Error("crash of a remote-bound replica should not fire a local election")
+		}
+	case <-time.After(200 * time.Millisecond):
+		// Expected: no event.
+	}
+}
+
 // --- Scale-up re-election ---------------------------------------------
 
 func TestOnScaleEvent_ScaleUpFiresElection(t *testing.T) {

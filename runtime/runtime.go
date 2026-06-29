@@ -11,8 +11,17 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrContainerNotFound is the sentinel returned by Inspect (and any other
+// container-scoped call) when the backend reports that the container no
+// longer exists — e.g. Podman returns HTTP 404 after the container has
+// been removed. Callers use errors.Is to distinguish a genuinely-gone
+// container (terminal, triggers re-election) from a transient backend
+// error (retryable).
+var ErrContainerNotFound = errors.New("runtime: container not found")
 
 // ContainerStatus represents the current state of a container.
 type ContainerStatus string
@@ -37,6 +46,60 @@ func (containerStatusEnum) Stopped() ContainerStatus    { return containerStatus
 func (containerStatusEnum) Checkpointed() ContainerStatus { return containerStatusCheckpoint }
 func (containerStatusEnum) Failed() ContainerStatus     { return containerStatusFailed }
 func (containerStatusEnum) Unknown() ContainerStatus    { return containerStatusUnknown }
+
+// ContainerEventAction enumerates the lifecycle transitions a backend can
+// report on its event stream. Backends map their native event names onto
+// these values; anything not relevant to crash/removal detection maps to
+// Other (and is dropped by the consumer).
+type ContainerEventAction string
+
+const (
+	containerEventDied    ContainerEventAction = "died"
+	containerEventRemoved ContainerEventAction = "removed"
+	containerEventStarted ContainerEventAction = "started"
+	containerEventStopped ContainerEventAction = "stopped"
+	containerEventOther   ContainerEventAction = "other"
+)
+
+type containerEventActionEnum struct{}
+
+// ContainerEventActionEnum is the public accessor for ContainerEventAction values.
+var ContainerEventActionEnum containerEventActionEnum
+
+// Died reports a container that exited (carries a real exit code).
+func (containerEventActionEnum) Died() ContainerEventAction { return containerEventDied }
+
+// Removed reports a container that was deleted — terminal, cannot be restarted.
+func (containerEventActionEnum) Removed() ContainerEventAction { return containerEventRemoved }
+
+// Started reports a container that began execution.
+func (containerEventActionEnum) Started() ContainerEventAction { return containerEventStarted }
+
+// Stopped reports a container that was stopped (without removal).
+func (containerEventActionEnum) Stopped() ContainerEventAction { return containerEventStopped }
+
+// Other is the catch-all for backend actions Falak does not act on
+// (create, init, kill, cleanup, health_status, …). Consumers drop these.
+func (containerEventActionEnum) Other() ContainerEventAction { return containerEventOther }
+
+// ContainerEvent is a single backend lifecycle event for one container.
+// ContainerID is the Falak container name (equal to containerID(capsuleID,
+// replicaID), e.g. "falak-<cap>-<rep>") — the ownership key the handler
+// uses, NOT the backend's opaque hash. ExitCode is meaningful only for a
+// Died action; it is 0 otherwise.
+type ContainerEvent struct {
+	// ContainerID is the Falak container name (falak-<cap>-<rep>).
+	ContainerID string
+
+	// Action is the lifecycle transition this event represents.
+	Action ContainerEventAction
+
+	// ExitCode is the container's exit code, valid only when Action is Died.
+	ExitCode int
+
+	// Time is when the backend recorded the event.
+	Time time.Time
+}
 
 // NetworkMode selects the container's network isolation model.
 type NetworkMode string
@@ -240,8 +303,19 @@ type Runtime interface {
 	// is closed when the context is cancelled or the container stops.
 	Logs(ctx context.Context, id string, opts ...LogOption) (<-chan LogEntry, error)
 
-	// Inspect returns the current state of a container.
+	// Inspect returns the current state of a container. When the backend
+	// reports the container no longer exists, the returned error wraps
+	// ErrContainerNotFound (test with errors.Is).
 	Inspect(ctx context.Context, id string) (ContainerInfo, error)
+
+	// Events streams container lifecycle events until ctx is cancelled or
+	// the backend stream ends; the channel is closed on either. The
+	// stream is best-effort (it can drop on a backend socket restart), so
+	// consumers MUST pair it with a periodic reconcile sweep for
+	// correctness. Backend-agnostic: Podman, containerd, and the mock
+	// each implement it. ContainerID on each event is the Falak container
+	// name, not the backend's hash.
+	Events(ctx context.Context) (<-chan ContainerEvent, error)
 }
 
 // --- Functional options --------------------------------------------------

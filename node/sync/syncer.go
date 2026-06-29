@@ -495,12 +495,25 @@ func (s *Syncer) processMember(clusterPath string, member *syncpb.MemberInfo) (b
 		return false, err
 	}
 
+	// Parse the cluster path so the entry carries Region/Datacenter
+	// even when delta-sync overwrites a previously-subscriber-built
+	// row. Without this, the subscriber set Region="test"/DC="dc1"
+	// and the very next sync round blanked them.
+	cp, _ := shared.ParseClusterPath(clusterPath)
+
 	entry := &phonebook.Entry{
 		NodeID:      member.NodeId,
 		ClusterPath: clusterPath,
 		PublicKey:   member.PublicKey,
 		Addresses:   member.Addresses,
+		Region:      cp.Region,
+		Datacenter:  cp.Datacenter,
 		UpdatedAt:   time.Now(),
+	}
+	if member.Capabilities != nil {
+		if n, ok := member.Capabilities.Metadata[phonebook.MetadataKeyNodeName]; ok {
+			entry.Name = n
+		}
 	}
 
 	if member.JoinedAt != nil {
@@ -819,8 +832,18 @@ func (s *Syncer) handleSyncRequest(evt events.SyncRequested) {
 	// Get all peers for this cluster to try as fallback
 	peers, err := s.phonebook.GetBestPeers(evt.ClusterPath, 10)
 	if err != nil || len(peers) == 0 {
-		s.logger.Warn("no peers available for sync request",
-			zap.String("cluster", evt.ClusterPath))
+		// Single-node bootstrap: phonebook only has self (or is empty)
+		// — there's literally nobody to sync with. Demote to Debug so
+		// it doesn't clutter the operator's normal startup log. Keep
+		// Warn for the case where peers exist but the lookup errored.
+		if err != nil {
+			s.logger.Warn("no peers available for sync request",
+				zap.String("cluster", evt.ClusterPath),
+				zap.Error(err))
+		} else {
+			s.logger.Debug("no peers to sync with yet (cluster size <= 1)",
+				zap.String("cluster", evt.ClusterPath))
+		}
 		return
 	}
 

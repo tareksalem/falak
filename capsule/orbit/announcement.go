@@ -86,8 +86,19 @@ func NewAnnouncer(manager *Manager, opts ...AnnouncerOption) *Announcer {
 	return a
 }
 
-// Announce publishes a capsule announcement to its orbit.
+// Announce publishes a capsule announcement to the capsule's declared
+// orbit. Retained for back-compat / named-orbit callers; the node now
+// announces via AnnounceOn(CapsuleControlOrbit) so every cluster member
+// observes the capsule.
 func (a *Announcer) Announce(ctx context.Context, c *capsule.Capsule) error {
+	return a.AnnounceOn(ctx, c, c.Spec.Orbit)
+}
+
+// AnnounceOn publishes a capsule announcement on the given logical orbit
+// (e.g. orbit.CapsuleControlOrbit for the cluster-wide control plane).
+// The capsule's declared Spec.Orbit is still carried in the payload as a
+// gravity/affinity hint regardless of the transport orbit.
+func (a *Announcer) AnnounceOn(ctx context.Context, c *capsule.Capsule, orbitName string) error {
 	announcement := &capsulePb.CapsuleAnnouncement{
 		Capsule:        capsuleToProto(c),
 		AnnouncingNode: a.nodeID,
@@ -103,11 +114,13 @@ func (a *Announcer) Announce(ctx context.Context, c *capsule.Capsule) error {
 		return err
 	}
 
-	if err := a.manager.Publish(ctx, c.Spec.Orbit, data); err != nil {
+	if err := a.manager.Publish(ctx, orbitName, data); err != nil {
 		a.logger.Error("Capsule announcement failed",
 			zap.String("capsule_id", c.ID.String()),
 			zap.String("name", c.Spec.Name),
-			zap.String("cluster", c.ClusterID), zap.String("orbit", c.Spec.Orbit))
+			zap.String("cluster", c.ClusterID),
+			zap.String("orbit", orbitName),
+			zap.String("hint_orbit", c.Spec.Orbit))
 		return fmt.Errorf("failed to publish announcement: %w", err)
 	}
 
@@ -115,12 +128,20 @@ func (a *Announcer) Announce(ctx context.Context, c *capsule.Capsule) error {
 		zap.String("capsule_id", c.ID.String()),
 		zap.String("name", c.Spec.Name),
 		zap.String("cluster", c.ClusterID),
-		zap.String("orbit", c.Spec.Orbit))
+		zap.String("orbit", orbitName),
+		zap.String("hint_orbit", c.Spec.Orbit))
 	return nil
 }
 
-// UpdateStatus publishes a capsule status update.
+// UpdateStatus publishes a capsule status update on the capsule's declared
+// orbit. Prefer UpdateStatusOn(CapsuleControlOrbit) so every cluster member
+// observes the transition.
 func (a *Announcer) UpdateStatus(ctx context.Context, c *capsule.Capsule) error {
+	return a.UpdateStatusOn(ctx, c, c.Spec.Orbit)
+}
+
+// UpdateStatusOn publishes a capsule status update on the given logical orbit.
+func (a *Announcer) UpdateStatusOn(ctx context.Context, c *capsule.Capsule, orbitName string) error {
 	update := &capsulePb.CapsuleStatusUpdate{
 		CapsuleId: c.ID.String(),
 		Status:    string(c.Status),
@@ -143,14 +164,14 @@ func (a *Announcer) UpdateStatus(ctx context.Context, c *capsule.Capsule) error 
 		return err
 	}
 
-	if err := a.manager.Publish(ctx, c.Spec.Orbit, data); err != nil {
+	if err := a.manager.Publish(ctx, orbitName, data); err != nil {
 		return fmt.Errorf("failed to publish status update: %w", err)
 	}
 
 	a.logger.Debug("capsule status updated",
 		zap.String("capsule_id", c.ID.String()),
 		zap.String("cluster", c.ClusterID),
-		zap.String("orbit", c.Spec.Orbit),
+		zap.String("orbit", orbitName),
 		zap.String("status", string(c.Status)))
 	return nil
 }

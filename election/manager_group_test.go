@@ -97,6 +97,9 @@ type fakeLifecycle struct{}
 func (fakeLifecycle) StartElection(capsule.CapsuleID) error   { return nil }
 func (fakeLifecycle) WinElection(capsule.CapsuleID) error     { return nil }
 func (fakeLifecycle) ElectionTimeout(capsule.CapsuleID) error { return nil }
+func (fakeLifecycle) WinElectionWithBinding(capsule.CapsuleID, capsule.ReplicaID, string) error {
+	return nil
+}
 
 // memberCapsule builds a minimal group-member capsule with the given
 // resources. Mirrors the helper in gravity/combined_test.go but defined

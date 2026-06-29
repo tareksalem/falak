@@ -30,6 +30,23 @@ func (a *electionLifecycleAdapter) WinElection(id capsule.CapsuleID) error {
 	return a.manager.WinElection(id)
 }
 
+// WinElectionWithBinding drives the Win FSM transition (Electing →
+// Assigned) and then records the replica→node binding durably via
+// AssignReplica, returning the first error. The election manager calls
+// this on the Won path BEFORE releasing its in-flight local claim slot so
+// the binding is visible to gravity.NodesRunningCapsule the instant the
+// slot frees — preserving multi-replica self-anti-affinity through durable
+// state instead of a retained slot.
+//
+// AssignReplica is idempotent, so the redundant mirror performed by the
+// handleElectionWon subscriber on the winning node is harmless.
+func (a *electionLifecycleAdapter) WinElectionWithBinding(id capsule.CapsuleID, replicaID capsule.ReplicaID, nodeID string) error {
+	if err := a.manager.WinElection(id); err != nil {
+		return err
+	}
+	return a.manager.AssignReplica(id, replicaID, nodeID)
+}
+
 func (a *electionLifecycleAdapter) ElectionTimeout(id capsule.CapsuleID) error {
 	return a.manager.ElectionTimeout(id)
 }

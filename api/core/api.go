@@ -40,6 +40,11 @@ type NodeFacade interface {
 
 	// Health
 	IsReady() bool
+
+	// StartedAt returns the wall-clock time the node finished its
+	// Start sequence. The API surface uses it to report uptime
+	// measured from node-start, not the API server's startup time.
+	StartedAt() time.Time
 }
 
 // Core is the central API entry point. All business logic routes through
@@ -110,12 +115,29 @@ func (c *Core) Readyz() error {
 
 // GetInfo returns system information about this node.
 func (c *Core) GetInfo() SystemInfo {
-	return SystemInfo{
+	// Prefer the underlying node's started-at so uptime reflects the
+	// actual node lifetime, not the API server's. Falls back to the
+	// core's own startedAt if the facade returns the zero time
+	// (test stubs or pre-Start callers).
+	start := c.node.StartedAt()
+	if start.IsZero() {
+		start = c.startedAt
+	}
+	info := SystemInfo{
 		NodeID:    c.node.NodeID(),
 		NodeName:  c.node.NodeName(),
 		Version:   "0.1.0-alpha",
 		GoVersion: runtime.Version(),
 		Platform:  runtime.GOOS + "/" + runtime.GOARCH,
-		Uptime:    time.Since(c.startedAt),
+		Uptime:    time.Since(start),
 	}
+	// Best-effort enrichment: the joined cluster list is helpful in
+	// the CLI but the system info should not fail if the cluster
+	// facade hiccups.
+	if list, err := c.node.ClusterList(context.Background()); err == nil && list != nil {
+		for _, cl := range list.Clusters {
+			info.Clusters = append(info.Clusters, cl.Path)
+		}
+	}
+	return info
 }

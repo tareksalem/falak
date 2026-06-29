@@ -57,16 +57,22 @@ func (s *clusterService) Members(ctx context.Context, req *pb.ClusterMembersRequ
 	}
 	resp := &pb.ClusterMembersResponse{}
 	for _, n := range nodes.Nodes {
-		resp.Nodes = append(resp.Nodes, &pb.NodeInfo{
-			Id:         n.Meta.ID,
-			Name:       n.Meta.Name,
-			Status:     n.Status.Status,
-			Addresses:  n.Status.Addresses,
-			Datacenter: n.Status.Datacenter,
-			Region:     n.Status.Region,
-			CpuCores:   n.Status.CPUCores,
-			MemoryMb:   n.Status.MemoryMB,
-		})
+		info := &pb.NodeInfo{
+			Id:               n.Meta.ID,
+			Name:             n.Meta.Name,
+			Status:           n.Status.Status,
+			Addresses:        n.Status.Addresses,
+			Datacenter:       n.Status.Datacenter,
+			Region:           n.Status.Region,
+			CpuCores:         n.Status.CPUCores,
+			MemoryMb:         n.Status.MemoryMB,
+			LastProbeSuccess: n.Status.LastProbeSuccess,
+			ReliabilityScore: n.Status.ReliabilityScore,
+		}
+		if !n.Status.LastProbeTime.IsZero() {
+			info.LastProbeTime = timestamppb.New(n.Status.LastProbeTime)
+		}
+		resp.Nodes = append(resp.Nodes, info)
 	}
 	return resp, nil
 }

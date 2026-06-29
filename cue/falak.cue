@@ -404,9 +404,38 @@ import "strings"
 	ports?: [...#PortMapping]
 }
 
+// #PortName is the curated set of well-known port labels. Strict
+// disjunction so editor LSPs (cuelangorg.vscode-cue + cue lsp) suggest
+// the options on Ctrl+Space when authoring a #PortMapping. CUE has no
+// native "open enum with suggestions" — adding a name outside this
+// list requires extending the schema (or switching the field to `string`
+// in a local override).
+#PortName: "http" | "https" | "grpc" | "tcp" | "udp" | "metrics" | "admin" | "debug" | "health"
+
+// PortName is a value struct mirroring #PortName as named constants
+// so callers can write `falak.PortName.http` instead of the raw
+// string `"http"`. Useful when the editor's value-position
+// autocomplete is unreliable but field-access completion is solid —
+// which is the case for `cue lsp` today.
+//
+// Both forms validate against #PortName, so either is correct:
+//   name: falak.PortName.http     // dot-access, autocompletes on `.`
+//   name: "http"                  // literal, validates the same way
+PortName: {
+	http:    #PortName & "http"
+	https:   #PortName & "https"
+	grpc:    #PortName & "grpc"
+	tcp:     #PortName & "tcp"
+	udp:     #PortName & "udp"
+	metrics: #PortName & "metrics"
+	admin:   #PortName & "admin"
+	debug:   #PortName & "debug"
+	health:  #PortName & "health"
+}
+
 // #PortMapping maps a container port to a host port.
 #PortMapping: {
-	name?:     string
+	name?:     #PortName
 	container: int & >0 & <=65535
 	host?:     int & >=0 & <=65535  // 0 = auto-assign
 	protocol:  "tcp" | "udp" | *"tcp"

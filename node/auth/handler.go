@@ -5,7 +5,10 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -16,9 +19,45 @@ import (
 	"github.com/tareksalem/falak/node/auth/certs"
 	"github.com/tareksalem/falak/node/internal/events"
 	"github.com/tareksalem/falak/node/internal/signing"
+	"github.com/tareksalem/falak/node/phonebook"
 	"github.com/tareksalem/falak/node/proto/authpb"
 	"github.com/tareksalem/falak/shared"
 )
+
+// isTransientStreamErr reports whether err is a benign mid-handshake
+// stream interruption: the peer closed the stream cleanly (io.EOF),
+// libp2p reset it ("stream reset"), the OS reset the connection
+// ("connection reset by peer"), or our own context was cancelled. These
+// happen routinely during gossipsub mesh churn and operator-driven
+// restarts; logging them at ERROR with stacks just adds noise (Bug #11).
+func isTransientStreamErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "stream reset") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "broken pipe")
+}
+
+// logStreamError emits err at Debug for transient stream interruptions
+// and at Error for genuine failures. msg/peer are passed through verbatim
+// so call sites read naturally.
+func (a *Authenticator) logStreamError(msg, peer string, err error) {
+	if isTransientStreamErr(err) {
+		a.logger.Debug(msg,
+			zap.String("peer", peer),
+			zap.Error(err))
+		return
+	}
+	a.logger.Error(msg,
+		zap.String("peer", peer),
+		zap.Error(err))
+}
 
 // handleAuthStream handles incoming authentication requests (Step 1).
 func (a *Authenticator) handleAuthStream(stream network.Stream) {
@@ -38,9 +77,13 @@ func (a *Authenticator) handleAuthStream(stream network.Stream) {
 	// Read JoinRequest
 	var joinReq authpb.JoinRequest
 	if err := shared.ReadProto(stream, &joinReq); err != nil {
-		a.logger.Error("failed to read join request", zap.Error(err))
+		a.logStreamError("failed to read join request", remotePeer.String(), err)
 		return
 	}
+
+	a.logger.Info("received join request, validating PSK",
+		zap.String("peer", joinReq.NodeId),
+		zap.String("cluster", joinReq.ClusterPath))
 
 	// Validate cluster HMAC key exists (derived from PSK at cluster setup)
 	a.hmacKeyMu.RLock()
@@ -84,14 +127,14 @@ func (a *Authenticator) handleAuthStream(stream network.Stream) {
 		ServerNonce: serverNonce,
 	}
 	if err := shared.WriteProto(stream, challengeMsg); err != nil {
-		a.logger.Error("failed to send challenge", zap.Error(err))
+		a.logStreamError("failed to send challenge", remotePeer.String(), err)
 		return
 	}
 
 	// Read ChallengeResponse
 	var challengeResp authpb.ChallengeResponse
 	if err := shared.ReadProto(stream, &challengeResp); err != nil {
-		a.logger.Error("failed to read challenge response", zap.Error(err))
+		a.logStreamError("failed to read challenge response", remotePeer.String(), err)
 		return
 	}
 
@@ -123,6 +166,10 @@ func (a *Authenticator) handleAuthStream(stream network.Stream) {
 		a.sendStep1Result(stream, false, nil, "invalid signature")
 		return
 	}
+
+	a.logger.Info("PSK validated, signing certificate",
+		zap.String("peer", joinReq.NodeId),
+		zap.String("cluster", joinReq.ClusterPath))
 
 	// Send Step1Result success
 	a.sendStep1Result(stream, true, nil, "")
@@ -167,11 +214,22 @@ func (a *Authenticator) handleAuthStream(stream network.Stream) {
 	ctx, cancel := context.WithTimeout(a.ctx, AuthTimeout)
 	defer cancel()
 
-	// Check if we have other cluster members to wait for confirmations
+	// Count third-party confirmers — peers other than the voucher
+	// (self) and the joining node. The PKI confirmation handshake
+	// only makes sense when at least one *other* peer can verify the
+	// new cert. On a 2-node bootstrap (just self + joiner) the wait
+	// would burn the full ConfirmationTimeout for nothing — turning
+	// joins from ~50ms into ~15s.
 	var clusterMemberCount int
 	if a.phonebook != nil {
 		entries, _ := a.phonebook.GetByCluster(joinReq.ClusterPath)
-		clusterMemberCount = len(entries)
+		selfID := a.host.ID().String()
+		for _, e := range entries {
+			if e.NodeID == selfID || e.NodeID == joinReq.NodeId {
+				continue
+			}
+			clusterMemberCount++
+		}
 	}
 
 	// Only wait for confirmations if we have other members in the cluster
@@ -286,8 +344,20 @@ func (a *Authenticator) handleAuthStream(stream network.Stream) {
 		NodeCertificate:    announcement.Certificate,
 	}
 	if err := shared.WriteProto(stream, authComplete); err != nil {
-		a.logger.Error("failed to send auth complete", zap.Error(err))
+		a.logStreamError("failed to send auth complete", joinReq.NodeId, err)
 		return
+	}
+
+	// Flip the joiner's phonebook entry from PendingAuth to Active now
+	// that AuthComplete has been delivered. Without this the SWIM grace
+	// window would do it eventually (Bug #13 default 10s) — but we know
+	// the handshake succeeded, so we don't need to wait.
+	if a.phonebook != nil {
+		if err := a.phonebook.SetStatus(joinReq.NodeId, joinReq.ClusterPath, phonebook.NodeStatusEnum.Active()); err != nil {
+			a.logger.Debug("failed to promote joiner to active",
+				zap.String("peer", joinReq.NodeId),
+				zap.Error(err))
+		}
 	}
 
 	a.logger.Info("authenticated new member",
@@ -303,7 +373,11 @@ func (a *Authenticator) sendStep1Result(stream network.Stream, success bool, tok
 		Error:      errMsg,
 	}
 	if err := shared.WriteProto(stream, result); err != nil {
-		a.logger.Error("failed to send step1 result", zap.Error(err))
+		peerStr := ""
+		if stream != nil {
+			peerStr = stream.Conn().RemotePeer().String()
+		}
+		a.logStreamError("failed to send step1 result", peerStr, err)
 	}
 }
 

@@ -1,15 +1,10 @@
 package capsule
 
-// SystemGroupOrbit is the reserved gossipsub topic on which group-kind
-// capsules are announced. Members are still announced on their own
-// declared orbits; the system orbit only carries the group coordinator
-// row so peers learn the membership graph + cascade-delete contract.
-//
-// Every cluster member auto-subscribes to this orbit at cluster setup
-// time. The "__" prefix marks it as a reserved system topic — DNS-label
-// validation on user orbit names excludes leading underscores so there
-// is no collision risk.
-const SystemGroupOrbit = "__falak/groups"
+// Group-kind capsules used to ride a dedicated reserved orbit
+// ("__falak/groups"). That special case has been removed: both group and
+// standalone capsules now travel on the single cluster-wide capsule
+// control plane (orbit.CapsuleControlOrbit). See
+// .claude/plans/capsule-control-plane-refactor.md.
 
 // --- CapsuleKind Enum ---
 

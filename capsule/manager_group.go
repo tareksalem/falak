@@ -54,6 +54,17 @@ func (m *Manager) CreateGroup(
 		return nil, nil, fmt.Errorf("group name %q must be a DNS-friendly label (lowercase letters, digits, hyphens; 1-63 chars; cannot start or end with hyphen)", groupName)
 	}
 
+	// Cluster-wide name uniqueness applies to groups just like standalone
+	// capsules — both kinds live in the same store and DNS namespace. A
+	// group name clashing with an existing standalone capsule (or another
+	// group) would break service-discovery resolution and self-anti-affinity.
+	// Member names are checked via Manager.Create's own uniqueness guard
+	// further down; failures there roll back the partial group.
+	if existing := m.store.GetByNameInCluster(clusterID, groupName); existing != nil {
+		return nil, nil, fmt.Errorf("%w: group %q in cluster %q (existing id=%s, kind=%s)",
+			ErrCapsuleNameConflict, groupName, clusterID, existing.ID.String(), existing.Spec.Kind)
+	}
+
 	// Apply defaults to each member's spec BEFORE validation so the validator
 	// sees the same shape Manager.Create would. We mutate a local copy and
 	// hand it back into groupSpec.Members so subsequent steps see defaults.
@@ -88,9 +99,9 @@ func (m *Manager) CreateGroup(
 			Labels: groupLabels,
 			Kind:   CapsuleKindEnum.Group(),
 			Group:  &groupSpec,
-			// Groups travel on a reserved system orbit so peers learn
-			// the membership graph alongside individual members.
-			Orbit: SystemGroupOrbit,
+			// Group capsules carry no workload orbit. They (like standalone
+			// capsules) propagate on the cluster-wide capsule control plane
+			// so every peer learns the membership graph; Orbit is left empty.
 		},
 		Status:    enums.CapsuleStatusEnum.Created(),
 		Replicas:  nil,

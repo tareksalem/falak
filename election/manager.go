@@ -25,7 +25,25 @@ type CapsuleStore interface {
 // invokes when an election starts, completes, or fails.
 type LifecycleController interface {
 	StartElection(id capsule.CapsuleID) error
+	// WinElection performs the Win FSM transition (Electing → Assigned)
+	// WITHOUT recording a replica→node binding. Retained for the
+	// group-claim / compatibility path, where the binding is materialized
+	// separately by the group placement flow.
 	WinElection(id capsule.CapsuleID) error
+	// WinElectionWithBinding performs the Win FSM transition AND records
+	// the replica→node binding synchronously, so the binding is durable
+	// (visible to gravity.NodesRunningCapsule, which reads AssignReplica
+	// state) BEFORE the manager releases the in-flight local claim slot.
+	//
+	// This ordering is what lets a sibling multi-replica round — parked in
+	// waitForCapsuleClaimReleased on the same capsule's slot — re-decide
+	// against a persisted binding when the slot frees, observe this node as
+	// already running the capsule, and step aside. It replaces the previous
+	// "retain the slot across a Won election" mechanism with durable
+	// self-anti-affinity, so a re-election for the same capsule on the same
+	// node (crash/removal recovery) no longer dead-locks on a permanently
+	// held slot.
+	WinElectionWithBinding(id capsule.CapsuleID, replicaID capsule.ReplicaID, nodeID string) error
 	ElectionTimeout(id capsule.CapsuleID) error
 }
 
@@ -599,14 +617,19 @@ func (m *Manager) runElection(ctx context.Context, req Request, c *capsule.Capsu
 	// Self-anti-affinity short-circuit for multi-replica capsules. If
 	// this node has already published a claim for another replica of
 	// the same capsule, wait for that claim's outcome before deciding.
-	// On Win the slot stays held: the next caller will see hasLocalClaim
-	// still true and step aside. On Lose/Failed the slot is released and
-	// this round retries the publish itself, so the same node can take a
-	// different replica when its earlier sibling didn't win.
+	//
+	// On Win the slot is released (in report) only AFTER the winner
+	// binding is made durable, so when this parked round unblocks and
+	// re-decides eligibility below, gravity.NodesRunningCapsule already
+	// reports this node as running the capsule and the re-decide returns
+	// ineligible — the round steps aside. On Lose/Failed the slot is
+	// released with no binding, so this round retries the publish itself
+	// and the same node can take a different replica when its earlier
+	// sibling didn't win.
 	//
 	// This is what prevents the best-fit node from winning every replica
-	// of a multi-replica capsule in a parallel fire — without leaving
-	// some replicas un-published when sibling rounds release their slots.
+	// of a multi-replica capsule in a parallel fire — via durable
+	// placement state rather than a slot retained across a Won election.
 	if m.hasLocalClaim(req.CapsuleID) {
 		m.logger.Debug("local node has in-flight claim for this capsule; awaiting outcome",
 			zap.String("capsule_id", string(req.CapsuleID)),
@@ -813,11 +836,27 @@ func isBetter(rival *electionpb.Claim, ours Decision, ourNodeID string) bool {
 func (m *Manager) report(req Request, outcome Outcome, winner string, score float64, reason string) {
 	switch outcome {
 	case OutcomeEnum.Won():
-		if err := m.lifecycle.WinElection(req.CapsuleID); err != nil {
-			m.logger.Warn("WinElection failed",
+		// Make the winner binding durable BEFORE releasing the local claim
+		// slot. winner == m.nodeID on the Won path (we only report Won for
+		// our own claim). WinElectionWithBinding drives the FSM
+		// (Electing → Assigned) and persists the replica→node binding via
+		// AssignReplica, so gravity.NodesRunningCapsule sees this node as a
+		// runner of the capsule the instant the slot frees.
+		if err := m.lifecycle.WinElectionWithBinding(req.CapsuleID, capsule.ReplicaID(req.ReplicaID), winner); err != nil {
+			m.logger.Warn("WinElectionWithBinding failed",
 				zap.String("capsule_id", string(req.CapsuleID)),
+				zap.String("replica_id", req.ReplicaID),
 				zap.Error(err))
 		}
+		// Release the local claim slot only AFTER the binding above is
+		// durable. Order is load-bearing: a sibling multi-replica round is
+		// parked in waitForCapsuleClaimReleased on this slot; it can only
+		// re-decide eligibility once the slot frees, and by then the binding
+		// is persisted, so it observes this node as already running the
+		// capsule and steps aside. Releasing here (instead of retaining the
+		// slot across a Won election as before) is what unblocks a
+		// re-election for the same capsule on the same node after a crash.
+		m.releaseCapsuleClaim(req.CapsuleID)
 		m.sink.EmitWon(req, winner, score)
 		m.logger.Info("election won",
 			zap.String("capsule_id", string(req.CapsuleID)),

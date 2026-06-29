@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"sync"
 	"time"
@@ -159,6 +161,20 @@ type StatsRegistry interface {
 	UnregisterStats(capsuleID string)
 }
 
+// runningContainer holds the per-container bookkeeping the centralized
+// event consumer and reconcile sweep need to drive crash recovery without
+// a per-container polling goroutine. cancel tears down the container's
+// health-check and stats goroutines; capsuleID and restartLimit feed the
+// recovery decision; localRestarts counts restarts already attempted so
+// the limit survives across separate Died events.
+type runningContainer struct {
+	cancel        context.CancelFunc
+	capsuleID     string
+	restartLimit  int
+	localRestarts int
+	inspectErrors int // consecutive transient Inspect failures (reconcile)
+}
+
 // Handler bridges election outcomes to the container runtime. It
 // subscribes to ElectionWon events, decides whether to restore from
 // snapshot or cold-start, manages the container lifecycle, and reports
@@ -177,8 +193,19 @@ type Handler struct {
 	pullHeartbeatTick time.Duration
 	logger            *zap.Logger
 
+	// Event/reconcile tuning (functional options, no magic numbers).
+	reconcileInterval     time.Duration // periodic reconcile sweep cadence
+	maxInspectErrors      int           // consecutive transient Inspect errors before escalation
+	eventReconnectBackoff time.Duration // base backoff between event-stream reconnect attempts
+
 	mu      sync.Mutex
-	running map[string]context.CancelFunc // containerID -> cancel for stats/watcher goroutine
+	running map[string]*runningContainer // containerID -> live container bookkeeping
+
+	// ignored maps an owned containerID to the deadline until which
+	// backend events for it are suppressed. Populated before any
+	// handler-initiated Stop/Remove so Falak's own teardowns do not
+	// self-trigger re-election. Swept by the reconcile loop.
+	ignored map[string]time.Time
 
 	// groupDispatched tracks capsule IDs that were dispatched as part
 	// of a StartGroup call. Their start failures route to
@@ -289,14 +316,71 @@ func WithDependencyTimeout(d time.Duration) HandlerOption {
 // itself trip a reservation timeout.
 const defaultPullHeartbeatInterval = 10 * time.Second
 
+// Event/reconcile defaults. The reconcile interval is deliberately long
+// (30s) because the event stream carries the fast path; reconcile is the
+// correctness backstop for events dropped on a socket restart.
+// maxInspectErrors bounds how many consecutive transient Inspect failures
+// are tolerated before the container is declared unreachable.
+// eventReconnectBackoff is the base (jittered) delay between event-stream
+// reconnect attempts.
+const (
+	defaultReconcileInterval     = 30 * time.Second
+	defaultMaxInspectErrors      = 5
+	defaultEventReconnectBackoff = 1 * time.Second
+)
+
+// ignoreTTL bounds how long an entry in the self-removal ignore set
+// survives. The backend emits died+remove for an intentional teardown
+// within milliseconds, so a few seconds is ample; the cap prevents the
+// set from pinning a stale entry if the expected event never arrives.
+const ignoreTTL = 30 * time.Second
+
+// WithReconcileInterval overrides the periodic reconcile-sweep cadence.
+// The sweep is the correctness backstop behind the event stream. Default
+// 30s. Non-positive values are ignored (default kept).
+func WithReconcileInterval(d time.Duration) HandlerOption {
+	return func(h *Handler) {
+		if d > 0 {
+			h.reconcileInterval = d
+		}
+	}
+}
+
+// WithMaxInspectErrors sets the number of consecutive transient Inspect
+// errors tolerated during reconcile before a container is escalated as
+// "runtime unreachable" (MarkFailed → re-election). Default 5.
+// Non-positive values are ignored (default kept).
+func WithMaxInspectErrors(n int) HandlerOption {
+	return func(h *Handler) {
+		if n > 0 {
+			h.maxInspectErrors = n
+		}
+	}
+}
+
+// WithEventReconnectBackoff sets the base delay between event-stream
+// reconnect attempts. The actual wait is jittered around this value.
+// Default 1s. Non-positive values are ignored (default kept).
+func WithEventReconnectBackoff(d time.Duration) HandlerOption {
+	return func(h *Handler) {
+		if d > 0 {
+			h.eventReconnectBackoff = d
+		}
+	}
+}
+
 // NewHandler constructs a runtime handler.
 func NewHandler(rt Runtime, opts ...HandlerOption) *Handler {
 	h := &Handler{
-		runtime:           rt,
-		logger:            zap.NewNop(),
-		running:           make(map[string]context.CancelFunc),
-		groupDispatched:   make(map[string]struct{}),
-		pullHeartbeatTick: defaultPullHeartbeatInterval,
+		runtime:               rt,
+		logger:                zap.NewNop(),
+		running:               make(map[string]*runningContainer),
+		ignored:               make(map[string]time.Time),
+		groupDispatched:       make(map[string]struct{}),
+		pullHeartbeatTick:     defaultPullHeartbeatInterval,
+		reconcileInterval:     defaultReconcileInterval,
+		maxInspectErrors:      defaultMaxInspectErrors,
+		eventReconnectBackoff: defaultEventReconnectBackoff,
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -369,6 +453,22 @@ func (h *Handler) Start(ctx context.Context) {
 			&h.wg,
 		)
 	}
+
+	// Long-lived event consumer: the primary, low-latency crash/removal
+	// signal. Reconnects with jittered backoff when the stream drops.
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		h.consumeEvents(h.ctx)
+	}()
+
+	// Periodic reconcile sweep: the correctness backstop for events
+	// dropped during a backend socket restart.
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		h.reconcileLoop(h.ctx)
+	}()
 }
 
 // Stop cancels all container watchers and waits for clean exit.
@@ -378,8 +478,8 @@ func (h *Handler) Stop() {
 		h.group.stop()
 	}
 	h.mu.Lock()
-	for id, cancel := range h.running {
-		cancel()
+	for id, rc := range h.running {
+		rc.cancel()
 		delete(h.running, id)
 	}
 	h.mu.Unlock()
@@ -579,6 +679,13 @@ func (h *Handler) captureSnapshot(capsuleID, cID, tag string, spec *CapsuleSpec)
 		zap.String("container_id", cID),
 		zap.String("path", snapPath))
 
+	// CRIU stops the container during checkpoint and we restart it right
+	// after. Suppress its died event for that window so the intentional
+	// checkpoint-stop does not self-trigger crash recovery. Ownership is
+	// retained throughout (suppressEvents does not drop h.running).
+	h.suppressEvents(cID)
+	defer h.unsuppressEvents(cID)
+
 	if err := h.runtime.Checkpoint(ctx, cID, snapPath); err != nil {
 		h.logger.Warn("runtime: snapshot capture failed (non-fatal, container continues)",
 			zap.String("capsule_id", capsuleID),
@@ -610,8 +717,8 @@ func (h *Handler) captureSnapshot(capsuleID, cID, tag string, spec *CapsuleSpec)
 			zap.Error(err))
 
 		h.mu.Lock()
-		if cancel, ok := h.running[cID]; ok {
-			cancel()
+		if rc, ok := h.running[cID]; ok {
+			rc.cancel()
 			delete(h.running, cID)
 		}
 		h.mu.Unlock()
@@ -653,18 +760,30 @@ func (h *Handler) onContainerRunning(cID, capsuleID string, spec *CapsuleSpec) {
 			zap.Error(err))
 	}
 
-	// Start a background goroutine to watch for container exit. If a
-	// watcher already exists for this container ID (e.g. due to event
-	// bus redelivery), cancel the old one first to prevent orphaned
-	// goroutines.
+	// Record the container as owned. Crash/removal detection is handled
+	// centrally by the event consumer and reconcile sweep (keyed off the
+	// h.running entry below); this context only scopes the per-container
+	// health-check and stats goroutines. If an entry already exists for
+	// this container ID (e.g. event-bus redelivery), cancel the old
+	// goroutines first to prevent orphans. A re-registration clears any
+	// stale ignore-set entry so a fresh container is watched again.
+	restartLimit := 0
+	if spec != nil {
+		restartLimit = spec.FailurePolicy.RestartLimit
+	}
 	watchCtx, watchCancel := context.WithCancel(h.ctx)
 	h.mu.Lock()
-	if oldCancel, exists := h.running[cID]; exists {
+	if old, exists := h.running[cID]; exists {
 		h.logger.Warn("runtime: replacing existing watcher for container",
 			zap.String("container_id", cID))
-		oldCancel()
+		old.cancel()
 	}
-	h.running[cID] = watchCancel
+	h.running[cID] = &runningContainer{
+		cancel:       watchCancel,
+		capsuleID:    capsuleID,
+		restartLimit: restartLimit,
+	}
+	delete(h.ignored, cID)
 	h.mu.Unlock()
 
 	// Start health checker if the capsule spec defines one.
@@ -722,79 +841,393 @@ func (h *Handler) onContainerRunning(cID, capsuleID string, spec *CapsuleSpec) {
 			}
 		}()
 	}
-
-	h.wg.Add(1)
-	go func() {
-		defer h.wg.Done()
-		restartLimit := 0
-		if spec != nil {
-			restartLimit = spec.FailurePolicy.RestartLimit
-		}
-		h.watchContainer(watchCtx, cID, capsuleID, restartLimit)
-	}()
 }
 
-// watchContainer polls the container status and detects crashes. When
-// the container exits unexpectedly, it attempts local restarts up to
-// restartLimit times before reporting failure (which triggers
-// re-election to another node).
-func (h *Handler) watchContainer(ctx context.Context, cID, capsuleID string, restartLimit int) {
-	ticker := time.NewTicker(2 * time.Second)
+// --- Event-driven crash/removal detection --------------------------------
+
+// ignoreContainer marks a container's backend events as suppressed and
+// removes it from the owned set, in that order, BEFORE any
+// handler-initiated Stop/Remove. The event consumer checks the ignore set
+// so Falak's own teardowns (RollingUpdate swap, StopContainer) never
+// self-trigger a re-election. The entry is swept after ignoreTTL.
+func (h *Handler) ignoreContainer(cID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.ignored[cID] = time.Now().Add(ignoreTTL)
+	if rc, ok := h.running[cID]; ok {
+		rc.cancel()
+		delete(h.running, cID)
+	}
+}
+
+// suppressEvents marks a container's backend events as ignored WITHOUT
+// dropping ownership. Used during snapshot checkpoint, where CRIU stops
+// the container (emitting a died event) but the handler immediately
+// restarts it and must keep watching it afterwards. Paired with
+// unsuppressEvents.
+func (h *Handler) suppressEvents(cID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.ignored[cID] = time.Now().Add(ignoreTTL)
+}
+
+// unsuppressEvents clears an events-suppression entry set by
+// suppressEvents once the intentional stop/restart window has closed.
+func (h *Handler) unsuppressEvents(cID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.ignored, cID)
+}
+
+// isIgnored reports whether the container is currently in the ignore set
+// (its deadline has not yet passed).
+func (h *Handler) isIgnored(cID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	deadline, ok := h.ignored[cID]
+	if !ok {
+		return false
+	}
+	if time.Now().After(deadline) {
+		delete(h.ignored, cID)
+		return false
+	}
+	return true
+}
+
+// sweepIgnored drops expired entries from the ignore set so it cannot grow
+// unbounded when an expected died/remove event never arrives.
+func (h *Handler) sweepIgnored() {
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for cID, deadline := range h.ignored {
+		if now.After(deadline) {
+			delete(h.ignored, cID)
+		}
+	}
+}
+
+// consumeEvents is the long-lived event consumer. It subscribes to the
+// backend event stream and reacts to crash/removal events for owned,
+// non-ignored containers. When the stream drops (channel close) it
+// reconciles every owned container — catching transitions missed during
+// the gap — then reconnects with jittered backoff.
+func (h *Handler) consumeEvents(ctx context.Context) {
+	attempt := 0
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		ch, err := h.runtime.Events(ctx)
+		if err != nil {
+			attempt++
+			h.logger.Warn("runtime: event stream subscribe failed; will retry",
+				zap.Int("attempt", attempt),
+				zap.Error(err))
+			if !h.backoffSleep(ctx, attempt) {
+				return
+			}
+			continue
+		}
+		attempt = 0
+
+		// Drain the stream until it closes or ctx is cancelled.
+		for evt := range ch {
+			h.handleContainerEvent(ctx, evt)
+		}
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		// Stream dropped (likely backend socket restart). Reconcile all
+		// owned containers to recover any transition missed during the
+		// gap, then reconnect with backoff.
+		h.reconcileAll(ctx)
+		attempt++
+		h.logger.Warn("runtime: event stream closed; reconnecting",
+			zap.Int("attempt", attempt))
+		if !h.backoffSleep(ctx, attempt) {
+			return
+		}
+	}
+}
+
+// backoffSleep waits a jittered backoff before the next reconnect attempt.
+// Returns false if ctx is cancelled during the wait. The jitter is full
+// jitter over [0, base) added to the base so concurrent handlers do not
+// reconnect in lockstep against a recovering socket.
+func (h *Handler) backoffSleep(ctx context.Context, attempt int) bool {
+	base := h.eventReconnectBackoff
+	if base <= 0 {
+		base = defaultEventReconnectBackoff
+	}
+	jitter := time.Duration(rand.Int63n(int64(base)))
+	wait := base + jitter
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// handleContainerEvent applies one backend event. It acts only on events
+// for currently-owned, non-ignored containers; everything else (routine
+// actions, foreign containers, Falak's own teardowns) is dropped at Debug.
+func (h *Handler) handleContainerEvent(ctx context.Context, evt ContainerEvent) {
+	cID := evt.ContainerID
+	if cID == "" {
+		return
+	}
+
+	h.mu.Lock()
+	rc, owned := h.running[cID]
+	_, ignored := h.ignored[cID]
+	h.mu.Unlock()
+
+	if !owned || ignored {
+		h.logger.Debug("runtime: dropping container event",
+			zap.String("container_id", cID),
+			zap.String("action", string(evt.Action)),
+			zap.Bool("owned", owned),
+			zap.Bool("ignored", ignored))
+		return
+	}
+
+	switch evt.Action {
+	case ContainerEventActionEnum.Died():
+		h.handleCrash(ctx, cID, rc.capsuleID, evt.ExitCode)
+	case ContainerEventActionEnum.Removed():
+		h.handleRemoved(cID, rc.capsuleID)
+	default:
+		h.logger.Debug("runtime: routine container event",
+			zap.String("container_id", cID),
+			zap.String("action", string(evt.Action)))
+	}
+}
+
+// handleRemoved handles a terminal removal: the container is gone, so it
+// cannot be restarted locally. Clears ownership and reports failure so the
+// capsule handler fires a re-election.
+func (h *Handler) handleRemoved(cID, capsuleID string) {
+	h.mu.Lock()
+	rc, ok := h.running[cID]
+	if ok {
+		rc.cancel()
+		delete(h.running, cID)
+	}
+	h.mu.Unlock()
+	if !ok {
+		return // already handled
+	}
+
+	h.logger.Warn("runtime: container removed; re-electing",
+		zap.String("container_id", cID),
+		zap.String("capsule_id", capsuleID))
+
+	if h.lifecycle != nil {
+		if err := h.lifecycle.MarkFailed(capsuleID, "container removed"); err != nil {
+			h.logger.Warn("runtime: MarkFailed failed",
+				zap.String("capsule_id", capsuleID),
+				zap.Error(err))
+		}
+	}
+}
+
+// handleCrash handles a container exit. It attempts a local restart up to
+// the container's restart limit; once the limit is exhausted (or a restart
+// fails) it clears ownership and reports failure so the capsule handler
+// fires a re-election. Restart counts persist across separate Died events
+// via the runningContainer entry. The call is idempotent: a duplicate Died
+// for an already-cleared container is a no-op.
+func (h *Handler) handleCrash(ctx context.Context, cID, capsuleID string, exitCode int) {
+	h.mu.Lock()
+	rc, ok := h.running[cID]
+	if !ok {
+		h.mu.Unlock()
+		return
+	}
+	restartLimit := rc.restartLimit
+	localRestarts := rc.localRestarts
+	h.mu.Unlock()
+
+	h.logger.Warn("runtime: container exited",
+		zap.String("container_id", cID),
+		zap.String("capsule_id", capsuleID),
+		zap.Int("exit_code", exitCode),
+		zap.Int("local_restarts", localRestarts),
+		zap.Int("restart_limit", restartLimit))
+
+	if localRestarts < restartLimit {
+		h.logger.Info("runtime: attempting local restart",
+			zap.String("container_id", cID),
+			zap.String("capsule_id", capsuleID),
+			zap.Int("attempt", localRestarts+1))
+
+		if err := h.runtime.Start(ctx, cID); err != nil {
+			h.logger.Warn("runtime: local restart failed",
+				zap.String("container_id", cID),
+				zap.Error(err))
+			// Fall through to MarkFailed below.
+		} else {
+			h.mu.Lock()
+			if cur, still := h.running[cID]; still {
+				cur.localRestarts++
+			}
+			h.mu.Unlock()
+			return // restart succeeded; the next exit will re-evaluate
+		}
+	}
+
+	h.mu.Lock()
+	if cur, still := h.running[cID]; still {
+		cur.cancel()
+		delete(h.running, cID)
+	}
+	h.mu.Unlock()
+
+	if h.lifecycle != nil {
+		if err := h.lifecycle.MarkFailed(capsuleID, fmt.Sprintf(
+			"container exited with code %d after %d local restarts",
+			exitCode, localRestarts)); err != nil {
+			h.logger.Warn("runtime: MarkFailed failed",
+				zap.String("capsule_id", capsuleID),
+				zap.Error(err))
+		}
+	}
+}
+
+// reconcileLoop runs the periodic reconcile sweep — the correctness
+// backstop behind the best-effort event stream.
+func (h *Handler) reconcileLoop(ctx context.Context) {
+	ticker := time.NewTicker(h.reconcileInterval)
 	defer ticker.Stop()
-
-	localRestarts := 0
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			info, err := h.runtime.Inspect(ctx, cID)
-			if err != nil {
-				continue // transient inspect error, retry
-			}
-			if info.Status != ContainerStatusEnum.Failed() &&
-				info.Status != ContainerStatusEnum.Stopped() {
-				continue // still running
-			}
+			h.sweepIgnored()
+			h.reconcileAll(ctx)
+		}
+	}
+}
 
-			h.logger.Warn("runtime: container exited",
+// reconcileAll inspects every owned container and drives recovery for any
+// that the event stream may have missed:
+//   - not-found (ErrContainerNotFound) → terminal removal → MarkFailed.
+//   - Stopped/Failed status            → crash path (restart up to limit).
+//   - other (transient) Inspect error  → per-container consecutive-error
+//     counter; escalate via MarkFailed at maxInspectErrors, reset on success.
+func (h *Handler) reconcileAll(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Snapshot the owned set so we do not hold the lock across Inspect.
+	h.mu.Lock()
+	ids := make([]string, 0, len(h.running))
+	caps := make(map[string]string, len(h.running))
+	for cID, rc := range h.running {
+		ids = append(ids, cID)
+		caps[cID] = rc.capsuleID
+	}
+	h.mu.Unlock()
+
+	for _, cID := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		if h.isIgnored(cID) {
+			continue
+		}
+		capsuleID := caps[cID]
+
+		info, err := h.runtime.Inspect(ctx, cID)
+		if err != nil {
+			if errors.Is(err, ErrContainerNotFound) {
+				h.logger.Warn("runtime: reconcile found container removed; re-electing",
+					zap.String("container_id", cID),
+					zap.String("capsule_id", capsuleID))
+				h.resetInspectErrors(cID)
+				h.handleRemoved(cID, capsuleID)
+				continue
+			}
+			h.escalateInspectError(cID, capsuleID, err)
+			continue
+		}
+		h.resetInspectErrors(cID)
+
+		if info.Status == ContainerStatusEnum.Failed() ||
+			info.Status == ContainerStatusEnum.Stopped() {
+			h.logger.Warn("runtime: reconcile found exited container",
 				zap.String("container_id", cID),
 				zap.String("capsule_id", capsuleID),
 				zap.String("status", string(info.Status)),
-				zap.Int("exit_code", info.ExitCode),
-				zap.Int("local_restarts", localRestarts),
-				zap.Int("restart_limit", restartLimit))
-
-			// Attempt local restart if under the limit.
-			if localRestarts < restartLimit {
-				localRestarts++
-				h.logger.Info("runtime: attempting local restart",
-					zap.String("container_id", cID),
-					zap.String("capsule_id", capsuleID),
-					zap.Int("attempt", localRestarts))
-
-				if err := h.runtime.Start(ctx, cID); err != nil {
-					h.logger.Warn("runtime: local restart failed",
-						zap.String("container_id", cID),
-						zap.Error(err))
-					// Fall through to MarkFailed below.
-				} else {
-					continue // restart succeeded, keep watching
-				}
-			}
-
-			// Local restarts exhausted (or restart failed) — report
-			// failure so the capsule handler fires a re-election.
-			h.mu.Lock()
-			delete(h.running, cID)
-			h.mu.Unlock()
-
-			h.lifecycle.MarkFailed(capsuleID, fmt.Sprintf(
-				"container exited with code %d after %d local restarts",
-				info.ExitCode, localRestarts))
-			return
+				zap.Int("exit_code", info.ExitCode))
+			h.handleCrash(ctx, cID, capsuleID, info.ExitCode)
 		}
+	}
+}
+
+// escalateInspectError increments the per-container consecutive-error
+// counter and, once it reaches maxInspectErrors, declares the container's
+// runtime unreachable: clears ownership and MarkFailed → re-election.
+// A single blip that is followed by a successful Inspect never escalates
+// because resetInspectErrors clears the counter on success.
+func (h *Handler) escalateInspectError(cID, capsuleID string, cause error) {
+	h.mu.Lock()
+	rc, ok := h.running[cID]
+	if !ok {
+		h.mu.Unlock()
+		return
+	}
+	rc.inspectErrors++
+	count := rc.inspectErrors
+	limit := h.maxInspectErrors
+	escalate := count >= limit
+	if escalate {
+		rc.cancel()
+		delete(h.running, cID)
+	}
+	h.mu.Unlock()
+
+	if !escalate {
+		h.logger.Debug("runtime: transient inspect error",
+			zap.String("container_id", cID),
+			zap.Int("count", count),
+			zap.Int("max", limit),
+			zap.Error(cause))
+		return
+	}
+
+	h.logger.Error("runtime: container runtime unreachable; re-electing",
+		zap.String("container_id", cID),
+		zap.String("capsule_id", capsuleID),
+		zap.Int("count", count),
+		zap.Error(cause))
+
+	if h.lifecycle != nil {
+		if err := h.lifecycle.MarkFailed(capsuleID, "runtime unreachable"); err != nil {
+			h.logger.Warn("runtime: MarkFailed failed",
+				zap.String("capsule_id", capsuleID),
+				zap.Error(err))
+		}
+	}
+}
+
+// resetInspectErrors clears the consecutive-error counter for a container
+// after a successful Inspect.
+func (h *Handler) resetInspectErrors(cID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if rc, ok := h.running[cID]; ok {
+		rc.inspectErrors = 0
 	}
 }
 
@@ -911,13 +1344,10 @@ func (h *Handler) RollingUpdate(capsuleID, replicaID string, newSpec *CapsuleSpe
 		}
 	}
 
-	// Stop the old container.
-	h.mu.Lock()
-	if cancel, ok := h.running[oldCID]; ok {
-		cancel()
-		delete(h.running, oldCID)
-	}
-	h.mu.Unlock()
+	// Stop the old container. Add it to the ignore set and drop it from
+	// the owned set BEFORE the Stop/Remove so the resulting died/remove
+	// events are suppressed and do not self-trigger a re-election.
+	h.ignoreContainer(oldCID)
 
 	h.runtime.Stop(ctx, oldCID, WithGracePeriod(10*time.Second))
 	h.runtime.Remove(ctx, oldCID)
@@ -1142,13 +1572,10 @@ func (h *Handler) CancelGroupStarts(groupID string) int {
 func (h *Handler) StopContainer(capsuleID, replicaID string, gracePeriod time.Duration) error {
 	cID := containerID(capsuleID, replicaID)
 
-	// Cancel the watcher.
-	h.mu.Lock()
-	if cancel, ok := h.running[cID]; ok {
-		cancel()
-		delete(h.running, cID)
-	}
-	h.mu.Unlock()
+	// Add to the ignore set and drop from the owned set BEFORE the
+	// Stop/Remove so the resulting died/remove events are suppressed and
+	// this user-initiated teardown does not self-trigger a re-election.
+	h.ignoreContainer(cID)
 
 	if err := h.runtime.Stop(h.ctx, cID, WithGracePeriod(gracePeriod)); err != nil {
 		return fmt.Errorf("runtime: stop %s: %w", cID, err)

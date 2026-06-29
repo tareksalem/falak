@@ -2,6 +2,7 @@ package runtime_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -347,7 +348,185 @@ func TestHandler_PullWithHeartbeat_StreamingDeriverNonZeroBytes(t *testing.T) {
 	}
 }
 
+// waitFailed blocks until MarkFailed has been called for capsuleID or the
+// timeout elapses (fatal on timeout).
+func (l *stubLifecycle) waitFailed(t *testing.T, capsuleID string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		l.mu.Lock()
+		for _, id := range l.failed {
+			if id == capsuleID {
+				l.mu.Unlock()
+				return
+			}
+		}
+		l.mu.Unlock()
+		select {
+		case <-deadline:
+			t.Fatalf("timeout waiting for MarkFailed(%s)", capsuleID)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// failedCount returns how many times MarkFailed was called for capsuleID.
+func (l *stubLifecycle) failedCount(capsuleID string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, id := range l.failed {
+		if id == capsuleID {
+			n++
+		}
+	}
+	return n
+}
+
 func TestHandler_CrashTriggersMarkFailed(t *testing.T) {
+	rt := mock.New()
+	lc := &stubLifecycle{}
+	store := &stubCapsuleStore{spec: defaultSpec()}
+
+	h := runtime.NewHandler(rt,
+		runtime.WithCapsuleStore(store),
+		runtime.WithLifecycleNotifier(lc),
+		runtime.WithReconcileInterval(10*time.Millisecond),
+	)
+	h.Start(context.Background())
+	defer h.Stop()
+
+	h.HandleElectionWon(runtime.ElectionWon{
+		CapsuleID: "cap1",
+		ReplicaID: "0",
+	})
+	lc.waitRunning(t, "cap1", 5*time.Second)
+
+	// Simulate container crash via the backend status (no event emitted);
+	// the reconcile sweep must catch the Failed status.
+	rt.SimulateCrash("falak-cap1-0", 137)
+
+	lc.waitFailed(t, "cap1", 5*time.Second)
+}
+
+// TestHandler_DiedEventTriggersRecovery exercises the event-driven crash
+// path: a Died event with restart_limit=0 goes straight to MarkFailed,
+// while restart_limit>0 attempts local restarts first.
+func TestHandler_DiedEventTriggersRecovery(t *testing.T) {
+	t.Run("no_restart_limit_marks_failed", func(t *testing.T) {
+		rt := mock.New()
+		lc := &stubLifecycle{}
+		spec := defaultSpec()
+		spec.FailurePolicy.RestartLimit = 0
+		store := &stubCapsuleStore{spec: spec}
+
+		h := runtime.NewHandler(rt,
+			runtime.WithCapsuleStore(store),
+			runtime.WithLifecycleNotifier(lc),
+		)
+		h.Start(context.Background())
+		defer h.Stop()
+
+		h.HandleElectionWon(runtime.ElectionWon{CapsuleID: "cap1", ReplicaID: "0"})
+		lc.waitRunning(t, "cap1", 5*time.Second)
+
+		rt.EmitContainerEvent(runtime.ContainerEvent{
+			ContainerID: "falak-cap1-0",
+			Action:      runtime.ContainerEventActionEnum.Died(),
+			ExitCode:    137,
+		})
+
+		lc.waitFailed(t, "cap1", 5*time.Second)
+	})
+
+	t.Run("restart_limit_restarts_before_failing", func(t *testing.T) {
+		rt := mock.New()
+		lc := &stubLifecycle{}
+		spec := defaultSpec()
+		spec.FailurePolicy.RestartLimit = 2
+		store := &stubCapsuleStore{spec: spec}
+
+		h := runtime.NewHandler(rt,
+			runtime.WithCapsuleStore(store),
+			runtime.WithLifecycleNotifier(lc),
+		)
+		h.Start(context.Background())
+		defer h.Stop()
+
+		h.HandleElectionWon(runtime.ElectionWon{CapsuleID: "cap1", ReplicaID: "0"})
+		lc.waitRunning(t, "cap1", 5*time.Second)
+
+		died := func() {
+			rt.EmitContainerEvent(runtime.ContainerEvent{
+				ContainerID: "falak-cap1-0",
+				Action:      runtime.ContainerEventActionEnum.Died(),
+				ExitCode:    1,
+			})
+		}
+
+		// First two crashes consume the restart budget (local restart),
+		// not MarkFailed. We poll the backend status to confirm it is
+		// running again after each restart.
+		waitRunning := func() {
+			deadline := time.After(2 * time.Second)
+			for rt.ContainerStatus("falak-cap1-0") != runtime.ContainerStatusEnum.Running() {
+				select {
+				case <-deadline:
+					t.Fatal("container not restarted to Running")
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+		}
+
+		died()
+		waitRunning()
+		if lc.failedCount("cap1") != 0 {
+			t.Fatalf("first crash should restart, not MarkFailed; failures=%d", lc.failedCount("cap1"))
+		}
+		died()
+		waitRunning()
+		if lc.failedCount("cap1") != 0 {
+			t.Fatalf("second crash should restart, not MarkFailed; failures=%d", lc.failedCount("cap1"))
+		}
+
+		// Third crash exhausts the budget → MarkFailed.
+		died()
+		lc.waitFailed(t, "cap1", 5*time.Second)
+	})
+}
+
+// TestHandler_RemoveEventTriggersMarkFailed is the O2 regression: a
+// removed container is terminal and must MarkFailed → re-election even
+// though it can no longer be restarted locally.
+func TestHandler_RemoveEventTriggersMarkFailed(t *testing.T) {
+	rt := mock.New()
+	lc := &stubLifecycle{}
+	spec := defaultSpec()
+	spec.FailurePolicy.RestartLimit = 5 // irrelevant: removal cannot restart
+	store := &stubCapsuleStore{spec: spec}
+
+	h := runtime.NewHandler(rt,
+		runtime.WithCapsuleStore(store),
+		runtime.WithLifecycleNotifier(lc),
+	)
+	h.Start(context.Background())
+	defer h.Stop()
+
+	h.HandleElectionWon(runtime.ElectionWon{CapsuleID: "cap1", ReplicaID: "0"})
+	lc.waitRunning(t, "cap1", 5*time.Second)
+
+	rt.EmitContainerEvent(runtime.ContainerEvent{
+		ContainerID: "falak-cap1-0",
+		Action:      runtime.ContainerEventActionEnum.Removed(),
+	})
+
+	lc.waitFailed(t, "cap1", 5*time.Second)
+}
+
+// TestHandler_IntentionalRemoveIgnored confirms that a handler-initiated
+// Stop/Remove (StopContainer) does NOT MarkFailed even though the backend
+// would emit died+remove events for the teardown.
+func TestHandler_IntentionalRemoveIgnored(t *testing.T) {
 	rt := mock.New()
 	lc := &stubLifecycle{}
 	store := &stubCapsuleStore{spec: defaultSpec()}
@@ -359,28 +538,114 @@ func TestHandler_CrashTriggersMarkFailed(t *testing.T) {
 	h.Start(context.Background())
 	defer h.Stop()
 
-	h.HandleElectionWon(runtime.ElectionWon{
-		CapsuleID: "cap1",
-		ReplicaID: "0",
-	})
+	h.HandleElectionWon(runtime.ElectionWon{CapsuleID: "cap1", ReplicaID: "0"})
 	lc.waitRunning(t, "cap1", 5*time.Second)
 
-	// Simulate container crash.
-	rt.SimulateCrash("falak-cap1-0", 137)
-
-	// Wait for the watcher to detect the crash (polls every 2s).
-	deadline := time.After(10 * time.Second)
-	for {
-		lc.mu.Lock()
-		failedCount := len(lc.failed)
-		lc.mu.Unlock()
-		if failedCount > 0 {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatal("timeout waiting for MarkFailed after crash")
-		case <-time.After(100 * time.Millisecond):
-		}
+	if err := h.StopContainer("cap1", "0", time.Second); err != nil {
+		t.Fatalf("StopContainer: %v", err)
 	}
+
+	// Now emit the died+remove events the backend would have produced for
+	// the teardown. They must be suppressed by the ignore set.
+	rt.EmitContainerEvent(runtime.ContainerEvent{
+		ContainerID: "falak-cap1-0",
+		Action:      runtime.ContainerEventActionEnum.Died(),
+		ExitCode:    0,
+	})
+	rt.EmitContainerEvent(runtime.ContainerEvent{
+		ContainerID: "falak-cap1-0",
+		Action:      runtime.ContainerEventActionEnum.Removed(),
+	})
+
+	// Give the consumer a moment to (not) act.
+	time.Sleep(50 * time.Millisecond)
+
+	if lc.failedCount("cap1") != 0 {
+		t.Fatalf("intentional teardown must not MarkFailed; failures=%d", lc.failedCount("cap1"))
+	}
+}
+
+// TestHandler_ReconcileCatchesMissedRemoval proves the reconcile backstop:
+// the container is removed at the backend WITHOUT emitting an event, and
+// the sweep detects the not-found Inspect → MarkFailed.
+func TestHandler_ReconcileCatchesMissedRemoval(t *testing.T) {
+	rt := mock.New()
+	lc := &stubLifecycle{}
+	store := &stubCapsuleStore{spec: defaultSpec()}
+
+	h := runtime.NewHandler(rt,
+		runtime.WithCapsuleStore(store),
+		runtime.WithLifecycleNotifier(lc),
+		runtime.WithReconcileInterval(10*time.Millisecond),
+	)
+	h.Start(context.Background())
+	defer h.Stop()
+
+	h.HandleElectionWon(runtime.ElectionWon{CapsuleID: "cap1", ReplicaID: "0"})
+	lc.waitRunning(t, "cap1", 5*time.Second)
+
+	// Remove via the backend without emitting any event.
+	if err := rt.Remove(context.Background(), "falak-cap1-0"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	lc.waitFailed(t, "cap1", 5*time.Second)
+}
+
+// TestHandler_TransientInspectEscalation confirms the runtime-unreachable
+// escalation: consecutive transient Inspect errors escalate only after
+// maxInspectErrors, while a single blip followed by recovery does not.
+func TestHandler_TransientInspectEscalation(t *testing.T) {
+	t.Run("escalates_after_max_errors", func(t *testing.T) {
+		rt := mock.New()
+		lc := &stubLifecycle{}
+		store := &stubCapsuleStore{spec: defaultSpec()}
+
+		h := runtime.NewHandler(rt,
+			runtime.WithCapsuleStore(store),
+			runtime.WithLifecycleNotifier(lc),
+			runtime.WithReconcileInterval(5*time.Millisecond),
+			runtime.WithMaxInspectErrors(3),
+		)
+		h.Start(context.Background())
+		defer h.Stop()
+
+		h.HandleElectionWon(runtime.ElectionWon{CapsuleID: "cap1", ReplicaID: "0"})
+		lc.waitRunning(t, "cap1", 5*time.Second)
+
+		// Inject a persistent transient (non-sentinel) error.
+		rt.SetInspectError("falak-cap1-0", errors.New("dial unix: connection refused"))
+
+		lc.waitFailed(t, "cap1", 5*time.Second)
+	})
+
+	t.Run("single_blip_does_not_escalate", func(t *testing.T) {
+		rt := mock.New()
+		lc := &stubLifecycle{}
+		store := &stubCapsuleStore{spec: defaultSpec()}
+
+		h := runtime.NewHandler(rt,
+			runtime.WithCapsuleStore(store),
+			runtime.WithLifecycleNotifier(lc),
+			runtime.WithReconcileInterval(5*time.Millisecond),
+			runtime.WithMaxInspectErrors(5),
+		)
+		h.Start(context.Background())
+		defer h.Stop()
+
+		h.HandleElectionWon(runtime.ElectionWon{CapsuleID: "cap1", ReplicaID: "0"})
+		lc.waitRunning(t, "cap1", 5*time.Second)
+
+		// One blip, then clear it before maxInspectErrors is reached.
+		rt.SetInspectError("falak-cap1-0", errors.New("temporary blip"))
+		time.Sleep(8 * time.Millisecond) // ~1 reconcile tick
+		rt.SetInspectError("falak-cap1-0", nil)
+
+		// Let several reconcile ticks run after recovery.
+		time.Sleep(60 * time.Millisecond)
+
+		if lc.failedCount("cap1") != 0 {
+			t.Fatalf("single blip must not escalate; failures=%d", lc.failedCount("cap1"))
+		}
+	})
 }

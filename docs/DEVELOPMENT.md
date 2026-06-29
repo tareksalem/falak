@@ -1134,17 +1134,15 @@ go test -tags=integration ./internal/integration/...
 ```
 
 ### Manual Testing
-```bash
-# Terminal 1: Start node 1
-air -- --name=node1 --address=/ip4/127.0.0.1/tcp/4001
 
-# Terminal 2: Start node 2, connect to node 1
-air -- --name=node2 --address=/ip4/127.0.0.1/tcp/4002 \
-  --peers=/ip4/127.0.0.1/tcp/4001/p2p/<node1-peer-id>
-
-# Terminal 3: Publish capsule via CLI
-./falak capsule create --spec=examples/capsule.yaml
-```
+The full layered verification flow lives in
+[`docs/SELF_TESTING.md`](SELF_TESTING.md) (copy-paste form) and
+[`docs/MANUAL_TESTING.md`](MANUAL_TESTING.md) (narrative form). Layer 1
+boots a node, Layer 2 joins a second, Layer 3 exercises SWIM, Layer 4
+deploys a capsule, Layers 5–6 cover CapsuleGroups, Layer 7 brings up the
+service mesh. Both docs assume the single `falak` binary and the current
+`falak daemon start` surface; the older `air --` / `--address=` /
+`--spec=` forms used here previously have been removed.
 
 ---
 

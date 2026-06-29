@@ -411,6 +411,114 @@ func TestManager_GetGroup_Missing(t *testing.T) {
 	}
 }
 
+// TestManager_CreateGroup_RejectsDuplicateGroupName verifies that two
+// groups in the same cluster cannot share a name. The second CreateGroup
+// must return ErrCapsuleNameConflict (the same sentinel Manager.Create
+// uses) so the API layer surfaces gRPC AlreadyExists.
+func TestManager_CreateGroup_RejectsDuplicateGroupName(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewManager()
+	build := func() GroupSpec {
+		return GroupSpec{
+			Colocation:    ColocationModeEnum.SameOrbit(),
+			CascadeDelete: true,
+			Members: []MemberSpec{
+				{Name: "api", Spec: memberSpecForTest("api")},
+			},
+		}
+	}
+
+	if _, _, err := mgr.CreateGroup(context.Background(), "prod/dc1", "stack", build(), nil); err != nil {
+		t.Fatalf("first CreateGroup failed: %v", err)
+	}
+
+	// Second create with the same name + cluster must reject. Use a
+	// distinct member name to make sure the failure is on the group, not
+	// on a member's Create-time uniqueness check.
+	conflict := build()
+	conflict.Members[0] = MemberSpec{Name: "api2", Spec: memberSpecForTest("api2")}
+	_, _, err := mgr.CreateGroup(context.Background(), "prod/dc1", "stack", conflict, nil)
+	if err == nil {
+		t.Fatal("expected duplicate-name CreateGroup to fail")
+	}
+	if !errors.Is(err, ErrCapsuleNameConflict) {
+		t.Errorf("expected ErrCapsuleNameConflict, got %T %v", err, err)
+	}
+}
+
+// TestManager_CreateGroup_RejectsGroupNameMatchingStandalone verifies a
+// group name cannot collide with an existing standalone capsule's name
+// in the same cluster. Names live in one namespace because DNS, Service
+// resolution, and self-anti-affinity all key off the name.
+func TestManager_CreateGroup_RejectsGroupNameMatchingStandalone(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewManager()
+	if _, err := mgr.Create(context.Background(), "prod/dc1", CapsuleSpec{
+		Name: "shared", Image: "nginx:alpine", Orbit: "default",
+	}); err != nil {
+		t.Fatalf("standalone Create failed: %v", err)
+	}
+
+	_, _, err := mgr.CreateGroup(context.Background(), "prod/dc1", "shared", GroupSpec{
+		Colocation:    ColocationModeEnum.SameOrbit(),
+		CascadeDelete: true,
+		Members:       []MemberSpec{{Name: "m1", Spec: memberSpecForTest("m1")}},
+	}, nil)
+	if err == nil {
+		t.Fatal("expected CreateGroup to reject group name colliding with standalone")
+	}
+	if !errors.Is(err, ErrCapsuleNameConflict) {
+		t.Errorf("expected ErrCapsuleNameConflict, got %T %v", err, err)
+	}
+}
+
+// TestManager_CreateGroup_MemberNameCollisionRollsBack verifies that if
+// a member name collides with an existing standalone capsule, the group
+// create rolls back atomically: no group row, no orphan members, just
+// the original standalone.
+func TestManager_CreateGroup_MemberNameCollisionRollsBack(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewManager()
+	if _, err := mgr.Create(context.Background(), "prod/dc1", CapsuleSpec{
+		Name: "db", Image: "postgres:15", Orbit: "data",
+	}); err != nil {
+		t.Fatalf("standalone Create failed: %v", err)
+	}
+
+	startCount := mgr.Count()
+
+	_, _, err := mgr.CreateGroup(context.Background(), "prod/dc1", "my-group", GroupSpec{
+		Colocation:    ColocationModeEnum.SameOrbit(),
+		CascadeDelete: true,
+		Members: []MemberSpec{
+			{Name: "api", Spec: memberSpecForTest("api")},
+			// "db" collides with the pre-existing standalone capsule.
+			{Name: "db", Spec: memberSpecForTest("db")},
+		},
+	}, nil)
+	if err == nil {
+		t.Fatal("expected CreateGroup to fail on member name collision")
+	}
+	if !errors.Is(err, ErrCapsuleNameConflict) {
+		t.Errorf("expected ErrCapsuleNameConflict, got %T %v", err, err)
+	}
+
+	// Rollback contract: store must hold exactly the original standalone
+	// — no group row, no orphan "api" member.
+	if got := mgr.Count(); got != startCount {
+		t.Errorf("store count after failed CreateGroup = %d, want %d (no leftovers)", got, startCount)
+	}
+	if mgr.GetByName("my-group") != nil {
+		t.Error("group capsule should not exist after rollback")
+	}
+	if mgr.GetByName("api") != nil {
+		t.Error("partial member 'api' should have been rolled back")
+	}
+}
+
 // TestManager_CreateGroup_EmptyClusterID verifies CreateGroup rejects an
 // empty clusterID before any work happens.
 func TestManager_CreateGroup_EmptyClusterID(t *testing.T) {

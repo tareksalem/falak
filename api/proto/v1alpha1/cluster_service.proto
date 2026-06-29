@@ -71,4 +71,10 @@ message NodeInfo {
     string region = 6;
     int32 cpu_cores = 7;
     int64 memory_mb = 8;
+
+    // SWIM-derived live health fields (powers `falak node health`).
+    // Populated by the health monitor's probe loop on every probe.
+    google.protobuf.Timestamp last_probe_time = 9;
+    bool last_probe_success = 10;
+    double reliability_score = 11;
 }

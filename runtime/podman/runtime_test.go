@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -166,10 +167,175 @@ func TestPodman_PullCreateStartInspectStopRemove(t *testing.T) {
 		t.Fatalf("Remove: %v", err)
 	}
 
-	// Inspect after remove — should fail.
+	// Inspect after remove — should be ErrContainerNotFound.
 	_, err = rt.Inspect(ctx, containerName)
 	if err == nil {
 		t.Error("Inspect after Remove should fail")
+	}
+	if !errors.Is(err, runtime.ErrContainerNotFound) {
+		t.Errorf("Inspect after Remove = %v, want ErrContainerNotFound", err)
+	}
+}
+
+// TestPodman_EventsStream runs a container, kills it, and removes it,
+// asserting the Events stream surfaces both a died and a remove action for
+// that container. Gated on a live Podman socket.
+func TestPodman_EventsStream(t *testing.T) {
+	sock := skipIfNoPodman(t)
+
+	rt := New(WithSocketPath(sock))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const image = "docker.io/library/alpine:latest"
+	const name = "falak-test-events-stream"
+
+	rt.Stop(ctx, name)
+	rt.Remove(ctx, name)
+
+	if err := rt.Pull(ctx, image); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	// Subscribe BEFORE starting so we do not miss the lifecycle events.
+	evCtx, evCancel := context.WithCancel(ctx)
+	defer evCancel()
+	events, err := rt.Events(evCtx)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+
+	if err := rt.Create(ctx, name, image, runtime.WithCommand("sleep", "60")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := rt.Start(ctx, name); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Force-remove (kills, then removes) → die + remove.
+	if err := rt.Remove(ctx, name); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	sawDied, sawRemoved := false, false
+	deadline := time.After(30 * time.Second)
+	for !(sawDied && sawRemoved) {
+		select {
+		case <-deadline:
+			t.Fatalf("timeout: died=%v removed=%v", sawDied, sawRemoved)
+		case evt, ok := <-events:
+			if !ok {
+				t.Fatalf("event stream closed early: died=%v removed=%v", sawDied, sawRemoved)
+			}
+			if evt.ContainerID != name {
+				continue
+			}
+			switch evt.Action {
+			case runtime.ContainerEventActionEnum.Died():
+				sawDied = true
+			case runtime.ContainerEventActionEnum.Removed():
+				sawRemoved = true
+			}
+		}
+	}
+}
+
+// TestPodman_CheckpointRestoreRoundTrip is the O7 regression guard. It
+// drives a full Checkpoint → (container gone) → Restore cycle against the
+// live socket and asserts the restore returns no error and the container
+// comes back Running. Before the O7 fix, Restore sent the archive path as
+// the `import` query param (typed as a bool by libpod) with a nil body and
+// got HTTP 400 `schema: error converting value for "import"`, so this test
+// would fail on the Restore call.
+//
+// Checkpoint requires root (CRIU). When the test runs against a rootless
+// socket, Checkpoint returns a "requires root" error from libpod; we skip
+// cleanly in that case rather than failing — the regression guard only
+// exercises on a rootful, CRIU-capable host.
+func TestPodman_CheckpointRestoreRoundTrip(t *testing.T) {
+	sock := skipIfNoPodman(t)
+
+	rt := New(WithSocketPath(sock))
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	const image = "docker.io/library/alpine:latest"
+	const name = "falak-test-checkpoint-restore"
+
+	// Clean up any leftover from a previous failed run.
+	rt.Stop(ctx, name)
+	rt.Remove(ctx, name)
+
+	if err := rt.Pull(ctx, image); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	if err := rt.Create(ctx, name, image, runtime.WithCommand("sleep", "120")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Ensure cleanup on every exit path.
+	defer func() {
+		rt.Stop(ctx, name)
+		rt.Remove(ctx, name)
+	}()
+
+	if err := rt.Start(ctx, name); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	snapshotPath := filepath.Join(t.TempDir(), "checkpoint.tar")
+	if err := rt.Checkpoint(ctx, name, snapshotPath); err != nil {
+		// CRIU checkpoint requires root; rootless sockets cannot run it.
+		// libpod surfaces this either as a "requires root" error or as a
+		// runc/CRIU checkpoint failure. A working checkpoint is an
+		// environmental prerequisite for this restore regression guard, so
+		// skip cleanly rather than fail when the host cannot checkpoint.
+		if isCheckpointUnsupportedError(err) {
+			t.Skipf("checkpoint unsupported on this host (needs root + CRIU) — skipping O7 round-trip: %v", err)
+		}
+		t.Fatalf("Checkpoint: %v", err)
+	}
+
+	// After checkpoint with leaveRunning=false the container is gone.
+	if _, err := rt.Inspect(ctx, name); !errors.Is(err, runtime.ErrContainerNotFound) {
+		t.Fatalf("Inspect after checkpoint = %v, want ErrContainerNotFound", err)
+	}
+
+	// O7 regression guard: this returned HTTP 400 before the fix.
+	if err := rt.Restore(ctx, name, snapshotPath); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	info, err := rt.Inspect(ctx, name)
+	if err != nil {
+		t.Fatalf("Inspect after restore: %v", err)
+	}
+	if info.Status != runtime.ContainerStatusEnum.Running() {
+		t.Errorf("after restore: status = %s, want Running", info.Status)
+	}
+}
+
+// isCheckpointUnsupportedError reports whether err indicates the host
+// cannot perform a CRIU checkpoint (no root, or a runc/CRIU checkpoint
+// failure typical of rootless Podman). In those cases the restore
+// regression guard cannot run and skips cleanly.
+func isCheckpointUnsupportedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "requires root"):
+		return true
+	case strings.Contains(msg, "must be run as root"):
+		return true
+	case strings.Contains(msg, "rootless"):
+		return true
+	case strings.Contains(msg, "runc checkpoint"):
+		return true
+	case strings.Contains(msg, "criu"):
+		return true
+	default:
+		return false
 	}
 }
 

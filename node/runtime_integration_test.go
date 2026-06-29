@@ -102,8 +102,8 @@ func TestRuntime_ElectionToContainer(t *testing.T) {
 
 	// Log events for debugging.
 	for name, rt := range map[string]*mock.Runtime{"rt1": rt1, "rt2": rt2, "rt3": rt3} {
-		t.Logf("%s events: %d, containers: %d", name, len(rt.Events), rt.ContainerCount())
-		for _, ev := range rt.Events {
+		t.Logf("%s calls: %d, containers: %d", name, len(rt.Calls), rt.ContainerCount())
+		for _, ev := range rt.Calls {
 			t.Logf("  %s %s %s %s", ev.Method, ev.ID, ev.Image, ev.Path)
 		}
 	}

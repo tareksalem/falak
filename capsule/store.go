@@ -254,13 +254,32 @@ func (s *Store) Get(id CapsuleID) *Capsule {
 	return s.capsules[id]
 }
 
-// GetByName retrieves a capsule by its spec name. Returns nil if not found.
+// GetByName retrieves a capsule by its spec name. Returns nil if not
+// found. Searches every cluster; callers that need a cluster-scoped
+// lookup should use GetByNameInCluster instead — Falak's name-uniqueness
+// rule is scoped per cluster, not globally.
 func (s *Store) GetByName(name string) *Capsule {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	for _, c := range s.capsules {
 		if c.Spec.Name == name {
+			return c
+		}
+	}
+	return nil
+}
+
+// GetByNameInCluster retrieves a capsule by its spec name AND cluster.
+// Returns nil if no capsule with the given name exists in the cluster.
+// Used by Manager.Create to enforce cluster-wide name uniqueness
+// (service-networking.md locked decision #16).
+func (s *Store) GetByNameInCluster(clusterID, name string) *Capsule {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, c := range s.capsules {
+		if c.ClusterID == clusterID && c.Spec.Name == name {
 			return c
 		}
 	}

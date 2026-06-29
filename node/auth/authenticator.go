@@ -145,6 +145,12 @@ type Authenticator struct {
 	// Testing flags
 	rejectAllAuth bool // When true, always reject incoming auth announcements
 
+	// Operator-supplied node identity + capabilities. Populated on the
+	// outbound JoinRequest so vouchers + downstream phonebook entries
+	// can display the friendly name and CPU/memory the operator brought.
+	nodeName     string
+	capabilities *authpb.Capabilities
+
 	// Lifecycle
 	parentCtx context.Context // Set via WithContext option
 	ctx       context.Context
@@ -263,6 +269,26 @@ func WithSessionStaleThreshold(d time.Duration) Option {
 }
 
 // WithStaleCheckInterval sets the interval for checking session staleness.
+// WithNodeName sets the operator-assigned friendly name that travels
+// inside JoinRequest.Capabilities.Metadata["node_name"]. Used by
+// downstream phonebook subscribers + the CLI to display "node1" instead
+// of the bare peer ID.
+func WithNodeName(name string) Option {
+	return func(a *Authenticator) {
+		a.nodeName = name
+	}
+}
+
+// WithCapabilities sets the resource capabilities (CPU cores, memory MB,
+// disk GB, datacenter, tags) the joining node announces. The voucher
+// stores this on the phonebook entry it creates for the new member.
+// When nil, the JoinRequest carries no capabilities (CLI will show 0).
+func WithCapabilities(caps *authpb.Capabilities) Option {
+	return func(a *Authenticator) {
+		a.capabilities = caps
+	}
+}
+
 func WithStaleCheckInterval(d time.Duration) Option {
 	return func(a *Authenticator) {
 		a.staleCheckInterval = d
@@ -805,11 +831,12 @@ func (a *Authenticator) Authenticate(ctx context.Context, clusterPath string, ta
 
 	// Send JoinRequest
 	joinReq := &authpb.JoinRequest{
-		NodeId:      a.host.ID().String(),
-		ClusterPath: clusterPath,
-		Addresses:   addrs,
-		Nonce:       nonce,
-		PublicKey:   pubKeyBytes,
+		NodeId:       a.host.ID().String(),
+		ClusterPath:  clusterPath,
+		Addresses:    addrs,
+		Nonce:        nonce,
+		PublicKey:    pubKeyBytes,
+		Capabilities: a.buildCapabilities(),
 	}
 
 	if err := shared.WriteProto(stream, joinReq); err != nil {
@@ -917,6 +944,20 @@ func (a *Authenticator) Authenticate(ctx context.Context, clusterPath string, ta
 			ClusterPath: clusterPath,
 			Members:     members,
 		})
+	}
+
+	// Flip the voucher from PendingAuth → Active immediately. The
+	// announcement we just acknowledged came over a working libp2p
+	// connection, so SWIM should be free to probe (Bug #13). The
+	// subscriber goroutine consuming ClusterMembersReceived above is
+	// async — without this explicit hop the voucher would sit in
+	// PendingAuth for the SWIM grace window.
+	if a.phonebook != nil {
+		if err := a.phonebook.SetStatus(targetPeer.String(), clusterPath, phonebook.NodeStatusEnum.Active()); err != nil {
+			a.logger.Debug("failed to promote voucher to active",
+				zap.String("voucher", targetPeer.String()),
+				zap.Error(err))
+		}
 	}
 
 	// Create and store session
@@ -1096,11 +1137,12 @@ func (a *Authenticator) handleClusterJoinRequest(req events.ClusterJoinRequested
 		}
 
 		a.eventBus.Publish(events.NewMemberAnnounced{
-			BaseEvent:   events.NewBaseEvent(),
-			NodeID:      a.host.ID().String(),
-			ClusterPath: req.ClusterPath,
-			Addresses:   addrs,
-			PublicKey:   pubKeyBytes,
+			BaseEvent:    events.NewBaseEvent(),
+			NodeID:       a.host.ID().String(),
+			ClusterPath:  req.ClusterPath,
+			Addresses:    addrs,
+			PublicKey:    pubKeyBytes,
+			Capabilities: a.buildCapabilitiesEvent(),
 		})
 	}
 
@@ -1135,6 +1177,10 @@ func (a *Authenticator) bootstrapAndAuthenticate(ctx context.Context, clusterPat
 		}
 
 		// Connect to peer
+		a.logger.Info("dialing bootstrap peer",
+			zap.String("peer", peerInfo.ID.String()),
+			zap.String("addr", peerAddr),
+			zap.String("cluster", clusterPath))
 		connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		if err := a.host.Connect(connectCtx, *peerInfo); err != nil {
 			cancel()
@@ -1145,9 +1191,18 @@ func (a *Authenticator) bootstrapAndAuthenticate(ctx context.Context, clusterPat
 			continue
 		}
 		cancel()
+		a.logger.Info("bootstrap peer connected, requesting auth (gossipsub mesh forming, may take 5-15s)",
+			zap.String("peer", peerInfo.ID.String()),
+			zap.String("cluster", clusterPath))
 
-		// Authenticate
+		// Authenticate. Run a heartbeat in the background so operators
+		// see progress instead of silence during the gossipsub mesh
+		// formation window.
+		authStart := time.Now()
+		hbCtx, hbCancel := context.WithCancel(ctx)
+		go a.authProgressHeartbeat(hbCtx, clusterPath, peerInfo.ID.String(), authStart)
 		session, err := a.Authenticate(ctx, clusterPath, peerInfo.ID)
+		hbCancel()
 		if err != nil {
 			a.logger.Warn("failed to authenticate with bootstrap peer",
 				zap.String("peer", peerInfo.ID.String()),
@@ -1158,7 +1213,8 @@ func (a *Authenticator) bootstrapAndAuthenticate(ctx context.Context, clusterPat
 
 		a.logger.Info("authenticated with bootstrap peer",
 			zap.String("peer", peerInfo.ID.String()),
-			zap.String("cluster", clusterPath))
+			zap.String("cluster", clusterPath),
+			zap.Duration("elapsed", time.Since(authStart)))
 
 		return session, nil
 	}
@@ -1167,6 +1223,88 @@ func (a *Authenticator) bootstrapAndAuthenticate(ctx context.Context, clusterPat
 		return nil, lastErr
 	}
 	return nil, fmt.Errorf("no bootstrap peers provided")
+}
+
+// MetadataKeyNodeName is the well-known Capabilities.Metadata key
+// carrying the operator-assigned friendly node name. Defined as a
+// constant so the joiner publisher and the voucher/phonebook
+// subscriber agree on the spelling.
+const MetadataKeyNodeName = "node_name"
+
+// buildCapabilities returns the protobuf Capabilities the joiner should
+// stamp onto its outbound JoinRequest. Returns a copy with the node
+// name merged into metadata so the voucher (and downstream phonebook
+// subscribers) see it without needing a proto schema change.
+func (a *Authenticator) buildCapabilities() *authpb.Capabilities {
+	if a.capabilities == nil && a.nodeName == "" {
+		return nil
+	}
+	out := &authpb.Capabilities{}
+	if a.capabilities != nil {
+		out.CpuCores = a.capabilities.CpuCores
+		out.MemoryMb = a.capabilities.MemoryMb
+		out.DiskGb = a.capabilities.DiskGb
+		out.Datacenter = a.capabilities.Datacenter
+		out.Tags = append([]string(nil), a.capabilities.Tags...)
+		if len(a.capabilities.Metadata) > 0 {
+			out.Metadata = make(map[string]string, len(a.capabilities.Metadata))
+			for k, v := range a.capabilities.Metadata {
+				out.Metadata[k] = v
+			}
+		}
+	}
+	if a.nodeName != "" {
+		if out.Metadata == nil {
+			out.Metadata = map[string]string{}
+		}
+		out.Metadata[MetadataKeyNodeName] = a.nodeName
+	}
+	return out
+}
+
+// buildCapabilitiesEvent is the events.Capabilities mirror of
+// buildCapabilities, used for the in-process publish on the first-node
+// self-add path (where the subscriber consumes events directly without
+// passing through the auth wire format).
+func (a *Authenticator) buildCapabilitiesEvent() *events.Capabilities {
+	caps := a.buildCapabilities()
+	if caps == nil {
+		return nil
+	}
+	out := &events.Capabilities{
+		CPUCores:   caps.CpuCores,
+		MemoryMB:   caps.MemoryMb,
+		DiskGB:     caps.DiskGb,
+		Datacenter: caps.Datacenter,
+		Tags:       caps.Tags,
+	}
+	if len(caps.Metadata) > 0 {
+		out.Metadata = make(map[string]string, len(caps.Metadata))
+		for k, v := range caps.Metadata {
+			out.Metadata[k] = v
+		}
+	}
+	return out
+}
+
+// authProgressHeartbeat logs an INFO every 5 seconds while waiting for
+// the voucher's auth-complete reply so operators can see the handshake
+// is still in flight (gossipsub mesh formation can take 5-15s and is
+// otherwise invisible).
+func (a *Authenticator) authProgressHeartbeat(ctx context.Context, clusterPath, peer string, startedAt time.Time) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.logger.Info("still waiting for voucher response",
+				zap.String("peer", peer),
+				zap.String("cluster", clusterPath),
+				zap.Duration("elapsed", time.Since(startedAt)))
+		}
+	}
 }
 
 // publishJoinFailed publishes a ClusterJoinFailed event.
@@ -1217,6 +1355,17 @@ func (a *Authenticator) checkStaleSessions() {
 
 	// Emit events for newly stale sessions (outside the lock)
 	for _, clusterPath := range newlyStale {
+		// On a single-node cluster (just self in the phonebook) there
+		// is nobody to re-auth against — skip the event entirely so
+		// idle bootstrap nodes don't log every 5 minutes.
+		if a.phonebook != nil {
+			if count, err := a.phonebook.CountByCluster(clusterPath); err == nil && count <= 1 {
+				a.logger.Debug("session stale on single-node cluster, skipping re-auth",
+					zap.String("cluster", clusterPath))
+				continue
+			}
+		}
+
 		a.logger.Info("session stale, triggering re-auth",
 			zap.String("cluster", clusterPath))
 

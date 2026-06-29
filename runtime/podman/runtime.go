@@ -103,13 +103,19 @@ func detectSocket() string {
 	return "/run/podman/podman.sock"
 }
 
-// apiURL builds a URL for the Podman REST API. All requests go to
-// http://d/v5.0.0/... — the host is ignored because we dial the socket.
+// apiURL builds a URL for the Podman REST API. All endpoints used by
+// Falak's runtime are libpod-flavoured (images/pull, containers/create,
+// containers/{id}/checkpoint, etc. — names that don't exist in the
+// Docker-compat namespace), so every request must be prefixed with
+// `/v5.0.0/libpod`. Dropping the `/libpod` segment yields 405 on every
+// call because the bare `/v5.0.0/<x>` paths map to the Docker-compat
+// API which uses different verbs and request shapes. The host is
+// ignored — we dial the unix socket directly.
 func apiURL(path string, query url.Values) string {
 	u := url.URL{
 		Scheme:   "http",
 		Host:     "d",
-		Path:     "/v5.0.0" + path,
+		Path:     "/v5.0.0/libpod" + path,
 		RawQuery: query.Encode(),
 	}
 	return u.String()
@@ -482,21 +488,40 @@ func (r *Runtime) Checkpoint(ctx context.Context, id string, snapshotPath string
 
 // Restore creates and starts a container from a CRIU checkpoint archive.
 //
-// Podman v5 API: POST /containers/{name}/restore with import query param
-// pointing to the checkpoint archive path on the Podman host.
+// Podman v5 API: POST /containers/{name}/restore. The libpod restore
+// endpoint types `import` as a BOOL and reads the checkpoint archive
+// from the REQUEST BODY (Content-Type application/x-tar). We therefore
+// stream the archive at snapshotPath in the body and set import=true —
+// the symmetric counterpart of Checkpoint, which uses export=true and
+// reads the archive from the RESPONSE body. The restored container
+// inherits the network/ports/env captured in the checkpoint; the
+// RestoreOption plumbing is kept for callers but not forwarded as query
+// params (the import-from-archive endpoint rejects unknown keys).
 func (r *Runtime) Restore(ctx context.Context, id string, snapshotPath string, opts ...runtime.RestoreOption) error {
 	r.logger.Info("podman: restoring container",
 		zap.String("id", id), zap.String("path", snapshotPath))
 
+	f, err := os.Open(snapshotPath)
+	if err != nil {
+		return fmt.Errorf("podman restore: open snapshot: %w", err)
+	}
+	defer f.Close()
+
 	q := url.Values{
-		"import": {snapshotPath},
+		"import": {"true"},
 		"name":   {id},
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		apiURL("/containers/"+id+"/restore", q), nil)
+		apiURL("/containers/"+id+"/restore", q), f)
 	if err != nil {
 		return fmt.Errorf("podman restore: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-tar")
+	// Set ContentLength so the upload is sent with a fixed length instead
+	// of chunked transfer encoding (some libpod versions reject chunked).
+	if st, statErr := os.Stat(snapshotPath); statErr == nil {
+		req.ContentLength = st.Size()
 	}
 
 	resp, err := r.client.Do(req)
@@ -674,6 +699,9 @@ func (r *Runtime) Inspect(ctx context.Context, id string) (runtime.ContainerInfo
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return runtime.ContainerInfo{}, fmt.Errorf("podman inspect %s: %w", id, runtime.ErrContainerNotFound)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return runtime.ContainerInfo{}, fmt.Errorf("podman inspect: status %d", resp.StatusCode)
 	}

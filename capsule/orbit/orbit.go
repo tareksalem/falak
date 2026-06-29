@@ -11,16 +11,37 @@ import (
 	"go.uber.org/zap"
 )
 
-// BuildOrbitTopic builds the PubSub topic name for an orbit.
+// BuildOrbitTopic builds the PubSub topic name for a named orbit.
 // Format: falak/<clusterPath>/orbit/<orbitName>
 func BuildOrbitTopic(clusterPath, orbitName string) string {
 	return fmt.Sprintf("falak/%s/orbit/%s", clusterPath, orbitName)
 }
 
-// BuildCapsuleTopic builds the PubSub topic for a specific capsule's status updates.
-// Format: falak/<clusterPath>/capsule/<capsuleID>
-func BuildCapsuleTopic(clusterPath, capsuleID string) string {
-	return fmt.Sprintf("falak/%s/capsule/%s", clusterPath, capsuleID)
+// CapsuleControlOrbit is the reserved logical orbit name for the
+// cluster-wide capsule control plane. Every cluster member joins it on
+// cluster setup, and all capsule lifecycle messages (announce / status /
+// withdraw) for BOTH standalone and group capsules travel on it. This
+// replaces per-orbit subscription gating for capsule propagation — the
+// capsule's own Spec.Orbit becomes a gravity/affinity hint, not a
+// participation gate. See .claude/plans/capsule-control-plane-refactor.md.
+const CapsuleControlOrbit = "__control"
+
+// BuildCapsuleControlTopic builds the cluster-wide capsule control-plane
+// topic. Format: falak/<clusterPath>/capsules
+func BuildCapsuleControlTopic(clusterPath string) string {
+	return fmt.Sprintf("falak/%s/capsules", clusterPath)
+}
+
+// resolveTopic maps a logical orbit name to its gossipsub topic. The
+// reserved control orbit maps to the flat cluster-wide capsule topic;
+// every other (user-named) orbit maps to the per-orbit topic. Named
+// orbits remain usable (e.g. via CapsuleHandler.JoinOrbit) but no longer
+// gate capsule election participation.
+func resolveTopic(clusterPath, orbitName string) string {
+	if orbitName == CapsuleControlOrbit {
+		return BuildCapsuleControlTopic(clusterPath)
+	}
+	return BuildOrbitTopic(clusterPath, orbitName)
 }
 
 // orbitEntry holds the topic and subscription for a joined orbit.
@@ -145,7 +166,7 @@ func (m *Manager) Join(_ context.Context, orbitName string) error {
 		return fmt.Errorf("already joined orbit %q", orbitName)
 	}
 
-	topicName := BuildOrbitTopic(m.clusterPath, orbitName)
+	topicName := resolveTopic(m.clusterPath, orbitName)
 	topic, err := m.ps.Join(topicName)
 	if err != nil {
 		return fmt.Errorf("failed to join orbit topic %q: %w", topicName, err)

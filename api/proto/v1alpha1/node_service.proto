@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package falak.api.v1alpha1;
+
+option go_package = "github.com/tareksalem/falak/api/proto/v1alpha1pb";
+
+import "google/api/annotations.proto";
+import "cluster_service.proto";
+
+// NodeService exposes per-node introspection RPCs. Until now `falak
+// node list|get|health` was a thin wrapper around ClusterService.Members
+// — this service makes the surface first-class so future expansion
+// (e.g. real-time stats, draining, eviction) doesn't have to overload
+// the cluster service.
+service NodeService {
+    // List returns every node in the requested cluster.
+    rpc List(ListNodesRequest) returns (ListNodesResponse) {
+        option (google.api.http) = {
+            get: "/v1alpha1/clusters/{cluster}/nodes"
+        };
+    }
+
+    // Get returns one node by ID or operator-name.
+    rpc Get(GetNodeRequest) returns (NodeInfo) {
+        option (google.api.http) = {
+            get: "/v1alpha1/clusters/{cluster}/nodes/{id}"
+        };
+    }
+
+    // Health returns the live SWIM-derived health snapshot.
+    rpc Health(GetNodeRequest) returns (NodeInfo) {
+        option (google.api.http) = {
+            get: "/v1alpha1/clusters/{cluster}/nodes/{id}/health"
+        };
+    }
+}
+
+message ListNodesRequest {
+    string cluster = 1;
+}
+
+message ListNodesResponse {
+    repeated NodeInfo nodes = 1;
+}
+
+message GetNodeRequest {
+    string cluster = 1;
+    string id = 2;  // peer ID or operator-assigned name
+}

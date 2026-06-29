@@ -14,6 +14,7 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 	"go.uber.org/zap"
@@ -115,6 +116,11 @@ type Node struct {
 
 	// Identity (set during Start)
 	id peer.ID
+
+	// startedAt records when Start() successfully transitioned the
+	// node to Running. Exposed via StartedAt() so the API surface can
+	// report uptime measured from node-start, not API-start.
+	startedAt time.Time
 
 	// Networking (set during Start)
 	host   host.Host
@@ -483,6 +489,7 @@ func (n *Node) Start() error {
 		phonebook.WithPhonebook(n.phonebook),
 		phonebook.WithEventBus(n.eventBus),
 		phonebook.WithSubscriberLogger(n.logger.Named("phonebook-subscriber")),
+		phonebook.WithSubscriberSelfID(n.host.ID().String()),
 	)
 	if err := n.phonebookSubscriber.Start(); err != nil {
 		n.cleanup()
@@ -500,6 +507,8 @@ func (n *Node) Start() error {
 		auth.WithDataDir(n.DataDir()),
 		auth.WithRejectAllAuth(n.rejectAllAuth),
 		auth.WithLogger(n.logger.Named("auth")),
+		auth.WithNodeName(n.name),
+		auth.WithCapabilities(sampleHostCapabilities(n.datacenter)),
 	)
 	if err := n.authenticator.Start(); err != nil {
 		n.cleanup()
@@ -589,6 +598,7 @@ func (n *Node) Start() error {
 		n.initializeRuntimeHandler()
 	}
 
+	n.startedAt = time.Now()
 	n.setState(nodeStateRunning)
 	n.logger.Info("node started",
 		zap.String("id", n.id.String()),
@@ -618,6 +628,13 @@ func (n *Node) Start() error {
 // fix plan. When that work lands, replace the magic sleep with a
 // bounded wait on peer acknowledgement or a WithDrainPropagationDelay
 // configurable option.
+// Drain transitions the node into Draining state and broadcasts a
+// NodeDeparting event so peers can update their phonebooks before the
+// node actually stops. Drain does NOT call Stop — the caller is
+// responsible for sleeping a grace window (so the broadcast has time to
+// leave the wire) and then invoking Stop separately. This split lets the
+// daemon control the exact ordering and lets future drain logic (e.g.
+// stopping containers, draining services) interleave with the wait.
 func (n *Node) Drain() error {
 	n.mu.Lock()
 	if n.state != nodeStateRunning {
@@ -629,19 +646,16 @@ func (n *Node) Drain() error {
 
 	n.logger.Info("draining node — rejecting new elections and notifying peers")
 
-	// Publish a departure event so peers can re-elect immediately.
-	// NOTE: today this only reaches local subscribers; see the Drain
-	// docstring for the wider issue.
+	// Publish locally. The health monitor subscribes to this and
+	// forwards it as a ScoreUpdate{Reason:node_departing} on the
+	// health pubsub topic, so peers evict us in one gossip round
+	// instead of waiting ~16-30s for SWIM to detect silence.
 	n.eventBus.Publish(events.NodeDeparting{
-		BaseEvent:   events.NewBaseEvent(),
-		NodeID:      n.id.String(),
+		BaseEvent: events.NewBaseEvent(),
+		NodeID:    n.id.String(),
 	})
 
-	// Placeholder: once NodeDeparting is bridged to PubSub, replace
-	// this with a bounded wait on peer acknowledgement.
-	time.Sleep(500 * time.Millisecond)
-
-	return n.Stop()
+	return nil
 }
 
 // IsDraining returns true if the node is in the draining state.
@@ -914,30 +928,20 @@ func (n *Node) applyClusterElectionConfig(cfg ClusterConfig) {
 	}
 }
 
-// joinConfiguredOrbits subscribes the capsule handler to every orbit named in
-// the cluster config. It is safe to pass an empty list (no-op).
-func (n *Node) joinConfiguredOrbits(ctx context.Context, cfg ClusterConfig) error {
-	if n.capsuleHandler == nil || len(cfg.Orbits) == 0 {
+// joinConfiguredOrbits is retained only for back-compat with existing
+// `orbits:` config blocks. Capsule propagation no longer depends on
+// per-orbit subscriptions — every node joins the cluster-wide capsule
+// control plane in CapsuleHandler.SetupCluster, so the `orbits:` list is
+// now a no-op. We log it once so operators with legacy config understand
+// it has no effect rather than silently ignoring it.
+func (n *Node) joinConfiguredOrbits(_ context.Context, cfg ClusterConfig) error {
+	if len(cfg.Orbits) == 0 {
 		return nil
 	}
-
-	var firstErr error
-	for _, orbitName := range cfg.Orbits {
-		if err := n.capsuleHandler.JoinOrbit(ctx, cfg.Path, orbitName); err != nil {
-			n.logger.Error("failed to join orbit",
-				zap.String("cluster", cfg.Path),
-				zap.String("orbit", orbitName),
-				zap.Error(err))
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		n.logger.Info("subscribed to orbit",
-			zap.String("cluster", cfg.Path),
-			zap.String("orbit", orbitName))
-	}
-	return firstErr
+	n.logger.Warn("`orbits:` config is legacy and ignored — capsules now propagate on the cluster-wide control plane",
+		zap.String("cluster", cfg.Path),
+		zap.Strings("orbits", cfg.Orbits))
+	return nil
 }
 
 // createConfiguredCapsules creates every declared capsule spec on this node
@@ -1126,6 +1130,15 @@ func (n *Node) Election() *election.Manager {
 	return n.electionManager
 }
 
+// StartedAt returns the wall-clock time the node finished Start. Zero
+// time if the node hasn't started yet. Used by the API facade to report
+// uptime measured from node-start rather than API-start.
+func (n *Node) StartedAt() time.Time {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.startedAt
+}
+
 // JoinedClusters returns the list of clusters this node has joined.
 func (n *Node) JoinedClusters() []string {
 	n.mu.RLock()
@@ -1135,6 +1148,20 @@ func (n *Node) JoinedClusters() []string {
 		clusters = append(clusters, path)
 	}
 	return clusters
+}
+
+// JoinedClustersWithTime returns each joined cluster paired with the
+// wall-clock time the node finished its cluster-join sequence. Used by
+// the API facade so `falak cluster list` can show a real JoinedAt
+// instead of the zero time.
+func (n *Node) JoinedClustersWithTime() map[string]time.Time {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	out := make(map[string]time.Time, len(n.joinedClusters))
+	for path, joinedAt := range n.joinedClusters {
+		out[path] = joinedAt
+	}
+	return out
 }
 
 // initializeIdentity sets up the node's cryptographic identity. Precedence:
@@ -1197,6 +1224,62 @@ func (n *Node) initializeHost() error {
 	n.logger.Debug("host initialized",
 		zap.String("id", h.ID().String()),
 		zap.Int("addrs", len(h.Addrs())))
+
+	// Register a libp2p network notifiee so we log peer connect /
+	// disconnect events as they happen. Without this, the first 5-15s
+	// of an inbound auth handshake looks silent from the voucher's
+	// side — operators can't tell if a peer dialed in or not.
+	h.Network().Notify(&network.NotifyBundle{
+		ConnectedF: func(_ network.Network, c network.Conn) {
+			peerID := c.RemotePeer().String()
+			n.logger.Info("peer connected",
+				zap.String("peer", peerID),
+				zap.String("addr", c.RemoteMultiaddr().String()),
+				zap.String("direction", c.Stat().Direction.String()))
+
+			// Bug #24 + Bug A follow-up: if this peer left gracefully
+			// and is now reconnecting (same identity, same cluster),
+			// lift its phonebook entry out of Departed so sync + pubsub
+			// signature verification work again. We keep the cert and
+			// public key intact across departures specifically to make
+			// this transparent.
+			//
+			// We flip to PendingAuth (not Active) and let the auth
+			// handler's explicit Active-promotion paths take over after
+			// the re-auth handshake completes — same gate the fresh-join
+			// path uses (Bug #13). Without this, the Notifiee jumps
+			// straight to Active at TCP-connect time and SWIM becomes
+			// eligible to probe a peer whose re-auth is still mid-flight.
+			// On a slow gossipsub-mesh window that would falsely suspect
+			// a healthy peer.
+			if n.phonebook == nil {
+				return
+			}
+			entries, err := n.phonebook.GetByNode(peerID)
+			if err != nil {
+				return
+			}
+			for _, e := range entries {
+				if e.Status != phonebook.NodeStatusEnum.Departed() {
+					continue
+				}
+				if err := n.phonebook.SetStatus(peerID, e.ClusterPath, phonebook.NodeStatusEnum.PendingAuth()); err != nil {
+					n.logger.Warn("failed to lift departed peer on reconnect",
+						zap.String("peer", peerID),
+						zap.String("cluster", e.ClusterPath),
+						zap.Error(err))
+					continue
+				}
+				n.logger.Info("departed peer reconnected, awaiting re-auth",
+					zap.String("peer", peerID),
+					zap.String("cluster", e.ClusterPath))
+			}
+		},
+		DisconnectedF: func(_ network.Network, c network.Conn) {
+			n.logger.Info("peer disconnected",
+				zap.String("peer", c.RemotePeer().String()))
+		},
+	})
 
 	return nil
 }

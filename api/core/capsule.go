@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"go.uber.org/zap"
@@ -29,6 +30,14 @@ func (c *Core) CreateCapsule(ctx context.Context, req CreateCapsuleRequest) (*Ca
 
 	result, err := c.node.CapsuleCreate(ctx, req.Cluster, req)
 	if err != nil {
+		// Preserve sentinel mapping: known classes (already-exists,
+		// invalid-argument) stay typed so the transport layer surfaces
+		// the correct gRPC code instead of collapsing to Internal.
+		if errors.Is(err, ErrAlreadyExists) ||
+			errors.Is(err, ErrInvalidArgument) ||
+			errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
 	}
 	return result, nil

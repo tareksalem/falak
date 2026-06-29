@@ -33,13 +33,6 @@ clusters: {
 falak daemon start --config=node1.cue
 ```
 
-Or with air (development):
-
-```bash
-cd cmd
-air -- --config=../configs/node1.cue
-```
-
 ---
 
 ## Configuration Reference
@@ -130,6 +123,40 @@ Falak requires the following on every node when `network.enabled=true`:
 When any of these checks fail, the daemon refuses to start with a clear,
 actionable error. The subsystem is binary: either everything is wired or
 nothing is — there is no degraded "no network" mode.
+
+### Runtime (crash & removal detection)
+
+The runtime handler detects container crashes and removals using two
+cooperating layers:
+
+- **Event stream (primary, low-latency).** A single long-lived consumer
+  subscribes to the container backend's lifecycle event stream
+  (`GET /libpod/events` on Podman). A `died` event drives crash recovery
+  (local restart up to the capsule's `restart_limit`, else re-election); a
+  `remove` event is terminal and triggers re-election immediately. The
+  stream is best-effort — it drops on a backend socket restart — so on a
+  dropped stream the consumer reconciles every owned container and
+  reconnects with jittered backoff.
+- **Reconcile sweep (correctness backstop).** A periodic sweep inspects
+  every owned container. A not-found result (the container was removed
+  out-of-band) is terminal → re-election. A stopped/failed status takes
+  the crash path. Repeated transient inspect errors escalate to
+  re-election once `max_inspect_errors` consecutive failures accumulate
+  (a single blip followed by recovery never escalates).
+
+Falak's own teardowns (rolling-update swap, user stop, snapshot
+checkpoint) are added to an internal ignore set before the intentional
+stop/remove, so they never self-trigger a re-election.
+
+These tunables are set via functional options on the runtime handler
+(`runtime.With…`); they have production-sensible defaults and rarely need
+overriding.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithReconcileInterval(d)` | `30s` | Cadence of the reconcile backstop sweep. The event stream carries the fast path, so this is deliberately long. |
+| `WithMaxInspectErrors(n)` | `5` | Consecutive transient inspect failures tolerated during reconcile before a container is declared "runtime unreachable" and re-elected. |
+| `WithEventReconnectBackoff(d)` | `1s` | Base (jittered) delay between event-stream reconnect attempts after the stream drops. |
 
 ---
 

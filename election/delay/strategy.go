@@ -40,6 +40,13 @@ const (
 	// slots — allowing the next-best node to win them. Default 150ms,
 	// wide enough for a gossipsub round-trip in a small cluster.
 	defaultReplicaStagger = 150 * time.Millisecond
+	// defaultMaxAnchorAge bounds how old a capsule's CreatedAt may be and
+	// still be used as the shared election anchor (see anchorToAnnouncement).
+	// Beyond this the strategy falls back to time.Now() so a daemon
+	// re-announcing an old capsule on restart does not anchor every node's
+	// publish time into the distant past (which would collapse the
+	// score-ordered delays into an immediate free-for-all).
+	defaultMaxAnchorAge = 30 * time.Second
 )
 
 // Strategy implements election.Strategy with the delay-based algorithm.
@@ -52,7 +59,16 @@ type Strategy struct {
 	maxWait        time.Duration
 	maxJitter      time.Duration
 	replicaStagger time.Duration
-	logger         *zap.Logger
+	// anchorToAnnouncement, when true, computes PublishAt relative to the
+	// capsule's announcement time (CreatedAt) instead of each node's local
+	// time at election start, for initial elections. Because every node
+	// derives the same anchor from the gossiped announcement, the
+	// score-ordered publish schedule is identical cluster-wide — so gravity
+	// decides the winner rather than which node happened to start its round
+	// first (the originator's head-start). Defaults to true.
+	anchorToAnnouncement bool
+	maxAnchorAge         time.Duration
+	logger               *zap.Logger
 }
 
 // Option configures a Strategy.
@@ -89,16 +105,37 @@ func WithReplicaStagger(d time.Duration) Option {
 	return func(s *Strategy) { s.replicaStagger = d }
 }
 
+// WithAnchorToAnnouncement toggles anchoring the publish schedule to the
+// capsule's announcement time for initial elections. Default true. Set
+// false to fall back to local-time anchoring (e.g. for clusters with poor
+// clock synchronization where cross-node skew exceeds maxWait).
+func WithAnchorToAnnouncement(on bool) Option {
+	return func(s *Strategy) { s.anchorToAnnouncement = on }
+}
+
+// WithMaxAnchorAge sets the maximum age of a capsule's CreatedAt for it to
+// be used as the election anchor. Older capsules fall back to time.Now().
+// Default 30s.
+func WithMaxAnchorAge(d time.Duration) Option {
+	return func(s *Strategy) {
+		if d > 0 {
+			s.maxAnchorAge = d
+		}
+	}
+}
+
 // New constructs a Strategy with the given options. Defaults are tuned
 // for a typical cluster (500ms max wait, 200µs jitter, 150ms per-replica
-// stagger); production deployments can override per cluster via
-// configuration.
+// stagger, announcement-anchored ordering); production deployments can
+// override per cluster via configuration.
 func New(opts ...Option) *Strategy {
 	s := &Strategy{
-		maxWait:        defaultMaxWait,
-		maxJitter:      defaultMaxJitter,
-		replicaStagger: defaultReplicaStagger,
-		logger:         zap.NewNop(),
+		maxWait:              defaultMaxWait,
+		maxJitter:            defaultMaxJitter,
+		replicaStagger:       defaultReplicaStagger,
+		anchorToAnnouncement: true,
+		maxAnchorAge:         defaultMaxAnchorAge,
+		logger:               zap.NewNop(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -163,7 +200,15 @@ func (s *Strategy) Decide(
 	jit := jitter(s.maxJitter)
 	slotDelay := replicaSlotStagger(req.ReplicaID, s.replicaStagger)
 	wait := baseWait + slotDelay + jit
-	publishAt := time.Now().Add(wait)
+
+	// Anchor the publish schedule. For initial elections we anchor to the
+	// capsule's announcement time so every node — originator and receivers
+	// alike — computes the SAME absolute PublishAt and the winner is
+	// decided purely by gravity, not by which node started its round first.
+	// Re-elections (node failure, scale-up) have no shared announcement
+	// anchor across independently-firing triggers, so they use local time.
+	anchor, anchored := s.electionAnchor(req, c)
+	publishAt := anchor.Add(wait)
 
 	s.logger.Info("delay strategy: eligible",
 		zap.String("capsule_id", string(req.CapsuleID)),
@@ -175,6 +220,7 @@ func (s *Strategy) Decide(
 		zap.Duration("slot_delay", slotDelay),
 		zap.Duration("jitter", jit),
 		zap.Duration("total_wait", wait),
+		zap.Bool("announcement_anchored", anchored),
 		zap.Time("publish_at", publishAt))
 
 	s.logger.Debug("delay strategy: gravity breakdown",
@@ -208,6 +254,30 @@ func replicaSlotStagger(replicaID string, stagger time.Duration) time.Duration {
 		return 0
 	}
 	return time.Duration(slot) * stagger
+}
+
+// electionAnchor returns the reference time the publish schedule is
+// computed from, plus whether the shared announcement anchor was used.
+//
+// For initial elections with anchoring enabled it uses the capsule's
+// CreatedAt — a value every node derives identically from the gossiped
+// announcement — so the score-ordered schedule is cluster-wide identical.
+// It falls back to local time when anchoring is disabled, the reason is
+// not Initial (re-elections have no shared anchor), the timestamp is
+// unset, or the capsule is older than maxAnchorAge (stale re-announce on
+// restart).
+func (s *Strategy) electionAnchor(req election.Request, c *capsule.Capsule) (time.Time, bool) {
+	now := time.Now()
+	if !s.anchorToAnnouncement || req.Reason != election.ReasonEnum.Initial() {
+		return now, false
+	}
+	if c == nil || c.CreatedAt.IsZero() {
+		return now, false
+	}
+	if now.Sub(c.CreatedAt) > s.maxAnchorAge {
+		return now, false
+	}
+	return c.CreatedAt, true
 }
 
 // waitForScore computes the base (un-jittered) wait time for a given

@@ -63,9 +63,26 @@ subcommands of that one binary.
 * **Linux** for full functionality (kernel VXLAN, IPsec/XFRM, iptables).
   macOS/Windows work for the in-process / single-node paths but the
   cross-node overlay is Linux-only.
-* **Podman** if you want capsules to actually run containers. Without
-  Podman the control-plane (capsule create, gossip, election) still
-  works; the runtime layer just retries pulls.
+* **Podman** to actually run containers. Without Podman the
+  control-plane (capsule create, gossip, election) still works; the
+  runtime layer just retries pulls. Falak speaks Podman's libpod REST
+  API over a unix socket (autodetected — set `--runtime-socket` to
+  override).
+  ```bash
+  systemctl --user start podman.socket
+  systemctl --user enable podman.socket
+  ```
+* **CRIU** for snapshot-based fast startup — the architectural
+  headline (sub-second restart on cached snapshots vs. 10–60s cold
+  start). Without CRIU the daemon logs a non-fatal warning per
+  capsule and falls back to cold-start every time; containers still
+  run, you just lose the snapshot fast-path.
+  ```bash
+  sudo apt install -y criu       # Debian / Ubuntu
+  sudo dnf install -y criu       # Fedora / RHEL
+  sudo pacman -S    criu         # Arch
+  sudo criu check                # last line should be "Looks good."
+  ```
 * **CAP_NET_ADMIN** + kernel modules `vxlan`, `esp4`, `xfrm_user` if
   you want the cross-node service mesh overlay. The daemon refuses to
   start without them on Linux (override in dev with config).
@@ -153,7 +170,7 @@ capsule: {
 }
 EOF
 
-/tmp/falak --insecure capsule create -f /tmp/cap-api.cue
+/tmp/falak --insecure capsule create -f /tmp/cap-api.cue --cluster=test/dc1/prod
 /tmp/falak --insecure capsule list
 ```
 
@@ -187,7 +204,11 @@ capsule: {
 }
 EOF
 
-/tmp/falak --insecure capsule create -f /tmp/grp-stack.cue
+# Group capsules don't go through `capsule create -f` yet — the gRPC
+# Create surface only carries standalone capsules. Until the daemon
+# grows a CreateGroup RPC, declare groups under the daemon's
+# `capsules:` config block and start the daemon with --config=node.cue.
+/tmp/falak daemon start --name=node1 --port=4001 --config=node.cue
 ```
 
 `api` is parked until `db` reports Running.

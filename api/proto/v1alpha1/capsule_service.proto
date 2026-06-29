@@ -83,6 +83,17 @@ message CapsuleSpec {
     map<string, string> env = 13;
     repeated string command = 14;
     string network_mode = 15;
+    repeated PortMapping ports = 16;
+}
+
+// PortMapping mirrors capsule.PortMapping so the API can carry the
+// container port spec from a CUE file through to the runtime layer.
+// host=0 lets Podman pick a free host port at start.
+message PortMapping {
+    string name = 1;
+    int32 container = 2;
+    int32 host = 3;
+    string protocol = 4;  // "tcp" (default) or "udp"
 }
 
 message CapsuleStatus {
@@ -119,6 +130,7 @@ message CreateCapsuleRequest {
     string registry_url = 19;
     string registry_username = 20;
     string registry_password = 21;
+    repeated PortMapping ports = 22;
 }
 
 message GetCapsuleRequest {

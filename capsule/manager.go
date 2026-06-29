@@ -14,6 +14,15 @@ import (
 // ErrNotFound is returned when a capsule lookup finds no match.
 var ErrNotFound = errors.New("capsule not found")
 
+// ErrCapsuleNameConflict is returned by Create when a capsule with the
+// same name already exists in the same cluster. Falak enforces
+// cluster-wide name uniqueness (locked decision #16 in
+// service-networking.md): names must be unique within a cluster so
+// Service backends, DNS lookups, and self-anti-affinity all agree on
+// what "the capsule named X" means. Use errors.Is to detect it across
+// wrapping layers — the API layer maps it to gRPC AlreadyExists.
+var ErrCapsuleNameConflict = errors.New("capsule name already exists in cluster")
+
 // ManagerEvent is emitted by the capsule manager on lifecycle actions.
 //
 // Meta carries optional contextual fields that some event types need but
@@ -217,6 +226,17 @@ func (m *Manager) Create(_ context.Context, clusterID string, spec CapsuleSpec) 
 	// Validate
 	if err := ValidateSpec(&spec); err != nil {
 		return nil, fmt.Errorf("invalid capsule spec: %w", err)
+	}
+
+	// Enforce cluster-wide name uniqueness BEFORE allocating an ID or
+	// touching the store. Without this guard, two capsules with the
+	// same name + cluster can coexist; both end up reachable by the
+	// election self-anti-affinity check (which matches by name, not
+	// ID), causing the second create to silently deadlock at the
+	// delay-strategy ineligibility branch.
+	if existing := m.store.GetByNameInCluster(clusterID, spec.Name); existing != nil {
+		return nil, fmt.Errorf("%w: %q in cluster %q (existing id=%s)",
+			ErrCapsuleNameConflict, spec.Name, clusterID, existing.ID.String())
 	}
 
 	now := time.Now()
@@ -564,6 +584,16 @@ func (m *Manager) MarkRunning(id CapsuleID) error {
 	return m.Fire(id, TriggerContainerReady)
 }
 
+// MarkNodeFailed transitions a running capsule back to Announced after the
+// node hosting it lost the container (crash/removal), so a fresh election can
+// re-place it. Fires TriggerNodeFailed (Running → Announced). Returns the Fire
+// error if the capsule is not in a state that permits it; callers in the crash
+// path treat that as non-fatal (the capsule may already have been downgraded
+// by a sibling replica's crash event).
+func (m *Manager) MarkNodeFailed(id CapsuleID) error {
+	return m.Fire(id, TriggerNodeFailed)
+}
+
 // MarkGroupRunning transitions a group capsule from Announced to Running by
 // firing TriggerMembersAdmitted. This is the group-only analogue of
 // MarkRunning — group lifecycle is admission-driven, not election-driven, so
@@ -662,6 +692,64 @@ func (m *Manager) AssignReplica(id CapsuleID, replicaID ReplicaID, nodeID string
 		zap.String("id", id.String()),
 		zap.String("replica_id", string(replicaID)),
 		zap.String("node_id", nodeID))
+	return nil
+}
+
+// UnassignReplica clears the node binding for a replica whose container is
+// known to be gone (crash or out-of-band removal). It sets the replica's
+// NodeID back to empty and its Status back to Announced — the capsule-level
+// "looking for a home" state that AssignReplica overwrites when it claims the
+// slot. Clearing the binding (rather than deleting the slot) keeps the
+// ReplicaID stable across the subsequent re-election and re-assign.
+//
+// Clearing matters for correctness: NodesRunningCapsule
+// (node/election_handler.go) skips replicas with an empty NodeID, so once the
+// binding is cleared the originating node is no longer counted by the
+// self-anti-affinity rule in gravity.IsEligible and becomes eligible to
+// re-place the replica it just lost. Without this, a single-node cluster
+// dead-locks on re-election ("no claim heard").
+//
+// UnassignReplica is idempotent: it returns nil with no side effects if the
+// capsule is unknown, the replica is unknown, or the replica's NodeID is
+// already empty.
+func (m *Manager) UnassignReplica(id CapsuleID, replicaID ReplicaID) error {
+	c := m.store.Get(id)
+	if c == nil {
+		// Unknown capsule — nothing to clear.
+		return nil
+	}
+
+	m.mu.Lock()
+	idx := -1
+	for i, r := range c.Replicas {
+		if r.ReplicaID == replicaID {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 || c.Replicas[idx].NodeID == "" {
+		// Unknown replica or already unbound — idempotent no-op.
+		m.mu.Unlock()
+		return nil
+	}
+
+	c.Replicas[idx].NodeID = ""
+	c.Replicas[idx].Status = enums.CapsuleStatusEnum.Announced()
+	c.UpdatedAt = time.Now()
+	// Hold the manager mutex across the store Update so the store's internal
+	// write of capsule.UpdatedAt does not race with concurrent readers
+	// calling Manager.Get (which snapshot-copies *c under m.mu.RLock). This
+	// mirrors AssignReplica's exact locking discipline; both locks together
+	// close the same race the AssignReplica comment describes.
+	err := m.store.Update(c)
+	m.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("failed to persist replica unassignment: %w", err)
+	}
+
+	m.logger.Info("capsule replica unassigned",
+		zap.String("id", id.String()),
+		zap.String("replica_id", string(replicaID)))
 	return nil
 }
 

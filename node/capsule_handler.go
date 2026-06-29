@@ -526,15 +526,15 @@ func (h *CapsuleHandler) SetupCluster(_ context.Context, clusterPath string) *or
 	announcer := orbit.NewAnnouncer(orbitMgr, annOpts...)
 	h.announcers[clusterPath] = announcer
 
-	// Auto-join the reserved system orbit for group capsules. Every node
-	// in the cluster subscribes so group announcements (membership graph,
-	// cascade-delete contract) reach the entire mesh regardless of which
-	// member orbits a peer otherwise subscribes to. Joined synchronously
-	// while holding h.mu to keep startup deterministic.
-	if err := orbitMgr.Join(h.ctx, capsule.SystemGroupOrbit); err != nil {
-		h.logger.Warn("failed to auto-join system group orbit",
+	// Auto-join the cluster-wide capsule control plane. Every node in the
+	// cluster subscribes so ALL capsule announcements (standalone and
+	// group) reach the entire mesh — this is what lets every candidate
+	// node run the gravity election instead of only the originator.
+	// Joined synchronously while holding h.mu to keep startup deterministic.
+	if err := orbitMgr.Join(h.ctx, orbit.CapsuleControlOrbit); err != nil {
+		h.logger.Warn("failed to auto-join capsule control plane",
 			zap.String("cluster", clusterPath),
-			zap.String("orbit", capsule.SystemGroupOrbit),
+			zap.String("orbit", orbit.CapsuleControlOrbit),
 			zap.Error(err))
 	}
 
@@ -761,33 +761,72 @@ func (h *CapsuleHandler) handleContainerCrash(ctx context.Context) {
 			if !ok {
 				continue
 			}
-			id := capsule.CapsuleID(failed.CapsuleID)
-			c := h.manager.Get(id)
-			if c == nil {
-				continue
-			}
-
-			h.logger.Warn("container crash detected, requesting re-election",
-				zap.String("capsule_id", failed.CapsuleID),
-				zap.String("reason", failed.Reason))
-
-			// Fire a re-election for each replica that was running on
-			// this node. The local node may or may not win again —
-			// gravity decides.
-			for _, replica := range c.Replicas {
-				if replica.NodeID != h.nodeID {
-					continue
-				}
-				h.requestElection(events.ElectionRequested{
-					BaseEvent:   events.NewBaseEvent(),
-					CapsuleID:   failed.CapsuleID,
-					ReplicaID:   string(replica.ReplicaID),
-					Reason:      events.ElectionReasonEnum.NodeFailure(),
-					ClusterPath: c.ClusterID,
-					Priority:    priorityNodeFailure,
-				})
-			}
+			h.onContainerCrash(failed)
 		}
+	}
+}
+
+// onContainerCrash is the per-event body of handleContainerCrash, split out
+// so tests can drive it without spinning up the subscriber goroutine. For
+// each replica of the crashed capsule that was bound to this node it clears
+// the stale binding (UnassignReplica) and then requests a re-election.
+//
+// Order is load-bearing: UnassignReplica is synchronous and persists the
+// cleared binding before requestElection (which only publishes an event)
+// returns. The originating node's self-anti-affinity in gravity.IsEligible
+// counts replicas via NodesRunningCapsule, which skips empty NodeIDs — so the
+// binding MUST be clear before the election round evaluates eligibility, or
+// the node that just lost the container is wrongly excluded from reclaiming
+// it (single-node clusters dead-lock entirely).
+func (h *CapsuleHandler) onContainerCrash(failed events.CapsuleExecutionFailed) {
+	id := capsule.CapsuleID(failed.CapsuleID)
+	c := h.manager.Get(id)
+	if c == nil {
+		return
+	}
+
+	h.logger.Warn("container crash detected, requesting re-election",
+		zap.String("capsule_id", failed.CapsuleID),
+		zap.String("reason", failed.Reason))
+
+	// Downgrade the capsule-level FSM Running → Announced ONCE (the FSM is
+	// per-capsule, not per-replica) so the re-election round's StartElection /
+	// WinElection / MarkRunning transitions are valid. Non-fatal: a non-running
+	// state or a sibling replica's crash event may have already downgraded it.
+	if err := h.manager.MarkNodeFailed(id); err != nil {
+		h.logger.Debug("FSM downgrade on crash rejected (already downgraded?)",
+			zap.String("capsule_id", failed.CapsuleID), zap.Error(err))
+	}
+
+	// c.Replicas is a snapshot copy from Manager.Get, so clearing the live
+	// binding via UnassignReplica mid-iteration does not mutate the slice we
+	// are ranging over. Fire a re-election for each replica that was running
+	// on this node. The local node may or may not win again — gravity
+	// decides.
+	for _, replica := range c.Replicas {
+		if replica.NodeID != h.nodeID {
+			continue
+		}
+
+		// Clear the stale binding BEFORE requesting the election so the
+		// lost replica stops counting toward self-anti-affinity and this
+		// node becomes eligible to re-place it.
+		if err := h.manager.UnassignReplica(id, replica.ReplicaID); err != nil {
+			h.logger.Warn("failed to clear crashed replica binding before re-election",
+				zap.String("capsule_id", failed.CapsuleID),
+				zap.String("replica", string(replica.ReplicaID)),
+				zap.Error(err))
+			continue
+		}
+
+		h.requestElection(events.ElectionRequested{
+			BaseEvent:   events.NewBaseEvent(),
+			CapsuleID:   failed.CapsuleID,
+			ReplicaID:   string(replica.ReplicaID),
+			Reason:      events.ElectionReasonEnum.NodeFailure(),
+			ClusterPath: c.ClusterID,
+			Priority:    priorityNodeFailure,
+		})
 	}
 }
 
@@ -2080,10 +2119,16 @@ func (h *CapsuleHandler) onManagerEvent(event capsule.ManagerEvent) {
 	}
 }
 
-// announceCapsule publishes a capsule announcement to its orbit.
+// announceCapsule publishes a capsule announcement to its orbit. The
+// originating node MUST be subscribed to that orbit's gossipsub topic
+// before publishing — otherwise the underlying topic.Publish rejects
+// with "not joined". Auto-join the orbit here on first announce so
+// operators don't have to pre-declare an `orbits:` list in the daemon
+// config just to create a capsule.
 func (h *CapsuleHandler) announceCapsule(c *capsule.Capsule) {
 	h.mu.RLock()
 	ann, ok := h.announcers[c.ClusterID]
+	orbitMgr := h.orbits[c.ClusterID]
 	h.mu.RUnlock()
 	if !ok {
 		h.logger.Debug("no announcer for cluster, skipping announcement",
@@ -2092,10 +2137,26 @@ func (h *CapsuleHandler) announceCapsule(c *capsule.Capsule) {
 		return
 	}
 
+	// The control plane is auto-joined in SetupCluster; guard defensively
+	// in case a capsule is announced before setup completed (e.g. store
+	// replay on restart).
+	if orbitMgr != nil && !orbitMgr.IsJoined(orbit.CapsuleControlOrbit) {
+		if err := orbitMgr.Join(h.ctx, orbit.CapsuleControlOrbit); err != nil {
+			h.logger.Error("failed to join capsule control plane before announce",
+				zap.String("cluster", c.ClusterID),
+				zap.String("capsule_id", c.ID.String()),
+				zap.Error(err))
+			return
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := ann.Announce(ctx, c); err != nil {
+	// Announce on the cluster-wide control plane so every node observes the
+	// capsule and runs the gravity election. Spec.Orbit travels in the
+	// payload as an affinity hint.
+	if err := ann.AnnounceOn(ctx, c, orbit.CapsuleControlOrbit); err != nil {
 		h.logger.Error("failed to announce capsule",
 			zap.String("capsule_id", c.ID.String()),
 			zap.Error(err))
@@ -2111,19 +2172,37 @@ func (h *CapsuleHandler) announceCapsule(c *capsule.Capsule) {
 	})
 }
 
-// withdrawCapsule publishes a withdrawal to the orbit.
+// withdrawCapsule publishes a withdrawal to the orbit. Mirrors
+// announceCapsule's auto-join behaviour: a capsule loaded from the
+// store on daemon restart has no orbit subscription yet, so a delete
+// in that state would fail to publish the withdrawal and leave zombie
+// entries on peers. Auto-join the orbit before publishing so the
+// withdrawal always lands.
 func (h *CapsuleHandler) withdrawCapsule(c *capsule.Capsule, reason string) {
 	h.mu.RLock()
 	ann, ok := h.announcers[c.ClusterID]
+	orbitMgr := h.orbits[c.ClusterID]
 	h.mu.RUnlock()
 	if !ok {
 		return
 	}
 
+	// The control plane is auto-joined in SetupCluster; guard defensively
+	// for the store-replay-on-restart path.
+	if orbitMgr != nil && !orbitMgr.IsJoined(orbit.CapsuleControlOrbit) {
+		if err := orbitMgr.Join(h.ctx, orbit.CapsuleControlOrbit); err != nil {
+			h.logger.Error("failed to join capsule control plane before withdraw",
+				zap.String("cluster", c.ClusterID),
+				zap.String("capsule_id", c.ID.String()),
+				zap.Error(err))
+			return
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := ann.Withdraw(ctx, c.Spec.Orbit, c.ID, reason); err != nil {
+	if err := ann.Withdraw(ctx, orbit.CapsuleControlOrbit, c.ID, reason); err != nil {
 		h.logger.Error("failed to withdraw capsule",
 			zap.String("capsule_id", c.ID.String()),
 			zap.Error(err))

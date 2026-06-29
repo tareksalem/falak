@@ -101,6 +101,7 @@ type CapsuleSpec struct {
 	Env           map[string]string      `protobuf:"bytes,13,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	Command       []string               `protobuf:"bytes,14,rep,name=command,proto3" json:"command,omitempty"`
 	NetworkMode   string                 `protobuf:"bytes,15,opt,name=network_mode,json=networkMode,proto3" json:"network_mode,omitempty"`
+	Ports         []*PortMapping         `protobuf:"bytes,16,rep,name=ports,proto3" json:"ports,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -240,6 +241,84 @@ func (x *CapsuleSpec) GetNetworkMode() string {
 	return ""
 }
 
+func (x *CapsuleSpec) GetPorts() []*PortMapping {
+	if x != nil {
+		return x.Ports
+	}
+	return nil
+}
+
+// PortMapping mirrors capsule.PortMapping so the API can carry the
+// container port spec from a CUE file through to the runtime layer.
+// host=0 lets Podman pick a free host port at start.
+type PortMapping struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Container     int32                  `protobuf:"varint,2,opt,name=container,proto3" json:"container,omitempty"`
+	Host          int32                  `protobuf:"varint,3,opt,name=host,proto3" json:"host,omitempty"`
+	Protocol      string                 `protobuf:"bytes,4,opt,name=protocol,proto3" json:"protocol,omitempty"` // "tcp" (default) or "udp"
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PortMapping) Reset() {
+	*x = PortMapping{}
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PortMapping) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PortMapping) ProtoMessage() {}
+
+func (x *PortMapping) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PortMapping.ProtoReflect.Descriptor instead.
+func (*PortMapping) Descriptor() ([]byte, []int) {
+	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *PortMapping) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *PortMapping) GetContainer() int32 {
+	if x != nil {
+		return x.Container
+	}
+	return 0
+}
+
+func (x *PortMapping) GetHost() int32 {
+	if x != nil {
+		return x.Host
+	}
+	return 0
+}
+
+func (x *PortMapping) GetProtocol() string {
+	if x != nil {
+		return x.Protocol
+	}
+	return ""
+}
+
 type CapsuleStatus struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
@@ -250,7 +329,7 @@ type CapsuleStatus struct {
 
 func (x *CapsuleStatus) Reset() {
 	*x = CapsuleStatus{}
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[2]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -262,7 +341,7 @@ func (x *CapsuleStatus) String() string {
 func (*CapsuleStatus) ProtoMessage() {}
 
 func (x *CapsuleStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[2]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -275,7 +354,7 @@ func (x *CapsuleStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CapsuleStatus.ProtoReflect.Descriptor instead.
 func (*CapsuleStatus) Descriptor() ([]byte, []int) {
-	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{2}
+	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *CapsuleStatus) GetStatus() string {
@@ -304,7 +383,7 @@ type ReplicaStatus struct {
 
 func (x *ReplicaStatus) Reset() {
 	*x = ReplicaStatus{}
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[3]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -316,7 +395,7 @@ func (x *ReplicaStatus) String() string {
 func (*ReplicaStatus) ProtoMessage() {}
 
 func (x *ReplicaStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[3]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -329,7 +408,7 @@ func (x *ReplicaStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicaStatus.ProtoReflect.Descriptor instead.
 func (*ReplicaStatus) Descriptor() ([]byte, []int) {
-	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{3}
+	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *ReplicaStatus) GetReplicaId() string {
@@ -383,13 +462,14 @@ type CreateCapsuleRequest struct {
 	RegistryUrl      string                 `protobuf:"bytes,19,opt,name=registry_url,json=registryUrl,proto3" json:"registry_url,omitempty"`
 	RegistryUsername string                 `protobuf:"bytes,20,opt,name=registry_username,json=registryUsername,proto3" json:"registry_username,omitempty"`
 	RegistryPassword string                 `protobuf:"bytes,21,opt,name=registry_password,json=registryPassword,proto3" json:"registry_password,omitempty"`
+	Ports            []*PortMapping         `protobuf:"bytes,22,rep,name=ports,proto3" json:"ports,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
 
 func (x *CreateCapsuleRequest) Reset() {
 	*x = CreateCapsuleRequest{}
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[4]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -401,7 +481,7 @@ func (x *CreateCapsuleRequest) String() string {
 func (*CreateCapsuleRequest) ProtoMessage() {}
 
 func (x *CreateCapsuleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[4]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -414,7 +494,7 @@ func (x *CreateCapsuleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateCapsuleRequest.ProtoReflect.Descriptor instead.
 func (*CreateCapsuleRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{4}
+	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *CreateCapsuleRequest) GetCluster() string {
@@ -564,6 +644,13 @@ func (x *CreateCapsuleRequest) GetRegistryPassword() string {
 	return ""
 }
 
+func (x *CreateCapsuleRequest) GetPorts() []*PortMapping {
+	if x != nil {
+		return x.Ports
+	}
+	return nil
+}
+
 type GetCapsuleRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -574,7 +661,7 @@ type GetCapsuleRequest struct {
 
 func (x *GetCapsuleRequest) Reset() {
 	*x = GetCapsuleRequest{}
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[5]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -586,7 +673,7 @@ func (x *GetCapsuleRequest) String() string {
 func (*GetCapsuleRequest) ProtoMessage() {}
 
 func (x *GetCapsuleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[5]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -599,7 +686,7 @@ func (x *GetCapsuleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetCapsuleRequest.ProtoReflect.Descriptor instead.
 func (*GetCapsuleRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{5}
+	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *GetCapsuleRequest) GetId() string {
@@ -628,7 +715,7 @@ type ListCapsulesRequest struct {
 
 func (x *ListCapsulesRequest) Reset() {
 	*x = ListCapsulesRequest{}
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[6]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -640,7 +727,7 @@ func (x *ListCapsulesRequest) String() string {
 func (*ListCapsulesRequest) ProtoMessage() {}
 
 func (x *ListCapsulesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[6]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -653,7 +740,7 @@ func (x *ListCapsulesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCapsulesRequest.ProtoReflect.Descriptor instead.
 func (*ListCapsulesRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{6}
+	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ListCapsulesRequest) GetCluster() string {
@@ -694,7 +781,7 @@ type ListCapsulesResponse struct {
 
 func (x *ListCapsulesResponse) Reset() {
 	*x = ListCapsulesResponse{}
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[7]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -706,7 +793,7 @@ func (x *ListCapsulesResponse) String() string {
 func (*ListCapsulesResponse) ProtoMessage() {}
 
 func (x *ListCapsulesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[7]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -719,7 +806,7 @@ func (x *ListCapsulesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCapsulesResponse.ProtoReflect.Descriptor instead.
 func (*ListCapsulesResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{7}
+	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ListCapsulesResponse) GetCapsules() []*CapsuleResource {
@@ -749,7 +836,7 @@ type UpdateCapsuleRequest struct {
 
 func (x *UpdateCapsuleRequest) Reset() {
 	*x = UpdateCapsuleRequest{}
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[8]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -761,7 +848,7 @@ func (x *UpdateCapsuleRequest) String() string {
 func (*UpdateCapsuleRequest) ProtoMessage() {}
 
 func (x *UpdateCapsuleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[8]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -774,7 +861,7 @@ func (x *UpdateCapsuleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateCapsuleRequest.ProtoReflect.Descriptor instead.
 func (*UpdateCapsuleRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{8}
+	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *UpdateCapsuleRequest) GetId() string {
@@ -822,7 +909,7 @@ type DeleteCapsuleRequest struct {
 
 func (x *DeleteCapsuleRequest) Reset() {
 	*x = DeleteCapsuleRequest{}
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[9]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -834,7 +921,7 @@ func (x *DeleteCapsuleRequest) String() string {
 func (*DeleteCapsuleRequest) ProtoMessage() {}
 
 func (x *DeleteCapsuleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[9]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -847,7 +934,7 @@ func (x *DeleteCapsuleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteCapsuleRequest.ProtoReflect.Descriptor instead.
 func (*DeleteCapsuleRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{9}
+	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *DeleteCapsuleRequest) GetId() string {
@@ -874,7 +961,7 @@ type WatchCapsulesRequest struct {
 
 func (x *WatchCapsulesRequest) Reset() {
 	*x = WatchCapsulesRequest{}
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[10]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -886,7 +973,7 @@ func (x *WatchCapsulesRequest) String() string {
 func (*WatchCapsulesRequest) ProtoMessage() {}
 
 func (x *WatchCapsulesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[10]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -899,7 +986,7 @@ func (x *WatchCapsulesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WatchCapsulesRequest.ProtoReflect.Descriptor instead.
 func (*WatchCapsulesRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{10}
+	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *WatchCapsulesRequest) GetCluster() string {
@@ -929,7 +1016,7 @@ type LogsRequest struct {
 
 func (x *LogsRequest) Reset() {
 	*x = LogsRequest{}
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[11]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -941,7 +1028,7 @@ func (x *LogsRequest) String() string {
 func (*LogsRequest) ProtoMessage() {}
 
 func (x *LogsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[11]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -954,7 +1041,7 @@ func (x *LogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogsRequest.ProtoReflect.Descriptor instead.
 func (*LogsRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{11}
+	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *LogsRequest) GetCapsuleId() string {
@@ -1003,7 +1090,7 @@ type LogEntry struct {
 
 func (x *LogEntry) Reset() {
 	*x = LogEntry{}
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[12]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1015,7 +1102,7 @@ func (x *LogEntry) String() string {
 func (*LogEntry) ProtoMessage() {}
 
 func (x *LogEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[12]
+	mi := &file_api_proto_v1alpha1_capsule_service_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1028,7 +1115,7 @@ func (x *LogEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogEntry.ProtoReflect.Descriptor instead.
 func (*LogEntry) Descriptor() ([]byte, []int) {
-	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{12}
+	return file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *LogEntry) GetTimestamp() *timestamppb.Timestamp {
@@ -1060,7 +1147,7 @@ const file_api_proto_v1alpha1_capsule_service_proto_rawDesc = "" +
 	"\x0fCapsuleResource\x122\n" +
 	"\x04meta\x18\x01 \x01(\v2\x1e.falak.api.v1alpha1.ObjectMetaR\x04meta\x123\n" +
 	"\x04spec\x18\x02 \x01(\v2\x1f.falak.api.v1alpha1.CapsuleSpecR\x04spec\x129\n" +
-	"\x06status\x18\x03 \x01(\v2!.falak.api.v1alpha1.CapsuleStatusR\x06status\"\xa9\x04\n" +
+	"\x06status\x18\x03 \x01(\v2!.falak.api.v1alpha1.CapsuleStatusR\x06status\"\xe0\x04\n" +
 	"\vCapsuleSpec\x12\x14\n" +
 	"\x05image\x18\x01 \x01(\tR\x05image\x12!\n" +
 	"\fimage_digest\x18\x02 \x01(\tR\vimageDigest\x12\x14\n" +
@@ -1077,10 +1164,16 @@ const file_api_proto_v1alpha1_capsule_service_proto_rawDesc = "" +
 	"\x0ereplicas_exact\x18\f \x01(\x05R\rreplicasExact\x12:\n" +
 	"\x03env\x18\r \x03(\v2(.falak.api.v1alpha1.CapsuleSpec.EnvEntryR\x03env\x12\x18\n" +
 	"\acommand\x18\x0e \x03(\tR\acommand\x12!\n" +
-	"\fnetwork_mode\x18\x0f \x01(\tR\vnetworkMode\x1a6\n" +
+	"\fnetwork_mode\x18\x0f \x01(\tR\vnetworkMode\x125\n" +
+	"\x05ports\x18\x10 \x03(\v2\x1f.falak.api.v1alpha1.PortMappingR\x05ports\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"f\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"o\n" +
+	"\vPortMapping\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1c\n" +
+	"\tcontainer\x18\x02 \x01(\x05R\tcontainer\x12\x12\n" +
+	"\x04host\x18\x03 \x01(\x05R\x04host\x12\x1a\n" +
+	"\bprotocol\x18\x04 \x01(\tR\bprotocol\"f\n" +
 	"\rCapsuleStatus\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12=\n" +
 	"\breplicas\x18\x02 \x03(\v2!.falak.api.v1alpha1.ReplicaStatusR\breplicas\"\x9a\x01\n" +
@@ -1090,7 +1183,7 @@ const file_api_proto_v1alpha1_capsule_service_proto_rawDesc = "" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x16\n" +
 	"\x06status\x18\x03 \x01(\tR\x06status\x129\n" +
 	"\n" +
-	"started_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\"\xef\x06\n" +
+	"started_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\"\xa6\a\n" +
 	"\x14CreateCapsuleRequest\x12\x18\n" +
 	"\acluster\x18\x01 \x01(\tR\acluster\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
@@ -1113,7 +1206,8 @@ const file_api_proto_v1alpha1_capsule_service_proto_rawDesc = "" +
 	"\fimage_digest\x18\x12 \x01(\tR\vimageDigest\x12!\n" +
 	"\fregistry_url\x18\x13 \x01(\tR\vregistryUrl\x12+\n" +
 	"\x11registry_username\x18\x14 \x01(\tR\x10registryUsername\x12+\n" +
-	"\x11registry_password\x18\x15 \x01(\tR\x10registryPassword\x1a9\n" +
+	"\x11registry_password\x18\x15 \x01(\tR\x10registryPassword\x125\n" +
+	"\x05ports\x18\x16 \x03(\v2\x1f.falak.api.v1alpha1.PortMappingR\x05ports\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a6\n" +
@@ -1187,70 +1281,73 @@ func file_api_proto_v1alpha1_capsule_service_proto_rawDescGZIP() []byte {
 	return file_api_proto_v1alpha1_capsule_service_proto_rawDescData
 }
 
-var file_api_proto_v1alpha1_capsule_service_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_api_proto_v1alpha1_capsule_service_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_api_proto_v1alpha1_capsule_service_proto_goTypes = []any{
 	(*CapsuleResource)(nil),       // 0: falak.api.v1alpha1.CapsuleResource
 	(*CapsuleSpec)(nil),           // 1: falak.api.v1alpha1.CapsuleSpec
-	(*CapsuleStatus)(nil),         // 2: falak.api.v1alpha1.CapsuleStatus
-	(*ReplicaStatus)(nil),         // 3: falak.api.v1alpha1.ReplicaStatus
-	(*CreateCapsuleRequest)(nil),  // 4: falak.api.v1alpha1.CreateCapsuleRequest
-	(*GetCapsuleRequest)(nil),     // 5: falak.api.v1alpha1.GetCapsuleRequest
-	(*ListCapsulesRequest)(nil),   // 6: falak.api.v1alpha1.ListCapsulesRequest
-	(*ListCapsulesResponse)(nil),  // 7: falak.api.v1alpha1.ListCapsulesResponse
-	(*UpdateCapsuleRequest)(nil),  // 8: falak.api.v1alpha1.UpdateCapsuleRequest
-	(*DeleteCapsuleRequest)(nil),  // 9: falak.api.v1alpha1.DeleteCapsuleRequest
-	(*WatchCapsulesRequest)(nil),  // 10: falak.api.v1alpha1.WatchCapsulesRequest
-	(*LogsRequest)(nil),           // 11: falak.api.v1alpha1.LogsRequest
-	(*LogEntry)(nil),              // 12: falak.api.v1alpha1.LogEntry
-	nil,                           // 13: falak.api.v1alpha1.CapsuleSpec.EnvEntry
-	nil,                           // 14: falak.api.v1alpha1.CreateCapsuleRequest.LabelsEntry
-	nil,                           // 15: falak.api.v1alpha1.CreateCapsuleRequest.EnvEntry
-	nil,                           // 16: falak.api.v1alpha1.ListCapsulesRequest.LabelsEntry
-	nil,                           // 17: falak.api.v1alpha1.UpdateCapsuleRequest.EnvEntry
-	nil,                           // 18: falak.api.v1alpha1.WatchCapsulesRequest.LabelsEntry
-	(*ObjectMeta)(nil),            // 19: falak.api.v1alpha1.ObjectMeta
-	(*timestamppb.Timestamp)(nil), // 20: google.protobuf.Timestamp
-	(*Pagination)(nil),            // 21: falak.api.v1alpha1.Pagination
-	(*PagedResult)(nil),           // 22: falak.api.v1alpha1.PagedResult
-	(*emptypb.Empty)(nil),         // 23: google.protobuf.Empty
-	(*WatchEvent)(nil),            // 24: falak.api.v1alpha1.WatchEvent
+	(*PortMapping)(nil),           // 2: falak.api.v1alpha1.PortMapping
+	(*CapsuleStatus)(nil),         // 3: falak.api.v1alpha1.CapsuleStatus
+	(*ReplicaStatus)(nil),         // 4: falak.api.v1alpha1.ReplicaStatus
+	(*CreateCapsuleRequest)(nil),  // 5: falak.api.v1alpha1.CreateCapsuleRequest
+	(*GetCapsuleRequest)(nil),     // 6: falak.api.v1alpha1.GetCapsuleRequest
+	(*ListCapsulesRequest)(nil),   // 7: falak.api.v1alpha1.ListCapsulesRequest
+	(*ListCapsulesResponse)(nil),  // 8: falak.api.v1alpha1.ListCapsulesResponse
+	(*UpdateCapsuleRequest)(nil),  // 9: falak.api.v1alpha1.UpdateCapsuleRequest
+	(*DeleteCapsuleRequest)(nil),  // 10: falak.api.v1alpha1.DeleteCapsuleRequest
+	(*WatchCapsulesRequest)(nil),  // 11: falak.api.v1alpha1.WatchCapsulesRequest
+	(*LogsRequest)(nil),           // 12: falak.api.v1alpha1.LogsRequest
+	(*LogEntry)(nil),              // 13: falak.api.v1alpha1.LogEntry
+	nil,                           // 14: falak.api.v1alpha1.CapsuleSpec.EnvEntry
+	nil,                           // 15: falak.api.v1alpha1.CreateCapsuleRequest.LabelsEntry
+	nil,                           // 16: falak.api.v1alpha1.CreateCapsuleRequest.EnvEntry
+	nil,                           // 17: falak.api.v1alpha1.ListCapsulesRequest.LabelsEntry
+	nil,                           // 18: falak.api.v1alpha1.UpdateCapsuleRequest.EnvEntry
+	nil,                           // 19: falak.api.v1alpha1.WatchCapsulesRequest.LabelsEntry
+	(*ObjectMeta)(nil),            // 20: falak.api.v1alpha1.ObjectMeta
+	(*timestamppb.Timestamp)(nil), // 21: google.protobuf.Timestamp
+	(*Pagination)(nil),            // 22: falak.api.v1alpha1.Pagination
+	(*PagedResult)(nil),           // 23: falak.api.v1alpha1.PagedResult
+	(*emptypb.Empty)(nil),         // 24: google.protobuf.Empty
+	(*WatchEvent)(nil),            // 25: falak.api.v1alpha1.WatchEvent
 }
 var file_api_proto_v1alpha1_capsule_service_proto_depIdxs = []int32{
-	19, // 0: falak.api.v1alpha1.CapsuleResource.meta:type_name -> falak.api.v1alpha1.ObjectMeta
+	20, // 0: falak.api.v1alpha1.CapsuleResource.meta:type_name -> falak.api.v1alpha1.ObjectMeta
 	1,  // 1: falak.api.v1alpha1.CapsuleResource.spec:type_name -> falak.api.v1alpha1.CapsuleSpec
-	2,  // 2: falak.api.v1alpha1.CapsuleResource.status:type_name -> falak.api.v1alpha1.CapsuleStatus
-	13, // 3: falak.api.v1alpha1.CapsuleSpec.env:type_name -> falak.api.v1alpha1.CapsuleSpec.EnvEntry
-	3,  // 4: falak.api.v1alpha1.CapsuleStatus.replicas:type_name -> falak.api.v1alpha1.ReplicaStatus
-	20, // 5: falak.api.v1alpha1.ReplicaStatus.started_at:type_name -> google.protobuf.Timestamp
-	14, // 6: falak.api.v1alpha1.CreateCapsuleRequest.labels:type_name -> falak.api.v1alpha1.CreateCapsuleRequest.LabelsEntry
-	15, // 7: falak.api.v1alpha1.CreateCapsuleRequest.env:type_name -> falak.api.v1alpha1.CreateCapsuleRequest.EnvEntry
-	16, // 8: falak.api.v1alpha1.ListCapsulesRequest.labels:type_name -> falak.api.v1alpha1.ListCapsulesRequest.LabelsEntry
-	21, // 9: falak.api.v1alpha1.ListCapsulesRequest.pagination:type_name -> falak.api.v1alpha1.Pagination
-	0,  // 10: falak.api.v1alpha1.ListCapsulesResponse.capsules:type_name -> falak.api.v1alpha1.CapsuleResource
-	22, // 11: falak.api.v1alpha1.ListCapsulesResponse.paging:type_name -> falak.api.v1alpha1.PagedResult
-	17, // 12: falak.api.v1alpha1.UpdateCapsuleRequest.env:type_name -> falak.api.v1alpha1.UpdateCapsuleRequest.EnvEntry
-	18, // 13: falak.api.v1alpha1.WatchCapsulesRequest.labels:type_name -> falak.api.v1alpha1.WatchCapsulesRequest.LabelsEntry
-	20, // 14: falak.api.v1alpha1.LogsRequest.since:type_name -> google.protobuf.Timestamp
-	20, // 15: falak.api.v1alpha1.LogEntry.timestamp:type_name -> google.protobuf.Timestamp
-	4,  // 16: falak.api.v1alpha1.CapsuleService.Create:input_type -> falak.api.v1alpha1.CreateCapsuleRequest
-	5,  // 17: falak.api.v1alpha1.CapsuleService.Get:input_type -> falak.api.v1alpha1.GetCapsuleRequest
-	6,  // 18: falak.api.v1alpha1.CapsuleService.List:input_type -> falak.api.v1alpha1.ListCapsulesRequest
-	8,  // 19: falak.api.v1alpha1.CapsuleService.Update:input_type -> falak.api.v1alpha1.UpdateCapsuleRequest
-	9,  // 20: falak.api.v1alpha1.CapsuleService.Delete:input_type -> falak.api.v1alpha1.DeleteCapsuleRequest
-	10, // 21: falak.api.v1alpha1.CapsuleService.Watch:input_type -> falak.api.v1alpha1.WatchCapsulesRequest
-	11, // 22: falak.api.v1alpha1.CapsuleService.Logs:input_type -> falak.api.v1alpha1.LogsRequest
-	0,  // 23: falak.api.v1alpha1.CapsuleService.Create:output_type -> falak.api.v1alpha1.CapsuleResource
-	0,  // 24: falak.api.v1alpha1.CapsuleService.Get:output_type -> falak.api.v1alpha1.CapsuleResource
-	7,  // 25: falak.api.v1alpha1.CapsuleService.List:output_type -> falak.api.v1alpha1.ListCapsulesResponse
-	0,  // 26: falak.api.v1alpha1.CapsuleService.Update:output_type -> falak.api.v1alpha1.CapsuleResource
-	23, // 27: falak.api.v1alpha1.CapsuleService.Delete:output_type -> google.protobuf.Empty
-	24, // 28: falak.api.v1alpha1.CapsuleService.Watch:output_type -> falak.api.v1alpha1.WatchEvent
-	12, // 29: falak.api.v1alpha1.CapsuleService.Logs:output_type -> falak.api.v1alpha1.LogEntry
-	23, // [23:30] is the sub-list for method output_type
-	16, // [16:23] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	3,  // 2: falak.api.v1alpha1.CapsuleResource.status:type_name -> falak.api.v1alpha1.CapsuleStatus
+	14, // 3: falak.api.v1alpha1.CapsuleSpec.env:type_name -> falak.api.v1alpha1.CapsuleSpec.EnvEntry
+	2,  // 4: falak.api.v1alpha1.CapsuleSpec.ports:type_name -> falak.api.v1alpha1.PortMapping
+	4,  // 5: falak.api.v1alpha1.CapsuleStatus.replicas:type_name -> falak.api.v1alpha1.ReplicaStatus
+	21, // 6: falak.api.v1alpha1.ReplicaStatus.started_at:type_name -> google.protobuf.Timestamp
+	15, // 7: falak.api.v1alpha1.CreateCapsuleRequest.labels:type_name -> falak.api.v1alpha1.CreateCapsuleRequest.LabelsEntry
+	16, // 8: falak.api.v1alpha1.CreateCapsuleRequest.env:type_name -> falak.api.v1alpha1.CreateCapsuleRequest.EnvEntry
+	2,  // 9: falak.api.v1alpha1.CreateCapsuleRequest.ports:type_name -> falak.api.v1alpha1.PortMapping
+	17, // 10: falak.api.v1alpha1.ListCapsulesRequest.labels:type_name -> falak.api.v1alpha1.ListCapsulesRequest.LabelsEntry
+	22, // 11: falak.api.v1alpha1.ListCapsulesRequest.pagination:type_name -> falak.api.v1alpha1.Pagination
+	0,  // 12: falak.api.v1alpha1.ListCapsulesResponse.capsules:type_name -> falak.api.v1alpha1.CapsuleResource
+	23, // 13: falak.api.v1alpha1.ListCapsulesResponse.paging:type_name -> falak.api.v1alpha1.PagedResult
+	18, // 14: falak.api.v1alpha1.UpdateCapsuleRequest.env:type_name -> falak.api.v1alpha1.UpdateCapsuleRequest.EnvEntry
+	19, // 15: falak.api.v1alpha1.WatchCapsulesRequest.labels:type_name -> falak.api.v1alpha1.WatchCapsulesRequest.LabelsEntry
+	21, // 16: falak.api.v1alpha1.LogsRequest.since:type_name -> google.protobuf.Timestamp
+	21, // 17: falak.api.v1alpha1.LogEntry.timestamp:type_name -> google.protobuf.Timestamp
+	5,  // 18: falak.api.v1alpha1.CapsuleService.Create:input_type -> falak.api.v1alpha1.CreateCapsuleRequest
+	6,  // 19: falak.api.v1alpha1.CapsuleService.Get:input_type -> falak.api.v1alpha1.GetCapsuleRequest
+	7,  // 20: falak.api.v1alpha1.CapsuleService.List:input_type -> falak.api.v1alpha1.ListCapsulesRequest
+	9,  // 21: falak.api.v1alpha1.CapsuleService.Update:input_type -> falak.api.v1alpha1.UpdateCapsuleRequest
+	10, // 22: falak.api.v1alpha1.CapsuleService.Delete:input_type -> falak.api.v1alpha1.DeleteCapsuleRequest
+	11, // 23: falak.api.v1alpha1.CapsuleService.Watch:input_type -> falak.api.v1alpha1.WatchCapsulesRequest
+	12, // 24: falak.api.v1alpha1.CapsuleService.Logs:input_type -> falak.api.v1alpha1.LogsRequest
+	0,  // 25: falak.api.v1alpha1.CapsuleService.Create:output_type -> falak.api.v1alpha1.CapsuleResource
+	0,  // 26: falak.api.v1alpha1.CapsuleService.Get:output_type -> falak.api.v1alpha1.CapsuleResource
+	8,  // 27: falak.api.v1alpha1.CapsuleService.List:output_type -> falak.api.v1alpha1.ListCapsulesResponse
+	0,  // 28: falak.api.v1alpha1.CapsuleService.Update:output_type -> falak.api.v1alpha1.CapsuleResource
+	24, // 29: falak.api.v1alpha1.CapsuleService.Delete:output_type -> google.protobuf.Empty
+	25, // 30: falak.api.v1alpha1.CapsuleService.Watch:output_type -> falak.api.v1alpha1.WatchEvent
+	13, // 31: falak.api.v1alpha1.CapsuleService.Logs:output_type -> falak.api.v1alpha1.LogEntry
+	25, // [25:32] is the sub-list for method output_type
+	18, // [18:25] is the sub-list for method input_type
+	18, // [18:18] is the sub-list for extension type_name
+	18, // [18:18] is the sub-list for extension extendee
+	0,  // [0:18] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_v1alpha1_capsule_service_proto_init() }
@@ -1265,7 +1362,7 @@ func file_api_proto_v1alpha1_capsule_service_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_v1alpha1_capsule_service_proto_rawDesc), len(file_api_proto_v1alpha1_capsule_service_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   19,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

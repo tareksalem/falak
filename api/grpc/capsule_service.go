@@ -41,11 +41,49 @@ func (s *capsuleService) Create(ctx context.Context, req *pb.CreateCapsuleReques
 		RegistryURL:      req.RegistryUrl,
 		RegistryUsername:  req.RegistryUsername,
 		RegistryPassword:  req.RegistryPassword,
+		Ports:            portsFromProto(req.Ports),
 	})
 	if err != nil {
 		return nil, core.ToGRPCError(err)
 	}
 	return capsuleToProto(result), nil
+}
+
+// portsFromProto lowers proto PortMapping list into the core form.
+func portsFromProto(in []*pb.PortMapping) []core.PortMapping {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]core.PortMapping, 0, len(in))
+	for _, p := range in {
+		if p == nil {
+			continue
+		}
+		out = append(out, core.PortMapping{
+			Name:      p.Name,
+			Container: p.Container,
+			Host:      p.Host,
+			Protocol:  p.Protocol,
+		})
+	}
+	return out
+}
+
+// portsToProto raises the core form back into the proto type.
+func portsToProto(in []core.PortMapping) []*pb.PortMapping {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*pb.PortMapping, 0, len(in))
+	for _, p := range in {
+		out = append(out, &pb.PortMapping{
+			Name:      p.Name,
+			Container: p.Container,
+			Host:      p.Host,
+			Protocol:  p.Protocol,
+		})
+	}
+	return out
 }
 
 func (s *capsuleService) Get(ctx context.Context, req *pb.GetCapsuleRequest) (*pb.CapsuleResource, error) {
@@ -164,6 +202,7 @@ func capsuleToProto(c *core.CapsuleResource) *pb.CapsuleResource {
 			Env:          c.Spec.Env,
 			Command:      c.Spec.Command,
 			NetworkMode:  c.Spec.NetworkMode,
+			Ports:        portsToProto(c.Spec.Ports),
 		},
 		Status: &pb.CapsuleStatus{
 			Status: c.Status.Status,

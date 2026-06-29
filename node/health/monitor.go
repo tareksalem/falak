@@ -24,10 +24,16 @@ import (
 
 // Default timing configuration. All overridable via functional options.
 const (
-	DefaultProtocolPeriod         = 2 * time.Second
+	DefaultProtocolPeriod          = 2 * time.Second
 	DefaultQuarantineCheckInterval = 5 * time.Second
 	DefaultQuarantineProbeInterval = 10 * time.Second
-	DefaultMaxResponders          = 2
+	DefaultMaxResponders           = 2
+	// DefaultPendingAuthGrace is how long a freshly-announced peer
+	// stays in PendingAuth before SWIM auto-promotes it to Active.
+	// 10s comfortably covers the typical 5-15s gossipsub mesh-formation
+	// window without leaving a real failure undetected for long
+	// (Bug #13).
+	DefaultPendingAuthGrace = 10 * time.Second
 )
 
 // SessionRefresher is called when a successful probe occurs to refresh
@@ -58,6 +64,7 @@ type Monitor struct {
 	quarantineCheckInterval time.Duration
 	quarantineProbeInterval time.Duration
 	maxResponders           int
+	pendingAuthGrace        time.Duration
 
 	// Configurable score parameters
 	scoreConfig ScoreConfig
@@ -143,6 +150,14 @@ func WithMaxResponders(n int) Option {
 	return func(m *Monitor) { m.maxResponders = n }
 }
 
+// WithPendingAuthGrace sets the duration a freshly-announced peer stays in
+// the PendingAuth status before SWIM auto-promotes it to Active. Probes
+// against PendingAuth peers are skipped during the grace window so the
+// gossipsub mesh has time to form (Bug #13). Zero disables the skip.
+func WithPendingAuthGrace(d time.Duration) Option {
+	return func(m *Monitor) { m.pendingAuthGrace = d }
+}
+
 // WithScoreIncrement sets the score added per failed probe.
 func WithScoreIncrement(v float64) Option {
 	return func(m *Monitor) { m.scoreConfig.ScoreIncrement = v }
@@ -204,6 +219,7 @@ func NewMonitor(opts ...Option) *Monitor {
 		quarantineCheckInterval: DefaultQuarantineCheckInterval,
 		quarantineProbeInterval: DefaultQuarantineProbeInterval,
 		maxResponders:           DefaultMaxResponders,
+		pendingAuthGrace:        DefaultPendingAuthGrace,
 		scoreConfig:             DefaultScoreConfig(),
 		pubsubConfig:            DefaultHealthPubSubConfig(),
 	}
@@ -283,6 +299,25 @@ func (m *Monitor) Start() error {
 		m.quarantineProbeLoop()
 	}()
 
+	// Subscribe to local NodeDeparting events and broadcast them to
+	// the health pubsub so peers can evict us instantly instead of
+	// waiting for SWIM detection (~16-30s).
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.departureBroadcastLoop()
+	}()
+
+	// Subscribe to local NodeProbeResult events and persist them on the
+	// phonebook entry so operators can inspect "last probe time" + "last
+	// probe success" via `falak node health`. Without this the per-probe
+	// telemetry is published into the void — see BUGS.md #22.
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.probeResultPersistLoop()
+	}()
+
 	m.logger.Info("health monitor started",
 		zap.String("cluster", m.clusterPath),
 		zap.Duration("period", m.protocolPeriod),
@@ -338,10 +373,47 @@ func (m *Monitor) runProtocolPeriod() {
 	// Ensure libp2p peerstore has the target's addresses so we can dial
 	m.addPeerAddresses(targetID, target.Addresses)
 
-	success := m.pingHandler.Ping(m.ctx, targetID)
+	success, err := m.pingHandler.PingWithError(m.ctx, targetID)
 
 	if success {
+		// Per-probe Debug log so operators can answer "is SWIM actually
+		// probing this peer?" without inferring from the event bus
+		// (Bug #21). Score 0 is the steady state — only deviations are
+		// interesting in aggregate, but a per-probe trace at Debug is
+		// cheap and uniquely diagnostic.
+		m.logger.Debug("probe ok",
+			zap.String("target", target.NodeID),
+			zap.String("cluster", m.clusterPath),
+			zap.Float64("score", target.ReliabilityScore))
 		m.onProbeSuccess(target.NodeID)
+		return
+	}
+
+	// Ghost-entry shortcut: libp2p reports "dial to self" when the
+	// target peer's multiaddrs collide with our own listen addresses.
+	// That can only happen when a phonebook entry survived a prior
+	// node identity at the same host:port. Treat it as eviction, not
+	// a probe failure — otherwise SWIM would walk the ghost through
+	// suspect→quarantine→fail and skew cluster-size thresholds the
+	// whole time.
+	// Mirror probe-ok with a probe-fail Debug so the trace shows both
+	// sides of "is SWIM working here?" before the score machinery kicks
+	// in (which only logs once a threshold is crossed).
+	m.logger.Debug("probe failed",
+		zap.String("target", target.NodeID),
+		zap.String("cluster", m.clusterPath),
+		zap.Float64("score", target.ReliabilityScore),
+		zap.Error(err))
+
+	if IsDialToSelfError(err) {
+		m.logger.Info("evicting phonebook ghost (multiaddrs collide with local host)",
+			zap.String("nodeId", target.NodeID),
+			zap.String("cluster", m.clusterPath))
+		if rmErr := m.phonebook.Remove(target.NodeID, m.clusterPath); rmErr != nil {
+			m.logger.Warn("failed to evict phonebook ghost",
+				zap.String("nodeId", target.NodeID),
+				zap.Error(rmErr))
+		}
 		return
 	}
 
@@ -364,8 +436,33 @@ func (m *Monitor) selectRandomActivePeer() *phonebook.Entry {
 		if p.NodeID == selfID {
 			continue
 		}
-		if p.Status == phonebook.NodeStatusEnum.Quarantined() || p.Status == phonebook.NodeStatusEnum.Failed() {
+		if p.Status == phonebook.NodeStatusEnum.Quarantined() ||
+			p.Status == phonebook.NodeStatusEnum.Failed() ||
+			p.Status == phonebook.NodeStatusEnum.Departed() {
+			// Departed peers said goodbye voluntarily — don't pester
+			// them with probes. The libp2p Notifiee reactivates them
+			// on reconnect.
 			continue
+		}
+		if p.Status == phonebook.NodeStatusEnum.PendingAuth() {
+			// Skip probes while the auth handshake / gossipsub mesh is
+			// still settling (Bug #13). Auto-promote to Active once the
+			// grace window elapses so a stuck PendingAuth marker doesn't
+			// leave a peer permanently un-probed.
+			if m.pendingAuthGrace > 0 && time.Since(p.UpdatedAt) < m.pendingAuthGrace {
+				continue
+			}
+			if err := m.phonebook.SetStatus(p.NodeID, m.clusterPath, phonebook.NodeStatusEnum.Active()); err != nil {
+				m.logger.Debug("failed to auto-promote pending-auth peer",
+					zap.String("peer", p.NodeID),
+					zap.Error(err))
+				continue
+			}
+			m.logger.Debug("pending-auth grace elapsed, promoting to active",
+				zap.String("peer", p.NodeID),
+				zap.String("cluster", m.clusterPath),
+				zap.Duration("waited", time.Since(p.UpdatedAt)))
+			p.Status = phonebook.NodeStatusEnum.Active()
 		}
 		candidates = append(candidates, p)
 	}
@@ -434,13 +531,109 @@ func (m *Monitor) onDirectPingFail(nodeID string) {
 
 // --- PubSub Message Handlers ---
 
+// ReasonNodeDeparting is the ScoreUpdate.Reason marker that signals an
+// intentional graceful shutdown rather than a probe failure. Peers
+// receiving this should evict the sender immediately instead of running
+// the SWIM score machinery.
+const ReasonNodeDeparting = "node_departing"
+
 // onScoreUpdate handles ScoreUpdate from PubSub (SET semantics, alive always wins).
 func (m *Monitor) onScoreUpdate(update *healthpb.ScoreUpdate) {
+	// Graceful-shutdown shortcut: when a peer broadcasts its own
+	// departure, mark the entry as Departed instead of removing it
+	// (Bug #24). Keeping the row preserves the public key + cert so
+	// that when the peer restarts with the same identity its signed
+	// pubsub messages still verify and sync requests are accepted.
+	// SWIM does not probe Departed peers; the next successful probe
+	// (or sync handshake) reactivates the entry.
+	if update.Reason == ReasonNodeDeparting && !update.Alive {
+		m.logger.Info("peer announced graceful departure",
+			zap.String("peer", update.TargetNodeId),
+			zap.String("cluster", m.clusterPath))
+		if err := m.phonebook.SetStatus(update.TargetNodeId, m.clusterPath, phonebook.NodeStatusEnum.Departed()); err != nil {
+			m.logger.Warn("failed to mark departing peer in phonebook",
+				zap.String("peer", update.TargetNodeId),
+				zap.Error(err))
+		}
+		return
+	}
+
 	m.scores.SetScore(update.TargetNodeId, update.Score, update.Alive, update.Reason)
 
 	// If alive, refresh our session too (cluster is active)
 	if update.Alive && m.sessionRefresher != nil {
 		m.sessionRefresher(m.clusterPath)
+	}
+}
+
+// probeResultPersistLoop subscribes to NodeProbeResult events and
+// records each one on the phonebook (LastProbeTime, LastProbeSuccess).
+// Closes Bug #22 — the event was previously published with no consumers
+// outside tests. Powers `falak node health`'s live SWIM display.
+func (m *Monitor) probeResultPersistLoop() {
+	ch := m.eventBus.Subscribe(events.TypeNodeProbeResult)
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			result, ok := ev.(events.NodeProbeResult)
+			if !ok {
+				continue
+			}
+			// Only persist results for our own cluster (the monitor
+			// runs per-cluster so the event could in principle come
+			// from a sibling monitor).
+			if result.ClusterPath != m.clusterPath {
+				continue
+			}
+			if err := m.phonebook.RecordProbe(result.NodeID, m.clusterPath, result.Success); err != nil {
+				m.logger.Debug("failed to record probe result on phonebook",
+					zap.String("peer", result.NodeID),
+					zap.Bool("success", result.Success),
+					zap.Error(err))
+			}
+		}
+	}
+}
+
+// departureBroadcastLoop subscribes to local NodeDeparting events and
+// publishes a corresponding health pubsub message so peers learn of the
+// graceful shutdown in ~1 gossip round instead of via SWIM probe misses.
+func (m *Monitor) departureBroadcastLoop() {
+	ch := m.eventBus.Subscribe(events.TypeNodeDeparting)
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			dep, ok := ev.(events.NodeDeparting)
+			if !ok {
+				continue
+			}
+			update := &healthpb.ScoreUpdate{
+				TargetNodeId: dep.NodeID,
+				Score:        0,
+				Alive:        false,
+				UpdatedBy:    m.host.ID().String(),
+				Timestamp:    timestamppb.Now(),
+				Reason:       ReasonNodeDeparting,
+			}
+			if err := m.healthPS.PublishScoreUpdate(m.ctx, update); err != nil {
+				m.logger.Warn("failed to broadcast departure",
+					zap.String("cluster", m.clusterPath),
+					zap.Error(err))
+				continue
+			}
+			m.logger.Info("broadcast graceful departure",
+				zap.String("cluster", m.clusterPath))
+		}
 	}
 }
 

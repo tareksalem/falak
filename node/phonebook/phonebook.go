@@ -13,6 +13,21 @@ const (
 	nodeStatusSuspected   NodeStatus = "suspected"
 	nodeStatusQuarantined NodeStatus = "quarantined"
 	nodeStatusFailed      NodeStatus = "failed"
+	// nodeStatusDeparted marks a peer that left gracefully (via Drain).
+	// We keep the row — public key, cert, addresses — so when the peer
+	// restarts with the same identity its signed pubsub messages still
+	// verify and the cluster picks it up transparently. SWIM does not
+	// probe Departed peers; the next successful probe (or the next
+	// libp2p reconnect) flips them back to Active.
+	nodeStatusDeparted NodeStatus = "departed"
+	// nodeStatusPendingAuth marks a freshly-added member that has been
+	// announced (Step 2 NewMemberAnnounced) but whose auth handshake or
+	// libp2p mesh is still settling. SWIM skips these peers so we don't
+	// burn score on a peer that the ping protocol can't reach yet
+	// (Bug #13). The monitor auto-promotes the entry to Active after the
+	// configurable PendingAuthGrace window, OR sooner when the
+	// authenticator finishes its handshake.
+	nodeStatusPendingAuth NodeStatus = "pending_auth"
 )
 
 type nodeStatusEnum struct{}
@@ -20,16 +35,23 @@ type nodeStatusEnum struct{}
 // NodeStatusEnum provides access to NodeStatus values.
 var NodeStatusEnum nodeStatusEnum
 
-func (nodeStatusEnum) Active() NodeStatus      { return nodeStatusActive }
-func (nodeStatusEnum) Suspected() NodeStatus   { return nodeStatusSuspected }
-func (nodeStatusEnum) Quarantined() NodeStatus { return nodeStatusQuarantined }
-func (nodeStatusEnum) Failed() NodeStatus      { return nodeStatusFailed }
+func (nodeStatusEnum) Active() NodeStatus       { return nodeStatusActive }
+func (nodeStatusEnum) Suspected() NodeStatus    { return nodeStatusSuspected }
+func (nodeStatusEnum) Quarantined() NodeStatus  { return nodeStatusQuarantined }
+func (nodeStatusEnum) Failed() NodeStatus       { return nodeStatusFailed }
+func (nodeStatusEnum) Departed() NodeStatus     { return nodeStatusDeparted }
+func (nodeStatusEnum) PendingAuth() NodeStatus  { return nodeStatusPendingAuth }
 
 // Entry represents a known peer in a specific cluster.
 type Entry struct {
 	// Composite key
 	NodeID      string `json:"node_id"`
 	ClusterPath string `json:"cluster_path"`
+
+	// Friendly operator-assigned name (e.g. "node1"). Travels in
+	// JoinRequest.Capabilities.Metadata[node_name]. May be empty for
+	// nodes that never published a name (older agents).
+	Name string `json:"name,omitempty"`
 
 	// Identity
 	PublicKey []byte `json:"public_key"`

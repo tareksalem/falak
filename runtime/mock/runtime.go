@@ -12,6 +12,11 @@ import (
 	"github.com/tareksalem/falak/runtime"
 )
 
+// eventBufferSize bounds the per-stream buffer for emitted container
+// events. Tests emit a handful of events synchronously, so a modest
+// buffer keeps EmitContainerEvent non-blocking without unbounded growth.
+const eventBufferSize = 64
+
 // container is the in-memory state of a mock container.
 type container struct {
 	id          string
@@ -40,13 +45,27 @@ type Runtime struct {
 	checkpointErr  error
 	restoreErr     error
 	removeErr      error
+	inspectErrByID map[string]error
 
-	// Events records every method call for assertion in tests.
-	Events []Event
+	// Calls records every method call for assertion in tests.
+	Calls []Call
+
+	// eventSubs holds the live channels returned by Events. Each is fed
+	// by EmitContainerEvent and closed when its context is cancelled.
+	eventSubs []*eventSub
 }
 
-// Event records a method invocation on the mock runtime.
-type Event struct {
+// eventSub is one active Events subscription. closed guards against a
+// send-on-closed-channel race when the subscription's context is
+// cancelled concurrently with an EmitContainerEvent fan-out.
+type eventSub struct {
+	ch     chan runtime.ContainerEvent
+	ctx    context.Context
+	closed bool
+}
+
+// Call records a method invocation on the mock runtime.
+type Call struct {
 	Method string
 	ID     string
 	Image  string
@@ -113,7 +132,7 @@ func New(opts ...Option) *Runtime {
 }
 
 func (r *Runtime) record(method, id, image, path string) {
-	r.Events = append(r.Events, Event{
+	r.Calls = append(r.Calls, Call{
 		Method: method,
 		ID:     id,
 		Image:  image,
@@ -298,9 +317,15 @@ func (r *Runtime) Inspect(_ context.Context, id string) (runtime.ContainerInfo, 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.record("Inspect", id, "", "")
+	// Injected transient error takes precedence over the not-found check
+	// so tests can exercise the runtime-unreachable escalation path while
+	// the container is still tracked.
+	if err, ok := r.inspectErrByID[id]; ok && err != nil {
+		return runtime.ContainerInfo{}, err
+	}
 	c, ok := r.containers[id]
 	if !ok {
-		return runtime.ContainerInfo{}, fmt.Errorf("mock: container %s not found", id)
+		return runtime.ContainerInfo{}, fmt.Errorf("mock: inspect %s: %w", id, runtime.ErrContainerNotFound)
 	}
 	return runtime.ContainerInfo{
 		ID:        c.id,
@@ -312,7 +337,79 @@ func (r *Runtime) Inspect(_ context.Context, id string) (runtime.ContainerInfo, 
 	}, nil
 }
 
+// Events returns a channel fed by EmitContainerEvent. The channel is
+// buffered and closed when ctx is cancelled, mirroring the production
+// backends' contract. Multiple concurrent subscriptions are supported;
+// EmitContainerEvent fans out to all of them.
+func (r *Runtime) Events(ctx context.Context) (<-chan runtime.ContainerEvent, error) {
+	sub := &eventSub{ch: make(chan runtime.ContainerEvent, eventBufferSize), ctx: ctx}
+	r.mu.Lock()
+	r.eventSubs = append(r.eventSubs, sub)
+	r.mu.Unlock()
+
+	go func() {
+		<-ctx.Done()
+		// Mark closed and close the channel under the lock so a
+		// concurrent EmitContainerEvent never sends on a closed channel.
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for i, s := range r.eventSubs {
+			if s == sub {
+				r.eventSubs = append(r.eventSubs[:i], r.eventSubs[i+1:]...)
+				break
+			}
+		}
+		if !sub.closed {
+			sub.closed = true
+			close(sub.ch)
+		}
+	}()
+
+	return sub.ch, nil
+}
+
 // --- Test helpers --------------------------------------------------------
+
+// EmitContainerEvent fans the given event out to every live Events
+// subscription. Deterministic and instant: tests use it to drive the
+// handler's event consumer without a real clock. Events for closed
+// (context-cancelled) subscriptions are dropped.
+func (r *Runtime) EmitContainerEvent(evt runtime.ContainerEvent) {
+	// Hold the lock across the send so a subscription cannot be closed
+	// (close happens under the same lock) between the closed-check and
+	// the send. The channel is buffered, so a non-blocking send keeps
+	// this from stalling under the lock; if the buffer is full the event
+	// is dropped (mirrors a best-effort backend stream).
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, sub := range r.eventSubs {
+		if sub.closed {
+			continue
+		}
+		select {
+		case <-sub.ctx.Done():
+		case sub.ch <- evt:
+		default:
+		}
+	}
+}
+
+// SetInspectError registers (or clears, via nil err) an error returned by
+// Inspect for the given id. The injected error is returned ahead of the
+// not-found check, so it must be a non-sentinel (transient) error to
+// exercise the runtime-unreachable escalation path.
+func (r *Runtime) SetInspectError(id string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inspectErrByID == nil {
+		r.inspectErrByID = make(map[string]error)
+	}
+	if err == nil {
+		delete(r.inspectErrByID, id)
+		return
+	}
+	r.inspectErrByID[id] = err
+}
 
 // ContainerCount returns the number of tracked containers.
 func (r *Runtime) ContainerCount() int {

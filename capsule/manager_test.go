@@ -2,6 +2,7 @@ package capsule
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -135,6 +136,61 @@ func TestManager_MarkGroupRunning(t *testing.T) {
 	}
 }
 
+// TestMarkNodeFailed verifies the crash-downgrade convenience wrapper (O6):
+// a capsule driven all the way to Running transitions back to Announced via
+// TriggerNodeFailed, so a fresh election round can re-place it. From a
+// non-Running state the call is rejected and leaves the state unchanged.
+func TestMarkNodeFailed(t *testing.T) {
+	mgr := NewManager()
+	c, err := mgr.Create(context.Background(), "test/dc1/cluster", CapsuleSpec{
+		Name: "downgrade-me", Image: "img", Orbit: "api",
+	})
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Create auto-announces; from a non-Running state MarkNodeFailed must be
+	// rejected and leave the state untouched.
+	if got, _ := mgr.Status(c.ID); got != enums.CapsuleStatusEnum.Announced() {
+		t.Fatalf("setup: expected Announced, got %s", got)
+	}
+	if err := mgr.MarkNodeFailed(c.ID); err == nil {
+		t.Error("MarkNodeFailed from Announced should be rejected")
+	}
+	if got, _ := mgr.Status(c.ID); got != enums.CapsuleStatusEnum.Announced() {
+		t.Errorf("state should be unchanged after rejected downgrade, got %s", got)
+	}
+
+	// Drive the full forward chain to Running.
+	if err := mgr.StartElection(c.ID); err != nil {
+		t.Fatalf("StartElection failed: %v", err)
+	}
+	if err := mgr.WinElection(c.ID); err != nil {
+		t.Fatalf("WinElection failed: %v", err)
+	}
+	if err := mgr.StartExecution(c.ID); err != nil {
+		t.Fatalf("StartExecution failed: %v", err)
+	}
+	if err := mgr.MarkRunning(c.ID); err != nil {
+		t.Fatalf("MarkRunning failed: %v", err)
+	}
+	if got, _ := mgr.Status(c.ID); got != enums.CapsuleStatusEnum.Running() {
+		t.Fatalf("setup: expected Running, got %s", got)
+	}
+
+	// The downgrade: Running → Announced.
+	if err := mgr.MarkNodeFailed(c.ID); err != nil {
+		t.Fatalf("MarkNodeFailed from Running failed: %v", err)
+	}
+	if got, _ := mgr.Status(c.ID); got != enums.CapsuleStatusEnum.Announced() {
+		t.Errorf("expected Announced after MarkNodeFailed, got %s", got)
+	}
+	// Persisted status must match the FSM.
+	if stored := mgr.Get(c.ID); stored.Status != enums.CapsuleStatusEnum.Announced() {
+		t.Errorf("store status mismatch: got %s, want Announced", stored.Status)
+	}
+}
+
 // TestManager_Fire_GroupAllowsAnnounceAndStop walks a group through the
 // triggers it IS allowed to fire: Announce, MembersAdmitted, StopRequested,
 // ContainerStopped. None of these are on the group-rejection list.
@@ -201,5 +257,38 @@ func TestManager_Create_RejectsGroupKind(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "CreateGroup") {
 		t.Errorf("error should point at CreateGroup, got %q", err.Error())
+	}
+}
+
+func TestManager_Create_RejectsDuplicateNameInCluster(t *testing.T) {
+	mgr := NewManager()
+	spec := CapsuleSpec{Name: "api", Image: "nginx:alpine", Orbit: "default"}
+
+	if _, err := mgr.Create(context.Background(), "test/dc1/prod", spec); err != nil {
+		t.Fatalf("first Create failed unexpectedly: %v", err)
+	}
+
+	// Second create with the same name + cluster must reject with the
+	// typed sentinel so the API layer can map it to gRPC AlreadyExists.
+	_, err := mgr.Create(context.Background(), "test/dc1/prod", spec)
+	if err == nil {
+		t.Fatal("expected duplicate-name create to fail")
+	}
+	if !errors.Is(err, ErrCapsuleNameConflict) {
+		t.Errorf("expected ErrCapsuleNameConflict, got %T %v", err, err)
+	}
+}
+
+func TestManager_Create_DuplicateNameAcrossClustersAllowed(t *testing.T) {
+	mgr := NewManager()
+	spec := CapsuleSpec{Name: "api", Image: "nginx:alpine", Orbit: "default"}
+
+	// Same name "api" is allowed in two different clusters — name
+	// uniqueness is cluster-scoped, not global.
+	if _, err := mgr.Create(context.Background(), "prod/dc1", spec); err != nil {
+		t.Fatalf("first Create failed: %v", err)
+	}
+	if _, err := mgr.Create(context.Background(), "staging/dc1", spec); err != nil {
+		t.Fatalf("Create in second cluster should be allowed, got: %v", err)
 	}
 }

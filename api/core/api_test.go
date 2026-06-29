@@ -24,6 +24,7 @@ func (s *stubNode) NodeID() string            { return "test-node-id" }
 func (s *stubNode) NodeName() string           { return "test-node" }
 func (s *stubNode) ListenAddrs() []string      { return []string{"/ip4/127.0.0.1/tcp/4001"} }
 func (s *stubNode) IsReady() bool              { return s.ready }
+func (s *stubNode) StartedAt() time.Time       { return time.Time{} }
 func (s *stubNode) ClusterJoin(ctx context.Context, req JoinClusterRequest) error { return nil }
 func (s *stubNode) ClusterLeave(ctx context.Context, path string) error           { return nil }
 func (s *stubNode) ClusterList(ctx context.Context) (*ListClustersResponse, error) {

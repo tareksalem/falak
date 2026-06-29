@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -37,6 +38,7 @@ func (p *Phonebook) migrate() error {
 	CREATE TABLE IF NOT EXISTS phonebook (
 		node_id           TEXT NOT NULL,
 		cluster_path      TEXT NOT NULL,
+		name              TEXT NOT NULL DEFAULT '',
 		public_key        BLOB,
 		addresses         TEXT NOT NULL,
 		region            TEXT NOT NULL DEFAULT '',
@@ -64,14 +66,25 @@ func (p *Phonebook) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_phonebook_reliability ON phonebook(cluster_path, success_rate DESC, last_seen DESC);
 	`
 
-	_, err := p.db.Exec(schema)
-	return err
+	if _, err := p.db.Exec(schema); err != nil {
+		return err
+	}
+
+	// Idempotent ALTER for upgrading DBs that pre-date the name column.
+	// SQLite returns "duplicate column name" if it already exists; we
+	// swallow that one specific error so re-runs are cheap.
+	if _, err := p.db.Exec(`ALTER TABLE phonebook ADD COLUMN name TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("phonebook migration: add name column: %w", err)
+		}
+	}
+	return nil
 }
 
 // Get retrieves a phonebook entry by node ID and cluster path.
 func (p *Phonebook) Get(nodeID string, clusterPath string) (*Entry, error) {
 	row := p.db.QueryRow(`
-		SELECT node_id, cluster_path, public_key, addresses, region, datacenter,
+		SELECT node_id, cluster_path, name, public_key, addresses, region, datacenter,
 		       capabilities, first_seen, last_seen, last_connected, updated_at,
 		       conn_attempts, conn_success, success_rate, consec_fails,
 		       reliability_score, last_probe_time, last_probe_success, status, is_connected
@@ -97,7 +110,7 @@ func (p *Phonebook) Exists(nodeID string, clusterPath string) (bool, error) {
 // GetByCluster retrieves all entries for a cluster.
 func (p *Phonebook) GetByCluster(clusterPath string) ([]*Entry, error) {
 	rows, err := p.db.Query(`
-		SELECT node_id, cluster_path, public_key, addresses, region, datacenter,
+		SELECT node_id, cluster_path, name, public_key, addresses, region, datacenter,
 		       capabilities, first_seen, last_seen, last_connected, updated_at,
 		       conn_attempts, conn_success, success_rate, consec_fails,
 		       reliability_score, last_probe_time, last_probe_success, status, is_connected
@@ -115,7 +128,7 @@ func (p *Phonebook) GetByCluster(clusterPath string) ([]*Entry, error) {
 // GetByNode retrieves all entries for a node across all clusters.
 func (p *Phonebook) GetByNode(nodeID string) ([]*Entry, error) {
 	rows, err := p.db.Query(`
-		SELECT node_id, cluster_path, public_key, addresses, region, datacenter,
+		SELECT node_id, cluster_path, name, public_key, addresses, region, datacenter,
 		       capabilities, first_seen, last_seen, last_connected, updated_at,
 		       conn_attempts, conn_success, success_rate, consec_fails,
 		       reliability_score, last_probe_time, last_probe_success, status, is_connected
@@ -133,7 +146,7 @@ func (p *Phonebook) GetByNode(nodeID string) ([]*Entry, error) {
 // GetBestPeers retrieves the best peers for a cluster, sorted by success rate.
 func (p *Phonebook) GetBestPeers(clusterPath string, limit int) ([]*Entry, error) {
 	rows, err := p.db.Query(`
-		SELECT node_id, cluster_path, public_key, addresses, region, datacenter,
+		SELECT node_id, cluster_path, name, public_key, addresses, region, datacenter,
 		       capabilities, first_seen, last_seen, last_connected, updated_at,
 		       conn_attempts, conn_success, success_rate, consec_fails,
 		       reliability_score, last_probe_time, last_probe_success, status, is_connected
@@ -182,13 +195,13 @@ func (p *Phonebook) Add(entry *Entry) error {
 
 	_, err = p.db.Exec(`
 		INSERT INTO phonebook (
-			node_id, cluster_path, public_key, addresses, region, datacenter,
+			node_id, cluster_path, name, public_key, addresses, region, datacenter,
 			capabilities, first_seen, last_seen, last_connected, updated_at,
 			conn_attempts, conn_success, success_rate, consec_fails,
 			reliability_score, last_probe_time, last_probe_success, status, is_connected
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		entry.NodeID, entry.ClusterPath, entry.PublicKey, string(addrsJSON),
+		entry.NodeID, entry.ClusterPath, entry.Name, entry.PublicKey, string(addrsJSON),
 		entry.Region, entry.Datacenter, string(capsJSON),
 		firstSeen, lastSeen, entry.LastConnected.UnixMilli(), now,
 		entry.ConnectionAttempts, entry.ConnectionSuccess, entry.SuccessRate, entry.ConsecutiveFails,
@@ -216,8 +229,12 @@ func (p *Phonebook) Update(entry *Entry) error {
 
 	now := time.Now().UnixMilli()
 
+	// COALESCE on name preserves an existing non-empty name when the
+	// update carries an empty one (e.g. a phonebook-sync delta from an
+	// older peer that didn't propagate the field).
 	_, err = p.db.Exec(`
 		UPDATE phonebook SET
+			name = CASE WHEN ? = '' THEN name ELSE ? END,
 			public_key = ?, addresses = ?, region = ?, datacenter = ?,
 			capabilities = ?, last_seen = ?, last_connected = ?, updated_at = ?,
 			conn_attempts = ?, conn_success = ?, success_rate = ?, consec_fails = ?,
@@ -225,6 +242,7 @@ func (p *Phonebook) Update(entry *Entry) error {
 			status = ?, is_connected = ?
 		WHERE node_id = ? AND cluster_path = ?
 	`,
+		entry.Name, entry.Name,
 		entry.PublicKey, string(addrsJSON), entry.Region, entry.Datacenter,
 		string(capsJSON), entry.LastSeen.UnixMilli(), entry.LastConnected.UnixMilli(), now,
 		entry.ConnectionAttempts, entry.ConnectionSuccess, entry.SuccessRate, entry.ConsecutiveFails,
@@ -315,7 +333,7 @@ func (p *Phonebook) SetStatus(nodeID string, clusterPath string, status NodeStat
 // GetByStatus retrieves entries by status.
 func (p *Phonebook) GetByStatus(clusterPath string, status NodeStatus) ([]*Entry, error) {
 	rows, err := p.db.Query(`
-		SELECT node_id, cluster_path, public_key, addresses, region, datacenter,
+		SELECT node_id, cluster_path, name, public_key, addresses, region, datacenter,
 		       capabilities, first_seen, last_seen, last_connected, updated_at,
 		       conn_attempts, conn_success, success_rate, consec_fails,
 		       reliability_score, last_probe_time, last_probe_success, status, is_connected
@@ -386,7 +404,7 @@ func (p *Phonebook) scanEntry(row *sql.Row) (*Entry, error) {
 	var status string
 
 	err := row.Scan(
-		&entry.NodeID, &entry.ClusterPath, &entry.PublicKey, &addrsJSON,
+		&entry.NodeID, &entry.ClusterPath, &entry.Name, &entry.PublicKey, &addrsJSON,
 		&entry.Region, &entry.Datacenter, &capsJSON,
 		&firstSeen, &lastSeen, &lastConnected, &updatedAt,
 		&entry.ConnectionAttempts, &entry.ConnectionSuccess, &entry.SuccessRate, &entry.ConsecutiveFails,
@@ -431,7 +449,7 @@ func (p *Phonebook) scanEntries(rows *sql.Rows) ([]*Entry, error) {
 		var status string
 
 		err := rows.Scan(
-			&entry.NodeID, &entry.ClusterPath, &entry.PublicKey, &addrsJSON,
+			&entry.NodeID, &entry.ClusterPath, &entry.Name, &entry.PublicKey, &addrsJSON,
 			&entry.Region, &entry.Datacenter, &capsJSON,
 			&firstSeen, &lastSeen, &lastConnected, &updatedAt,
 			&entry.ConnectionAttempts, &entry.ConnectionSuccess, &entry.SuccessRate, &entry.ConsecutiveFails,

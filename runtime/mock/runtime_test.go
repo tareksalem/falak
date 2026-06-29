@@ -155,6 +155,21 @@ func TestNotFound(t *testing.T) {
 	}
 }
 
+// TestInspectMissingIsNotFound asserts that Inspect of an unknown id
+// returns an error that satisfies errors.Is(runtime.ErrContainerNotFound),
+// the contract the handler's reconcile sweep relies on to distinguish a
+// removed container (terminal) from a transient backend error.
+func TestInspectMissingIsNotFound(t *testing.T) {
+	r := New()
+	_, err := r.Inspect(context.Background(), "ghost")
+	if err == nil {
+		t.Fatal("expected error for missing container")
+	}
+	if !errors.Is(err, runtime.ErrContainerNotFound) {
+		t.Fatalf("error %v does not wrap ErrContainerNotFound", err)
+	}
+}
+
 func TestEventRecording(t *testing.T) {
 	r := New()
 	ctx := context.Background()
@@ -162,17 +177,17 @@ func TestEventRecording(t *testing.T) {
 	r.Create(ctx, "c1", "img:v1")
 	r.Start(ctx, "c1")
 
-	if len(r.Events) != 3 {
-		t.Fatalf("expected 3 events, got %d", len(r.Events))
+	if len(r.Calls) != 3 {
+		t.Fatalf("expected 3 calls, got %d", len(r.Calls))
 	}
-	if r.Events[0].Method != "Pull" {
-		t.Errorf("event 0 method = %q, want Pull", r.Events[0].Method)
+	if r.Calls[0].Method != "Pull" {
+		t.Errorf("call 0 method = %q, want Pull", r.Calls[0].Method)
 	}
-	if r.Events[1].Method != "Create" {
-		t.Errorf("event 1 method = %q, want Create", r.Events[1].Method)
+	if r.Calls[1].Method != "Create" {
+		t.Errorf("call 1 method = %q, want Create", r.Calls[1].Method)
 	}
-	if r.Events[2].Method != "Start" {
-		t.Errorf("event 2 method = %q, want Start", r.Events[2].Method)
+	if r.Calls[2].Method != "Start" {
+		t.Errorf("call 2 method = %q, want Start", r.Calls[2].Method)
 	}
 }
 

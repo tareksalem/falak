@@ -219,8 +219,13 @@ func (st *ScoreTracker) RecordSuccess(nodeID string, reason string) {
 	// Remove quarantine timer if present
 	delete(st.quarantineTimers, nodeID)
 
-	// Emit recovery event if was degraded
-	if oldStatus == phonebook.NodeStatusEnum.Suspected() || oldStatus == phonebook.NodeStatusEnum.Quarantined() {
+	// Emit recovery event if was degraded — includes Departed so that
+	// a peer that gracefully left and then came back (e.g. operator
+	// restarted the daemon) gets reactivated on the first successful
+	// probe instead of staying invisible.
+	if oldStatus == phonebook.NodeStatusEnum.Suspected() ||
+		oldStatus == phonebook.NodeStatusEnum.Quarantined() ||
+		oldStatus == phonebook.NodeStatusEnum.Departed() {
 		st.logger.Info("node recovered",
 			zap.String("nodeId", nodeID),
 			zap.String("cluster", st.clusterPath),
