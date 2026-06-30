@@ -42,12 +42,14 @@ func clamp01(v float64) float64 {
 // capacity. A node with abundant headroom scores higher than a node
 // already running near its limit.
 //
-// Returns notApplicable when the capsule does not request CPU.
+// The factor is request-independent (O9-A): when the capsule does not
+// request CPU (required == 0) the formula degenerates to free/total,
+// which still rewards emptier nodes by their relative free fraction.
+// This is what differentiates two otherwise-identical bare capsules
+// across a busy and an idle node. The only guard is total <= 0, which
+// means the node has not yet reported its capacity.
 func factorCPUHeadroom(c *capsule.Capsule, node NodeState) factorContribution {
 	required := c.Spec.Resources.CPUCores
-	if required <= 0 {
-		return notApplicable
-	}
 	if node.Resources.CPUCoresTotal <= 0 {
 		return notApplicable
 	}
@@ -59,11 +61,9 @@ func factorCPUHeadroom(c *capsule.Capsule, node NodeState) factorContribution {
 }
 
 // factorMemoryHeadroom mirrors factorCPUHeadroom for memory in megabytes.
+// Request-independent (O9-A): required == 0 yields free/total.
 func factorMemoryHeadroom(c *capsule.Capsule, node NodeState) factorContribution {
 	required := c.Spec.Resources.MemoryMB
-	if required <= 0 {
-		return notApplicable
-	}
 	if node.Resources.MemoryMBTotal <= 0 {
 		return notApplicable
 	}
@@ -75,11 +75,9 @@ func factorMemoryHeadroom(c *capsule.Capsule, node NodeState) factorContribution
 }
 
 // factorDiskHeadroom mirrors factorCPUHeadroom for disk in megabytes.
+// Request-independent (O9-A): required == 0 yields free/total.
 func factorDiskHeadroom(c *capsule.Capsule, node NodeState) factorContribution {
 	required := c.Spec.Resources.DiskMB
-	if required <= 0 {
-		return notApplicable
-	}
 	if node.Resources.DiskMBTotal <= 0 {
 		return notApplicable
 	}
@@ -164,15 +162,21 @@ func factorHardwareLabelMatch(c *capsule.Capsule, node NodeState) factorContribu
 	return applied(float64(matched) / float64(len(c.Spec.Labels)))
 }
 
-// factorLoadPenalty discourages stacking many capsules on the same node.
-// The score is `1 - utilization` where utilization is the running capsule
-// count expressed as a fraction of a soft cap. Above the soft cap the
-// penalty saturates at 0.
+// factorLoadPenalty rewards nodes with free committed-capsule capacity,
+// discouraging stacking many capsules on the same node. The score is
+// `1 - utilization` where utilization is the running capsule count
+// expressed as a fraction of a soft cap; above the soft cap the score
+// saturates at 0 (no free capacity). Despite the historical name, this
+// is now a positive free-capacity factor routed through the same
+// add-to-numerator-and-denominator path as every other factor — it no
+// longer subtracts. Keeping the count-based proxy (rather than live CPU
+// utilization) matters because idle capsules consume ~0 CPU, so resource
+// headroom alone cannot spread them; the committed count can.
 //
-// The penalty is *always* applied — every node has some load, so the
-// factor is meaningful for every election.
+// The factor is *always* applied — every node has some committed load,
+// so it is meaningful for every election.
 func factorLoadPenalty(node NodeState) factorContribution {
-	const softCap = 50.0 // soft cap on capsules per node before saturating
+	const softCap = 20.0 // soft cap on capsules per node before saturating
 	utilization := float64(node.RunningCapsuleCount) / softCap
 	if utilization > 1 {
 		utilization = 1
@@ -187,6 +191,21 @@ func factorLoadPenalty(node NodeState) factorContribution {
 // history (defaulting to 1.0 for newly-joined nodes).
 func factorReliability(node NodeState) factorContribution {
 	return applied(node.ReliabilityScore)
+}
+
+// factorExecutionReliability rewards nodes that have historically been
+// able to actually START and RUN capsules — as distinct from the
+// connection-level ReliabilityScore. It is sourced from the node-local
+// execution-reliability tracker (decayed Bayesian-smoothed success/
+// failure counts over container starts), surfaced on NodeState by the
+// metrics provider. The score is in [0, 1]; a node with no history
+// scores at the optimistic prior (0.8) so a freshly-joined node is not
+// starved before it has placed anything.
+//
+// The factor is always applied because every node has an execution
+// reliability value (the prior, until it accrues history).
+func factorExecutionReliability(node NodeState) factorContribution {
+	return applied(node.ExecutionReliability)
 }
 
 // factorDiversity rewards spreading replicas across distinct datacenters.

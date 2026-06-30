@@ -30,6 +30,16 @@ type noCapsuleCounts struct{}
 
 func (noCapsuleCounts) CountForNode(string, string) int { return 0 }
 
+// ExecutionReliabilityReader supplies the node-global execution reliability
+// score in [0, 1]. The Provider only READS it — the execution-reliability
+// tracker owns the state and its mutation (it subscribes to the event bus).
+// Kept as a narrow interface so the metrics package stays free of the
+// reliability package and there is no import cycle.
+type ExecutionReliabilityReader interface {
+	// Current returns the live execution-reliability score in [0, 1].
+	Current() float64
+}
+
 // Provider adapts the metrics Manager and the phonebook to the
 // gravity.StateProvider interface used by the election package. It is
 // the seam where election (which knows nothing about phonebook or
@@ -43,6 +53,27 @@ type Provider struct {
 	phonebook     phonebook.IPhonebook
 	localNodeID   string
 	capsuleCounts CapsuleCountProvider
+
+	// neutralReliability is the optimistic prior applied to a node that has
+	// no connection history (ConnectionAttempts == 0). A node that has never
+	// been probed has NO DATA, not "0% reliable"; treating it as 0 would let
+	// the reliability factor zero out the whole gravity score for a freshly
+	// joined node. Optimistic-until-proven (default 1.0) matches SWIM/Consul/
+	// Cassandra semantics and is what gravity's factorReliability already
+	// documents. The prior is applied ONLY in this read path — the stored
+	// phonebook SuccessRate stays honest because it feeds health/eviction/sync.
+	neutralReliability float64
+
+	// execReliability supplies the node's execution-reliability score. When
+	// nil (tests, bootstrap before the tracker is wired) buildState falls
+	// back to neutralExecutionReliability so the gravity factor never zeroes
+	// out a node that simply has no tracker attached yet.
+	execReliability ExecutionReliabilityReader
+
+	// neutralExecutionReliability is the score used when execReliability is
+	// nil. It matches the tracker's zero-history prior (0.8) so behaviour is
+	// continuous whether or not a tracker is wired.
+	neutralExecutionReliability float64
 }
 
 // ProviderOption configures a Provider.
@@ -57,6 +88,27 @@ func WithCapsuleCounts(c CapsuleCountProvider) ProviderOption {
 	}
 }
 
+// WithNeutralReliability overrides the optimistic reliability prior applied
+// to nodes with no connection history (ConnectionAttempts == 0). The default
+// is 1.0 (fully optimistic, matching gravity.factorReliability's documented
+// "defaulting to 1.0 for newly-joined nodes"). Lower it to make the scheduler
+// more cautious about unproven nodes. The value only affects the gravity-state
+// read path; it never mutates the stored phonebook SuccessRate.
+func WithNeutralReliability(v float64) ProviderOption {
+	return func(p *Provider) {
+		p.neutralReliability = v
+	}
+}
+
+// WithExecutionReliability wires the node-global execution-reliability reader
+// (the tracker) into the provider's read path. Without it, buildState uses the
+// optimistic neutral default (0.8).
+func WithExecutionReliability(r ExecutionReliabilityReader) ProviderOption {
+	return func(p *Provider) {
+		p.execReliability = r
+	}
+}
+
 // NewProvider constructs a Provider for the given metrics manager and
 // phonebook. The localNodeID is the libp2p peer ID of the node hosting
 // this provider — used by LocalNode to differentiate "me" from peers.
@@ -67,10 +119,12 @@ func NewProvider(
 	opts ...ProviderOption,
 ) *Provider {
 	p := &Provider{
-		manager:       mgr,
-		phonebook:     pb,
-		localNodeID:   localNodeID,
-		capsuleCounts: noCapsuleCounts{},
+		manager:                     mgr,
+		phonebook:                   pb,
+		localNodeID:                 localNodeID,
+		capsuleCounts:               noCapsuleCounts{},
+		neutralReliability:          1.0,
+		neutralExecutionReliability: 0.8,
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -99,7 +153,7 @@ func (p *Provider) LocalNode(clusterPath string) (gravity.NodeState, error) {
 		return gravity.NodeState{}, fmt.Errorf("metrics provider: local snapshot: %w", err)
 	}
 
-	state := buildState(p.localNodeID, clusterPath, entry, snap)
+	state := p.buildState(p.localNodeID, clusterPath, entry, snap)
 	state.RunningCapsuleCount = p.capsuleCounts.CountForNode(clusterPath, p.localNodeID)
 	return state, nil
 }
@@ -114,20 +168,43 @@ func (p *Provider) LocalNode(clusterPath string) (gravity.NodeState, error) {
 // memory advertised at cluster join). The "free" fields then default
 // to the totals — the gravity calculator treats this as "node is empty",
 // which is conservative for newly-joined nodes that haven't reported yet.
-func buildState(
+//
+// Reliability prior: a node with zero connection attempts has NO DATA, not
+// "0% reliable". For such a node we substitute the optimistic neutral prior
+// (default 1.0) instead of the stored SuccessRate (which is 0 by default and
+// would otherwise zero out gravity's reliability factor for a freshly-joined
+// node). Once the node has any connection history (ConnectionAttempts > 0) we
+// use the honest measured SuccessRate. The stored phonebook value is NEVER
+// mutated here — it feeds health/eviction/sync and must stay truthful.
+//
+// Execution reliability is read from the wired tracker (if any) or the
+// optimistic neutral default (0.8). buildState only reads; it never mutates
+// tracker state.
+func (p *Provider) buildState(
 	nodeID string,
 	clusterPath string,
 	entry *phonebook.Entry,
 	snap Snapshot,
 ) gravity.NodeState {
+	reliability := entry.SuccessRate
+	if entry.ConnectionAttempts == 0 {
+		reliability = p.neutralReliability
+	}
+
+	execReliability := p.neutralExecutionReliability
+	if p.execReliability != nil {
+		execReliability = p.execReliability.Current()
+	}
+
 	state := gravity.NodeState{
-		NodeID:           nodeID,
-		ClusterPath:      clusterPath,
-		Datacenter:       entry.Datacenter,
-		Region:           entry.Region,
-		Labels:           labelsFromEntry(entry),
-		Status:           translateStatus(entry.Status),
-		ReliabilityScore: entry.SuccessRate,
+		NodeID:               nodeID,
+		ClusterPath:          clusterPath,
+		Datacenter:           entry.Datacenter,
+		Region:               entry.Region,
+		Labels:               labelsFromEntry(entry),
+		Status:               translateStatus(entry.Status),
+		ReliabilityScore:     reliability,
+		ExecutionReliability: execReliability,
 	}
 
 	// If we have a fresh snapshot, use it for resource fields.

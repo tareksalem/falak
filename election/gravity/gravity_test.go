@@ -233,12 +233,39 @@ func TestFactorCPUHeadroom_Applied(t *testing.T) {
 	}
 }
 
-func TestFactorCPUHeadroom_NotApplicableWhenCapsuleHasNoCPU(t *testing.T) {
+// TestFactorCPUHeadroom_RequestIndependent verifies O9-A: a capsule with
+// no CPU request still gets a headroom score equal to free/total, so two
+// otherwise-identical bare capsules differentiate a busy node from an idle
+// one. Only a node with no reported capacity (total <= 0) is notApplicable.
+func TestFactorCPUHeadroom_RequestIndependent(t *testing.T) {
+	c := minimalCapsule("test") // no CPU request
+	node := healthyNode("n1")   // 8 free / 8 total
+	got := factorCPUHeadroom(c, node)
+	if !got.Applied {
+		t.Fatal("request-independent headroom should apply when total > 0")
+	}
+	if got.Value != 1.0 {
+		t.Errorf("empty node should score 1.0 (8/8), got %v", got.Value)
+	}
+
+	busy := healthyNode("n2", func(n *NodeState) {
+		n.Resources.CPUCoresFree = 2 // 2 free / 8 total
+	})
+	got = factorCPUHeadroom(c, busy)
+	if !got.Applied || got.Value != 0.25 {
+		t.Errorf("busy node should score 0.25 (2/8), got %+v", got)
+	}
+}
+
+func TestFactorCPUHeadroom_NotApplicableWhenNodeHasNoCapacity(t *testing.T) {
 	c := minimalCapsule("test")
-	node := healthyNode("n1")
+	node := healthyNode("n1", func(n *NodeState) {
+		n.Resources.CPUCoresTotal = 0
+		n.Resources.CPUCoresFree = 0
+	})
 	got := factorCPUHeadroom(c, node)
 	if got.Applied {
-		t.Error("should not apply when capsule has no CPU requirement")
+		t.Error("should not apply when node has not reported CPU capacity")
 	}
 }
 
@@ -338,16 +365,16 @@ func TestFactorLoadPenalty(t *testing.T) {
 		t.Errorf("empty node should score 1.0, got %+v", got)
 	}
 
-	// 25 capsules running: 25/50 = 0.5 utilization, penalty value 0.5
+	// 10 capsules running: 10/20 = 0.5 utilization, free-capacity value 0.5
 	loaded := healthyNode("n1", func(n *NodeState) {
-		n.RunningCapsuleCount = 25
+		n.RunningCapsuleCount = 10
 	})
 	got = factorLoadPenalty(loaded)
 	if got.Value != 0.5 {
 		t.Errorf("loaded node should score 0.5, got %v", got.Value)
 	}
 
-	// At and beyond saturation: 0
+	// At and beyond saturation (>= softCap 20): 0
 	full := healthyNode("n1", func(n *NodeState) {
 		n.RunningCapsuleCount = 100
 	})

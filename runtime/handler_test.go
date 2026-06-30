@@ -60,10 +60,11 @@ func (s *stubSnapshotStore) setLocal(capsuleID, tag string) {
 
 // stubLifecycle records lifecycle calls.
 type stubLifecycle struct {
-	mu      sync.Mutex
-	running []string
-	failed  []string
-	stopped []string
+	mu             sync.Mutex
+	running        []string
+	failed         []string
+	failedCategory []runtime.FailureCategory
+	stopped        []string
 }
 
 func (l *stubLifecycle) MarkRunning(capsuleID string) error {
@@ -73,10 +74,11 @@ func (l *stubLifecycle) MarkRunning(capsuleID string) error {
 	return nil
 }
 
-func (l *stubLifecycle) MarkFailed(capsuleID, reason string) error {
+func (l *stubLifecycle) MarkFailed(capsuleID, reason string, category runtime.FailureCategory) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.failed = append(l.failed, capsuleID)
+	l.failedCategory = append(l.failedCategory, category)
 	return nil
 }
 

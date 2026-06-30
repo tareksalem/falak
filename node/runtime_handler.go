@@ -158,7 +158,7 @@ func (a *runtimeLifecycleAdapter) MarkRunning(capsuleID string) error {
 	return nil
 }
 
-func (a *runtimeLifecycleAdapter) MarkFailed(capsuleID, reason string) error {
+func (a *runtimeLifecycleAdapter) MarkFailed(capsuleID, reason string, category falakrt.FailureCategory) error {
 	id := capsule.CapsuleID(capsuleID)
 	if err := a.manager.ExecutionFailed(id); err != nil {
 		a.logger.Debug("ExecutionFailed transition failed", zap.String("capsule_id", capsuleID), zap.Error(err))
@@ -167,8 +167,25 @@ func (a *runtimeLifecycleAdapter) MarkFailed(capsuleID, reason string) error {
 		BaseEvent: events.NewBaseEvent(),
 		CapsuleID: capsuleID,
 		Reason:    reason,
+		Category:  translateFailureCategory(category),
 	})
 	return nil
+}
+
+// translateFailureCategory maps the runtime package's FailureCategory onto
+// the node-internal events enum. The two enums are intentionally separate
+// (the runtime module cannot import node-internal packages); this adapter is
+// the single translation point. An unrecognized value defaults to Ambiguous,
+// matching the "count it" safe default.
+func translateFailureCategory(c falakrt.FailureCategory) events.FailureCategory {
+	switch c {
+	case falakrt.FailureCategoryEnum.NodeAttributable():
+		return events.FailureCategoryEnum.NodeAttributable()
+	case falakrt.FailureCategoryEnum.CapsuleGlobal():
+		return events.FailureCategoryEnum.CapsuleGlobal()
+	default:
+		return events.FailureCategoryEnum.Ambiguous()
+	}
 }
 
 func (a *runtimeLifecycleAdapter) MarkStopped(capsuleID string) error {

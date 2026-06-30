@@ -34,6 +34,7 @@ import (
 	"github.com/tareksalem/falak/node/internal/events"
 	"github.com/tareksalem/falak/node/metrics"
 	"github.com/tareksalem/falak/node/phonebook"
+	"github.com/tareksalem/falak/node/reliability"
 	nodesync "github.com/tareksalem/falak/node/sync"
 )
 
@@ -145,6 +146,11 @@ type Node struct {
 	// Node-level resource metrics (created at Start, joins each cluster
 	// as the node joins it). Powers the election gravity calculator.
 	metricsManager *metrics.Manager
+
+	// Execution-reliability tracker (created at Start). Subscribes to the
+	// event bus for capsule lifecycle outcomes and maintains the decayed
+	// execution-reliability score read by the election gravity calculator.
+	reliabilityTracker *reliability.Tracker
 
 	// Election manager (created at Start, joins each cluster's election
 	// topic as the node joins them). Decides which node runs each capsule
@@ -726,6 +732,12 @@ func (n *Node) cleanup() {
 	// Stop capsule handler (it depends on pubsub, eventbus, phonebook)
 	if n.capsuleHandler != nil {
 		n.capsuleHandler.Stop()
+	}
+
+	// Stop the execution-reliability tracker (event subscriptions) and persist
+	// its final counters before the metrics data dir is otherwise quiesced.
+	if n.reliabilityTracker != nil {
+		n.reliabilityTracker.Stop()
 	}
 
 	// Stop metrics manager (collector loop, publisher topics, subscriber goroutines).
@@ -1336,6 +1348,25 @@ func (n *Node) initializeMetricsManager() error {
 	n.logger.Debug("metrics manager initialized",
 		zap.Duration("interval", cfg.Interval),
 		zap.Bool("enabled", cfg.Enabled))
+
+	// Execution-reliability tracker: node-global, persisted alongside the
+	// metrics data dir, started here so the election provider (built later)
+	// can read its score. Failure to open the store is non-fatal — execution
+	// reliability is a soft scoring signal, so we log and continue without it
+	// (the provider then falls back to the optimistic neutral default).
+	relStore, err := reliability.OpenStore(filepath.Join(dataDir, "reliability.db"),
+		reliability.WithStoreLogger(n.logger.Named("reliability.store")))
+	if err != nil {
+		n.logger.Warn("failed to open execution reliability store; execution reliability disabled",
+			zap.Error(err))
+		return nil
+	}
+	n.reliabilityTracker = reliability.NewTracker(
+		n.id.String(), relStore, n.eventBus,
+		reliability.WithLogger(n.logger.Named("reliability")),
+	)
+	n.reliabilityTracker.Start(n.ctx)
+	n.logger.Debug("execution reliability tracker initialized")
 	return nil
 }
 
@@ -1371,7 +1402,11 @@ func (n *Node) initializeElectionManager() error {
 	signer := &electionSigner{key: n.privateKey}
 	verifier := &electionVerifier{pb: n.phonebook}
 
-	provider := metrics.NewProvider(n.metricsManager, n.phonebook, n.id.String())
+	providerOpts := []metrics.ProviderOption{}
+	if n.reliabilityTracker != nil {
+		providerOpts = append(providerOpts, metrics.WithExecutionReliability(n.reliabilityTracker))
+	}
+	provider := metrics.NewProvider(n.metricsManager, n.phonebook, n.id.String(), providerOpts...)
 
 	// Wire the capsule store as the gravity target lookup so
 	// self-anti-affinity (a node never runs two replicas of the same

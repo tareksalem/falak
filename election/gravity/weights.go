@@ -43,13 +43,21 @@ type Weights struct {
 	// Default 0.2.
 	HardwareLabelMatch float64
 
-	// LoadPenalty discourages stacking too many capsules on the same node.
-	// Subtracted from the score. Default 0.5 (treated as -0.5 in the sum).
+	// LoadPenalty weights the free committed-capsule-capacity factor
+	// (despite the historical name, it is now a positive reward, not a
+	// subtraction — see factorLoadPenalty). The field name is retained
+	// because it is the CUE config key operators tune. Default 1.0.
 	LoadPenalty float64
 
-	// Reliability rewards nodes with high historical success rates.
-	// Default 0.4.
+	// Reliability rewards nodes with high historical connection success
+	// rates (from the phonebook). Default 0.8.
 	Reliability float64
+
+	// ExecutionReliability rewards nodes with a high historical ability to
+	// actually start and run capsules (from the node-local execution
+	// reliability tracker). Distinct from Reliability (connection health).
+	// Default 0.6.
+	ExecutionReliability float64
 
 	// Diversity rewards spreading replicas across distinct datacenters or
 	// regions. Default 0.2. Only applies when the capsule asks for more
@@ -68,16 +76,17 @@ type Weights struct {
 // intervention.
 func DefaultWeights() Weights {
 	return Weights{
-		CPUHeadroom:        1.0,
-		MemoryHeadroom:     1.0,
-		DiskHeadroom:       0.5,
-		SoftPlacementMatch: 0.3,
-		AffinityProximity:  0.8,
-		HardwareLabelMatch: 0.2,
-		LoadPenalty:        0.5,
-		Reliability:        0.4,
-		Diversity:          0.2,
-		SnapshotLocality:   0.6,
+		CPUHeadroom:          1.0,
+		MemoryHeadroom:       1.0,
+		DiskHeadroom:         0.5,
+		SoftPlacementMatch:   0.3,
+		AffinityProximity:    0.8,
+		HardwareLabelMatch:   0.2,
+		LoadPenalty:          1.0,
+		Reliability:          0.8,
+		ExecutionReliability: 0.6,
+		Diversity:            0.2,
+		SnapshotLocality:     0.6,
 	}
 }
 
@@ -115,6 +124,9 @@ func (w Weights) Merge(override Weights) Weights {
 	if override.Reliability != 0 {
 		out.Reliability = override.Reliability
 	}
+	if override.ExecutionReliability != 0 {
+		out.ExecutionReliability = override.ExecutionReliability
+	}
 	if override.Diversity != 0 {
 		out.Diversity = override.Diversity
 	}
@@ -125,27 +137,26 @@ func (w Weights) Merge(override Weights) Weights {
 }
 
 // MaxPossibleScore is the upper bound of the unnormalized weighted sum,
-// computed as the sum of all positive weights plus the maximum positive
-// contribution from the load penalty (which is zero — the load penalty
-// only ever subtracts).
+// the sum of every factor's weight (each factor contributes at most
+// 1.0 × its weight). Load and execution reliability are now positive
+// factors routed through the standard add path, so they count toward the
+// maximum exactly like the others — the old "load only subtracts" carve-out
+// no longer holds.
 //
-// The Calculator divides the unnormalized sum by this value to produce a
-// 0–100 score, so the same set of weights always normalizes consistently.
-//
-// Note: this is the *theoretical* max where every factor returns its
-// maximum per-factor contribution (1.0). Real scores rarely reach this
-// because no node satisfies every factor perfectly.
+// This is a diagnostics helper: the Calculator normalizes against the sum
+// of *applicable* factor weights per (capsule, node) pair, which is a
+// subset of this theoretical maximum. Real scores rarely reach it because
+// no node satisfies every factor perfectly.
 func (w Weights) MaxPossibleScore() float64 {
-	// Each factor contributes at most 1.0 * its weight to the unnormalized sum.
-	// The load penalty is the only factor that subtracts; we exclude it from
-	// the maximum because subtraction never increases the score.
 	return w.CPUHeadroom +
 		w.MemoryHeadroom +
 		w.DiskHeadroom +
 		w.SoftPlacementMatch +
 		w.AffinityProximity +
 		w.HardwareLabelMatch +
+		w.LoadPenalty +
 		w.Reliability +
+		w.ExecutionReliability +
 		w.Diversity +
 		w.SnapshotLocality
 }

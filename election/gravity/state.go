@@ -156,6 +156,13 @@ type NodeState struct {
 	// in [0, 1]. Newly-joined nodes default to 1.0 (no history yet).
 	ReliabilityScore float64
 
+	// ExecutionReliability is the node's historical ability to actually
+	// start and run capsules, in [0, 1], sourced from the node-local
+	// execution-reliability tracker. Distinct from ReliabilityScore
+	// (connection health). Nodes with no execution history default to the
+	// optimistic prior (0.8) supplied by the metrics provider.
+	ExecutionReliability float64
+
 	// RunningCapsuleCount is the number of capsules currently running on
 	// this node. Used by the load penalty factor.
 	RunningCapsuleCount int

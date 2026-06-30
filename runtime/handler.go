@@ -88,9 +88,13 @@ type SnapshotPuller interface {
 
 // LifecycleNotifier is the callback interface the handler uses to
 // update capsule lifecycle state and broadcast to the mesh.
+//
+// MarkFailed carries a typed FailureCategory determined at the failure
+// site so downstream consumers (notably the node-local execution
+// reliability tracker) do not have to re-derive blame from reason strings.
 type LifecycleNotifier interface {
 	MarkRunning(capsuleID string) error
-	MarkFailed(capsuleID, reason string) error
+	MarkFailed(capsuleID, reason string, category FailureCategory) error
 	MarkStopped(capsuleID string) error
 }
 
@@ -443,7 +447,9 @@ func (h *Handler) Start(ctx context.Context) {
 			h.startContainerNow,
 			func(capsuleID, reason string) {
 				if h.lifecycle != nil {
-					if err := h.lifecycle.MarkFailed(capsuleID, reason); err != nil {
+					// A dependency that never reached Running could be the
+					// node's fault or the dependency's — ambiguous, so count it.
+					if err := h.lifecycle.MarkFailed(capsuleID, reason, FailureCategoryEnum.Ambiguous()); err != nil {
 						h.logger.Warn("group dep timeout: MarkFailed failed",
 							zap.String("capsule_id", capsuleID),
 							zap.Error(err))
@@ -540,7 +546,8 @@ func (h *Handler) startContainer(event ElectionWon) {
 		h.logger.Error("runtime: capsule spec lookup failed",
 			zap.String("capsule_id", capsuleID),
 			zap.Error(err))
-		h.reportStartFailure(capsuleID, "spec lookup failed: "+err.Error())
+		// Spec lookup hits the local store/runtime — a node condition.
+		h.reportStartFailure(capsuleID, "spec lookup failed: "+err.Error(), FailureCategoryEnum.NodeAttributable())
 		return
 	}
 
@@ -617,7 +624,10 @@ func (h *Handler) coldStart(ctx context.Context, cID, capsuleID, tag string, spe
 		h.logger.Error("runtime: image pull failed",
 			zap.String("capsule_id", capsuleID),
 			zap.Error(err))
-		h.reportStartFailure(capsuleID, "image pull failed: "+err.Error())
+		// Sub-classify the pull error at the site: disk-full/permission is
+		// the node's fault, manifest-not-found/auth is the capsule's fault,
+		// network/registry-down is ambiguous.
+		h.reportStartFailure(capsuleID, "image pull failed: "+err.Error(), classifyPullError(err))
 		return
 	}
 
@@ -640,7 +650,8 @@ func (h *Handler) coldStart(ctx context.Context, cID, capsuleID, tag string, spe
 		h.logger.Error("runtime: create failed",
 			zap.String("capsule_id", capsuleID),
 			zap.Error(err))
-		h.reportStartFailure(capsuleID, "create failed: "+err.Error())
+		// Create failures (runc/cgroup/namespace) are node conditions.
+		h.reportStartFailure(capsuleID, "create failed: "+err.Error(), FailureCategoryEnum.NodeAttributable())
 		return
 	}
 
@@ -650,7 +661,9 @@ func (h *Handler) coldStart(ctx context.Context, cID, capsuleID, tag string, spe
 			zap.String("capsule_id", capsuleID),
 			zap.Error(err))
 		h.runtime.Remove(ctx, cID)
-		h.reportStartFailure(capsuleID, "start failed: "+err.Error())
+		// Start failures are node conditions (the image and spec were valid
+		// enough to create; the node could not run the container).
+		h.reportStartFailure(capsuleID, "start failed: "+err.Error(), FailureCategoryEnum.NodeAttributable())
 		return
 	}
 
@@ -722,7 +735,8 @@ func (h *Handler) captureSnapshot(capsuleID, cID, tag string, spec *CapsuleSpec)
 			delete(h.running, cID)
 		}
 		h.mu.Unlock()
-		h.lifecycle.MarkFailed(capsuleID, "restart after checkpoint failed: "+err.Error())
+		// Checkpoint/restore is a node/runtime capability — node-attributable.
+		h.lifecycle.MarkFailed(capsuleID, "restart after checkpoint failed: "+err.Error(), FailureCategoryEnum.NodeAttributable())
 		return
 	}
 
@@ -806,7 +820,9 @@ func (h *Handler) onContainerRunning(cID, capsuleID string, spec *CapsuleSpec) {
 				zap.String("container_id", cID),
 				zap.String("capsule_id", capsuleID),
 				zap.String("address", containerAddr))
-			h.lifecycle.MarkFailed(capsuleID, "health check exhausted retries")
+			// Health-check exhaustion could be an app fault or a node
+			// networking fault — ambiguous; count it (decay forgives).
+			h.lifecycle.MarkFailed(capsuleID, "health check exhausted retries", FailureCategoryEnum.Ambiguous())
 			watchCancel()
 		})
 	}
@@ -1031,7 +1047,7 @@ func (h *Handler) handleRemoved(cID, capsuleID string) {
 		zap.String("capsule_id", capsuleID))
 
 	if h.lifecycle != nil {
-		if err := h.lifecycle.MarkFailed(capsuleID, "container removed"); err != nil {
+		if err := h.lifecycle.MarkFailed(capsuleID, "container removed", FailureCategoryEnum.Ambiguous()); err != nil {
 			h.logger.Warn("runtime: MarkFailed failed",
 				zap.String("capsule_id", capsuleID),
 				zap.Error(err))
@@ -1092,9 +1108,13 @@ func (h *Handler) handleCrash(ctx context.Context, cID, capsuleID string, exitCo
 	h.mu.Unlock()
 
 	if h.lifecycle != nil {
+		// A container that exits non-zero after exhausting local restarts is
+		// most often an application fault that would recur on any node, but it
+		// can also be a node condition (OOM kill). Treat as ambiguous so it is
+		// counted yet forgiven by decay rather than excluded outright.
 		if err := h.lifecycle.MarkFailed(capsuleID, fmt.Sprintf(
 			"container exited with code %d after %d local restarts",
-			exitCode, localRestarts)); err != nil {
+			exitCode, localRestarts), FailureCategoryEnum.Ambiguous()); err != nil {
 			h.logger.Warn("runtime: MarkFailed failed",
 				zap.String("capsule_id", capsuleID),
 				zap.Error(err))
@@ -1213,7 +1233,9 @@ func (h *Handler) escalateInspectError(cID, capsuleID string, cause error) {
 		zap.Error(cause))
 
 	if h.lifecycle != nil {
-		if err := h.lifecycle.MarkFailed(capsuleID, "runtime unreachable"); err != nil {
+		// The local container runtime being unreachable is squarely the
+		// node's fault — node-attributable.
+		if err := h.lifecycle.MarkFailed(capsuleID, "runtime unreachable", FailureCategoryEnum.NodeAttributable()); err != nil {
 			h.logger.Warn("runtime: MarkFailed failed",
 				zap.String("capsule_id", capsuleID),
 				zap.Error(err))
@@ -1502,7 +1524,7 @@ func (h *Handler) pullWithHeartbeat(ctx context.Context, capsuleID, image string
 // trigger group rollback — they should follow the per-replica
 // re-election flow. Same-node rollback is reserved for failures of
 // containers that were started as part of an atomic group placement.
-func (h *Handler) reportStartFailure(capsuleID, reason string) {
+func (h *Handler) reportStartFailure(capsuleID, reason string, category FailureCategory) {
 	if h.groupEmitter != nil && h.groupView != nil && h.isGroupDispatched(capsuleID) {
 		info, ok := h.groupView.MemberInfo(capsuleID)
 		if ok && info.GroupID != "" {
@@ -1522,7 +1544,7 @@ func (h *Handler) reportStartFailure(capsuleID, reason string) {
 		}
 	}
 	if h.lifecycle != nil {
-		if err := h.lifecycle.MarkFailed(capsuleID, reason); err != nil {
+		if err := h.lifecycle.MarkFailed(capsuleID, reason, category); err != nil {
 			h.logger.Warn("runtime: MarkFailed failed",
 				zap.String("capsule_id", capsuleID),
 				zap.Error(err))

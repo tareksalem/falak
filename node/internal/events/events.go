@@ -383,6 +383,37 @@ type CapsuleRunning struct {
 
 func (e CapsuleRunning) EventType() string { return TypeCapsuleRunning }
 
+// FailureCategory classifies why a capsule failed, set at the failure site
+// in the runtime and carried on CapsuleExecutionFailed. The execution
+// reliability tracker uses it to decide whether a failure reflects on the
+// node (count it) or on the capsule itself (ignore it). This mirrors the
+// runtime package's FailureCategory across the module boundary (the runtime
+// module cannot import node-internal packages).
+//
+// Enum pattern: private consts + private carrier struct + public var accessor.
+type FailureCategory string
+
+const (
+	failureNodeAttributable FailureCategory = "node_attributable"
+	failureCapsuleGlobal    FailureCategory = "capsule_global"
+	failureAmbiguous        FailureCategory = "ambiguous"
+)
+
+type failureCategoryEnum struct{}
+
+// FailureCategoryEnum is the public accessor for FailureCategory values.
+var FailureCategoryEnum failureCategoryEnum
+
+// NodeAttributable returns the node-at-fault category.
+func (failureCategoryEnum) NodeAttributable() FailureCategory { return failureNodeAttributable }
+
+// CapsuleGlobal returns the capsule-at-fault category (excluded from a
+// node's execution reliability).
+func (failureCategoryEnum) CapsuleGlobal() FailureCategory { return failureCapsuleGlobal }
+
+// Ambiguous returns the unattributable category.
+func (failureCategoryEnum) Ambiguous() FailureCategory { return failureAmbiguous }
+
 // CapsuleExecutionFailed is emitted when a running container exits
 // unexpectedly or fails health checks. The capsule handler subscribes
 // to this to fire re-election.
@@ -390,6 +421,11 @@ type CapsuleExecutionFailed struct {
 	BaseEvent
 	CapsuleID string
 	Reason    string
+
+	// Category is the typed blame attribution set at the failure site.
+	// Empty (the zero value) is treated as Ambiguous by consumers — i.e.
+	// counted as a node failure — which is the safe default.
+	Category FailureCategory
 }
 
 func (e CapsuleExecutionFailed) EventType() string { return TypeCapsuleFailed }

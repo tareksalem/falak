@@ -102,10 +102,11 @@ func (c *Calculator) Weights() Weights {
 //  1. Run the eligibility filter. If the node is ineligible, return a
 //     zero-score Result with Eligible=false and the failure reason set.
 //  2. Compute every factor that applies to the (capsule, node) pair.
-//  3. Sum applicable factors weighted by their respective weights.
-//  4. Subtract the load penalty (always applied).
-//  5. Normalize the weighted sum into the 0–100 scale and clamp.
-//  6. Return the final Score plus the per-factor breakdown.
+//  3. Sum applicable factors weighted by their respective weights. Load
+//     is one such factor (a positive free-capacity reward), added like
+//     the rest — it is not subtracted.
+//  4. Normalize the weighted sum into the 0–100 scale and clamp.
+//  5. Return the final Score plus the per-factor breakdown.
 //
 // Calculate is pure: given the same inputs it always returns the same
 // output. It performs no I/O and no logging.
@@ -144,21 +145,16 @@ func (c *Calculator) Calculate(
 	addFactor("affinity_proximity", factorAffinityProximity(capsuleObj, node, c.lookup), c.weights.AffinityProximity)
 	addFactor("hardware_label_match", factorHardwareLabelMatch(capsuleObj, node), c.weights.HardwareLabelMatch)
 	addFactor("reliability", factorReliability(node), c.weights.Reliability)
+	addFactor("execution_reliability", factorExecutionReliability(node), c.weights.ExecutionReliability)
 	addFactor("diversity", factorDiversity(capsuleObj, node), c.weights.Diversity)
 	addFactor("snapshot_locality", factorSnapshotLocality(capsuleObj, c.snapLookup), c.weights.SnapshotLocality)
 
-	// Load penalty is always applied (and subtracted, not added).
-	loadFactor := factorLoadPenalty(node)
-	if loadFactor.Applied {
-		factors["load_penalty"] = loadFactor.Value
-		// Higher loadFactor.Value means MORE free capacity. We invert so
-		// the *penalty* grows as the node gets fuller.
-		penalty := (1 - loadFactor.Value) * c.weights.LoadPenalty
-		weightedSum -= penalty
-		// The penalty's contribution to the maximum is its full weight,
-		// because in the best case (node empty) the penalty is zero.
-		maxWeightedSum += c.weights.LoadPenalty
-	}
+	// Load is a symmetric free-capacity factor: higher value == more free
+	// committed-capsule capacity. It is routed through addFactor like every
+	// other factor (value×weight into the numerator, weight into the
+	// denominator) — it no longer subtracts, which previously double-counted
+	// against the maximum and pulled scores below their true normalized value.
+	addFactor("load_penalty", factorLoadPenalty(node), c.weights.LoadPenalty)
 
 	if maxWeightedSum <= 0 {
 		// No factor applied — degenerate case (shouldn't happen because

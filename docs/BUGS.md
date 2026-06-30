@@ -23,12 +23,17 @@ The real opposing-factor risk is the **gray-failure holder** (alive,
 `Active`, still claiming, but degraded) keeping its snapshot bonus.
 
 **Sequencing:**
-- **Step 1 — O9-B alone** (optimistic reliability). Lowest risk, ship
-  independently. Fix in the PROVIDER (`buildState`), NOT the phonebook:
-  if `entry.ConnectionAttempts == 0`, pass a configurable
-  `neutralReliability` (default 1.0) instead of `entry.SuccessRate`.
-  Keep `SuccessRate` honest (it feeds health/eviction/sync) — apply the
-  optimistic prior at the decision seam only.
+- **Step 1 — O9-B alone** (optimistic reliability). **IMPLEMENTED
+  (Session 19).** Fixed in the PROVIDER (`node/metrics/provider.go`
+  `buildState`), NOT the phonebook: when `entry.ConnectionAttempts == 0`
+  the read path substitutes a configurable `neutralReliability` (default
+  1.0, override via `WithNeutralReliability`) instead of
+  `entry.SuccessRate`. `SuccessRate` stays honest (it feeds
+  health/eviction/sync) — the optimistic prior is applied at the decision
+  seam only. Covered by `node/metrics/provider_test.go`.
+  Note: O9 is only PARTIALLY addressed — O9-B is done; O9-A (the
+  headroom guard) plus the rest of the scoring-correctness work remain in
+  the Step-2 bundle below.
 - **Step 2 — scoring-correctness bundle (ship together):**
   1. O9-A: delete the `if required <= 0 { return notApplicable }` guard
      in the three headroom factors (keep the `total <= 0` guard). The
