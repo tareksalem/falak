@@ -195,7 +195,18 @@ place the capsule target lookup is wired). The `HasLocalSnapshot` method
 already exists on the snapshot side. Add a test asserting a
 snapshot-holding node outscores an identical node without the snapshot.
 
-**Status: Open.** Part of the gravity-scoring fix cluster (O9 + O10).
+**Status: FIXED (Session 19, gravity Step 3).** The election calculator now
+receives `gravity.WithSnapshotLookup(&electionSnapshotLookup{store:
+n.snapshotStore})` in `initializeElectionManager`; snapshot store init was
+reordered to run before election so the reference exists at construction. The
+`gravity.SnapshotLookup` interface was redesigned to `LocalSnapshot(...)
+(SnapshotInfo{Age,TTL}, ok)` and the factor now AGE-DECAYS the bonus
+(`(1-age/horizon)^exponent`, horizon = record TTL or a configurable 72h
+fallback) so a fresh snapshot scores ~1.0 and a near-TTL one ~0. Tag
+derivation (`ImageDigest` else `Image`) matches the runtime restore path.
+Tests in `election/gravity/snapshot_locality_test.go` +
+`node/election_snapshot_lookup_test.go`. See `.claude/PROGRESS.md`
+"Step 3". O11 replication (Step 4) remains open.
 
 ---
 

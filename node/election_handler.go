@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"go.uber.org/zap"
@@ -10,8 +11,10 @@ import (
 	"github.com/tareksalem/falak/capsule"
 	"github.com/tareksalem/falak/capsule/enums"
 	"github.com/tareksalem/falak/election"
+	"github.com/tareksalem/falak/election/gravity"
 	"github.com/tareksalem/falak/node/internal/events"
 	"github.com/tareksalem/falak/node/phonebook"
+	"github.com/tareksalem/falak/snapshot"
 )
 
 // electionLifecycleAdapter bridges election.LifecycleController to the
@@ -102,6 +105,43 @@ func (l *electionCapsuleLookup) NodesRunningCapsule(clusterPath, capsuleName str
 		}
 	}
 	return out
+}
+
+// electionSnapshotLookup implements gravity.SnapshotLookup by querying the
+// node's local snapshot.Store. It surfaces both snapshot presence and
+// freshness (age + TTL) so the gravity snapshot-locality factor can
+// age-decay the restore bonus.
+//
+// The tag passed by the factor is the capsule's ImageDigest (falling back
+// to Image) — the SAME derivation the runtime handler uses on its restore
+// path, so a snapshot this lookup reports is the one the runtime would
+// actually restore from.
+type electionSnapshotLookup struct {
+	store *snapshot.Store
+	now   func() time.Time // injectable clock; defaults to time.Now
+}
+
+// LocalSnapshot returns freshness info for the local snapshot matching the
+// (capsuleID, tag) pair, or ok=false when no such snapshot exists. Store
+// errors are treated as "no snapshot" — snapshot locality is a soft scoring
+// signal and must never block or skew an election on a transient read error.
+func (l *electionSnapshotLookup) LocalSnapshot(capsuleID, tag string) (gravity.SnapshotInfo, bool) {
+	if l == nil || l.store == nil {
+		return gravity.SnapshotInfo{}, false
+	}
+	rec, err := l.store.Get(capsuleID, tag)
+	if err != nil || rec == nil {
+		return gravity.SnapshotInfo{}, false
+	}
+	now := time.Now
+	if l.now != nil {
+		now = l.now
+	}
+	age := now().Sub(rec.CreatedAt)
+	if age < 0 {
+		age = 0
+	}
+	return gravity.SnapshotInfo{Age: age, TTL: rec.TTL}, true
 }
 
 // electionEventSink implements election.EventSink by publishing the

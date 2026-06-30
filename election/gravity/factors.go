@@ -1,6 +1,9 @@
 package gravity
 
 import (
+	"math"
+	"time"
+
 	"github.com/tareksalem/falak/capsule"
 	capsuleEnums "github.com/tareksalem/falak/capsule/enums"
 )
@@ -225,16 +228,88 @@ func factorDiversity(c *capsule.Capsule, node NodeState) factorContribution {
 	return applied(1)
 }
 
-// factorSnapshotLocality rewards nodes that already have a local
-// snapshot for the capsule. Restoring from a local snapshot avoids
-// the transfer latency, making startup significantly faster.
+// Snapshot-locality age-decay defaults. The bonus a snapshot-holding node
+// earns is not flat: it decays from ~1.0 (just captured) toward 0 as the
+// snapshot ages. A stale CRIU image can restore to a worse state than a
+// clean cold start, and decaying the bonus also damps the self-reinforcing
+// loop where a holder keeps winning re-elections and re-refreshing its own
+// snapshot (which would otherwise pin a workload to one node forever).
+const (
+	// defaultSnapshotDecayHorizon is the fallback age at which the
+	// snapshot-locality bonus reaches 0, used when a snapshot record carries
+	// no TTL. Tied to the typical snapshot TTL (72h).
+	defaultSnapshotDecayHorizon = 72 * time.Hour
+
+	// defaultSnapshotDecayExponent shapes the decay curve. 1.0 is a straight
+	// linear decay from full bonus at age 0 to zero at the horizon.
+	defaultSnapshotDecayExponent = 1.0
+)
+
+// snapshotDecayConfig parameterizes how the snapshot-locality bonus decays
+// with the held snapshot's age. It is configured on the Calculator via the
+// WithSnapshotDecay* options and consumed by factorSnapshotLocality.
+type snapshotDecayConfig struct {
+	// fallbackHorizon is the decay horizon used when the snapshot record
+	// reports no TTL (TTL <= 0). A snapshot whose age reaches the horizon
+	// contributes zero locality bonus.
+	fallbackHorizon time.Duration
+
+	// exponent shapes the decay curve applied to the remaining-life
+	// fraction (see snapshotAgeDecay). 1.0 is linear.
+	exponent float64
+}
+
+// defaultSnapshotDecay returns the built-in snapshot-locality decay config.
+func defaultSnapshotDecay() snapshotDecayConfig {
+	return snapshotDecayConfig{
+		fallbackHorizon: defaultSnapshotDecayHorizon,
+		exponent:        defaultSnapshotDecayExponent,
+	}
+}
+
+// snapshotAgeDecay returns the age-decayed snapshot-locality bonus in
+// [0, 1]. It yields 1.0 for a fresh snapshot (age <= 0), 0 for a snapshot at
+// or beyond the horizon, and a monotonically decreasing value in between
+// following (1 - age/horizon)^exponent. A non-positive horizon disables
+// decay (returns 1.0) — used for snapshots with no TTL only after the caller
+// has already substituted the configured fallback horizon.
+func snapshotAgeDecay(age, horizon time.Duration, exponent float64) float64 {
+	if horizon <= 0 {
+		return 1
+	}
+	if age <= 0 {
+		return 1
+	}
+	if age >= horizon {
+		return 0
+	}
+	remaining := 1 - float64(age)/float64(horizon)
+	if exponent == 1 {
+		return remaining
+	}
+	return math.Pow(remaining, exponent)
+}
+
+// factorSnapshotLocality rewards nodes that already have a local snapshot
+// for the capsule. Restoring from a local snapshot avoids the transfer
+// latency, making startup significantly faster.
 //
-// The factor is binary: 1.0 if the node has the snapshot, 0.0 if not.
-// The weight (default 0.6) is intentionally capped below resource
-// factors so a heavily loaded node with a snapshot still loses to an
-// empty node without one — preventing snapshot-holders from becoming
-// overloaded. Returns notApplicable when no SnapshotLookup is wired.
-func factorSnapshotLocality(c *capsule.Capsule, snapLookup SnapshotLookup) factorContribution {
+// The bonus is age-decayed rather than flat: a freshly captured snapshot
+// scores ~1.0 and the value falls toward 0 as the snapshot approaches its
+// decay horizon (its TTL when set, otherwise the calculator's configured
+// fallback horizon). See snapshotDecayConfig for why staleness is penalized.
+//
+// The tag is derived identically to the runtime restore path (ImageDigest,
+// falling back to Image) so a snapshot the runtime would actually restore
+// from is the same one this factor credits.
+//
+// The weight (default 0.6) is intentionally capped below the health/
+// headroom factors so a heavily loaded or degraded node holding a snapshot
+// still loses to a healthy empty node without one — preventing
+// snapshot-holders from becoming overloaded. Returns notApplicable when no
+// SnapshotLookup is wired (e.g. a calculator built without snapshot
+// support), leaving other calculators unaffected.
+func factorSnapshotLocality(c *capsule.Capsule, snapLookup SnapshotLookup, decay snapshotDecayConfig) factorContribution {
 	if snapLookup == nil {
 		return notApplicable
 	}
@@ -242,8 +317,13 @@ func factorSnapshotLocality(c *capsule.Capsule, snapLookup SnapshotLookup) facto
 	if tag == "" {
 		tag = c.Spec.Image // fall back to image ref if no digest
 	}
-	if snapLookup.HasLocalSnapshot(c.ID.String(), tag) {
-		return applied(1)
+	info, ok := snapLookup.LocalSnapshot(c.ID.String(), tag)
+	if !ok {
+		return applied(0)
 	}
-	return applied(0)
+	horizon := info.TTL
+	if horizon <= 0 {
+		horizon = decay.fallbackHorizon
+	}
+	return applied(snapshotAgeDecay(info.Age, horizon, decay.exponent))
 }

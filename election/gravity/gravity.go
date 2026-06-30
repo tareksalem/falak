@@ -1,6 +1,8 @@
 package gravity
 
 import (
+	"time"
+
 	"github.com/tareksalem/falak/capsule"
 )
 
@@ -27,13 +29,31 @@ type Result struct {
 	Inelig     Ineligibility // populated when Eligible is false
 }
 
-// SnapshotLookup checks whether the local node has a snapshot cached
-// for a given capsule. The gravity calculator uses this to reward nodes
-// that can restore instantly (avoiding transfer latency).
+// SnapshotInfo describes the freshness of a local snapshot for the purpose
+// of gravity scoring. Both fields are durations so the snapshot-locality
+// factor can age-decay the bonus without importing wall-clock concerns into
+// the pure gravity package — the lookup implementation owns the clock.
+type SnapshotInfo struct {
+	// Age is how long ago the snapshot was created. A fresh snapshot has
+	// Age ≈ 0; a stale one approaches (or exceeds) its decay horizon.
+	Age time.Duration
+
+	// TTL is the snapshot's configured time-to-live. When positive it is
+	// used as the decay horizon (the bonus reaches 0 exactly as the
+	// snapshot expires). Zero means "unbounded" — the calculator's
+	// configured fallback horizon is used instead.
+	TTL time.Duration
+}
+
+// SnapshotLookup checks whether the local node has a snapshot cached for a
+// given capsule and, if so, how fresh it is. The gravity calculator uses
+// this to reward nodes that can restore instantly (avoiding transfer
+// latency), decaying the reward as the snapshot ages toward staleness.
 type SnapshotLookup interface {
-	// HasLocalSnapshot returns true if the local node has a snapshot for
-	// the given (capsuleID, tag). The tag is typically the image digest.
-	HasLocalSnapshot(capsuleID, tag string) bool
+	// LocalSnapshot returns freshness info for the (capsuleID, tag)
+	// snapshot held by the local node. ok is false when the local node has
+	// no snapshot for the pair. The tag is typically the image digest.
+	LocalSnapshot(capsuleID, tag string) (info SnapshotInfo, ok bool)
 }
 
 // Calculator computes gravity scores for capsule/node pairs.
@@ -43,9 +63,10 @@ type SnapshotLookup interface {
 // concurrently. Construct one Calculator per cluster (because weights
 // are per-cluster) and reuse it for the cluster's lifetime.
 type Calculator struct {
-	weights  Weights
-	lookup   CapsuleTargetLookup
+	weights    Weights
+	lookup     CapsuleTargetLookup
 	snapLookup SnapshotLookup
+	snapDecay  snapshotDecayConfig
 }
 
 // CalculatorOption configures a Calculator.
@@ -77,12 +98,45 @@ func WithSnapshotLookup(l SnapshotLookup) CalculatorOption {
 	}
 }
 
+// WithSnapshotDecayHorizon overrides the fallback decay horizon used by the
+// snapshot-locality factor when a held snapshot carries no TTL. The bonus
+// decays from ~1.0 (fresh) toward 0 as the snapshot's age approaches the
+// horizon. A non-positive value resets the option to the default
+// (defaultSnapshotDecayHorizon). When a snapshot record reports a positive
+// TTL, that TTL takes precedence over this fallback.
+func WithSnapshotDecayHorizon(d time.Duration) CalculatorOption {
+	return func(c *Calculator) {
+		if d <= 0 {
+			d = defaultSnapshotDecayHorizon
+		}
+		c.snapDecay.fallbackHorizon = d
+	}
+}
+
+// WithSnapshotDecayExponent overrides the shape of the snapshot-locality
+// age-decay curve. The bonus follows (1 - age/horizon)^exponent, so:
+//   - exponent == 1 (default) is a straight linear decay,
+//   - exponent > 1 decays faster while the snapshot is young,
+//   - 0 < exponent < 1 decays more gently early on.
+//
+// A non-positive value resets the option to the default
+// (defaultSnapshotDecayExponent).
+func WithSnapshotDecayExponent(e float64) CalculatorOption {
+	return func(c *Calculator) {
+		if e <= 0 {
+			e = defaultSnapshotDecayExponent
+		}
+		c.snapDecay.exponent = e
+	}
+}
+
 // NewCalculator constructs a Calculator with the given options. Defaults:
 //   - Weights: DefaultWeights()
 //   - Lookup:  nil (capsule-typed factors will be skipped)
 func NewCalculator(opts ...CalculatorOption) *Calculator {
 	c := &Calculator{
-		weights: DefaultWeights(),
+		weights:   DefaultWeights(),
+		snapDecay: defaultSnapshotDecay(),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -147,7 +201,7 @@ func (c *Calculator) Calculate(
 	addFactor("reliability", factorReliability(node), c.weights.Reliability)
 	addFactor("execution_reliability", factorExecutionReliability(node), c.weights.ExecutionReliability)
 	addFactor("diversity", factorDiversity(capsuleObj, node), c.weights.Diversity)
-	addFactor("snapshot_locality", factorSnapshotLocality(capsuleObj, c.snapLookup), c.weights.SnapshotLocality)
+	addFactor("snapshot_locality", factorSnapshotLocality(capsuleObj, c.snapLookup, c.snapDecay), c.weights.SnapshotLocality)
 
 	// Load is a symmetric free-capacity factor: higher value == more free
 	// committed-capsule capacity. It is routed through addFactor like every

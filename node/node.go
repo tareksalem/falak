@@ -580,20 +580,23 @@ func (n *Node) Start() error {
 	// map. Disabled by default — opt in via WithServiceConfig.
 	n.initializeServiceHandler()
 
-	// 13. Create and start the election manager. Depends on metrics
-	// (state provider), capsules (lifecycle + store), pubsub, and
-	// the phonebook (for verifying election claim signatures).
-	if err := n.initializeElectionManager(); err != nil {
-		n.cleanup()
-		return fmt.Errorf("failed to start election manager: %w", err)
-	}
-
-	// 14. Create snapshot store + discovery. Depends on the data dir
-	// and pubsub being available.
+	// 13. Create snapshot store + discovery. Depends only on the data dir
+	// and pubsub being available, so it comes BEFORE the election manager:
+	// the gravity calculator wires the store as its snapshot-locality
+	// lookup, and that reference must exist at calculator construction time.
 	if n.containerRuntime != nil {
 		if err := n.initializeSnapshotStore(); err != nil {
 			n.logger.Warn("snapshot store init failed (snapshots disabled)", zap.Error(err))
 		}
+	}
+
+	// 14. Create and start the election manager. Depends on metrics
+	// (state provider), capsules (lifecycle + store), pubsub, the
+	// phonebook (for verifying election claim signatures), and the
+	// snapshot store (for the gravity snapshot-locality factor).
+	if err := n.initializeElectionManager(); err != nil {
+		n.cleanup()
+		return fmt.Errorf("failed to start election manager: %w", err)
 	}
 
 	// 15. Create and start the runtime handler. Depends on election
@@ -1413,7 +1416,19 @@ func (n *Node) initializeElectionManager() error {
 	// capsule) works in production, and so capsule-typed placement
 	// rules can be evaluated against live state.
 	lookup := &electionCapsuleLookup{manager: capsMgr, localNodeID: n.id.String()}
-	calc := gravity.NewCalculator(gravity.WithCapsuleTargetLookup(lookup))
+	calcOpts := []gravity.CalculatorOption{gravity.WithCapsuleTargetLookup(lookup)}
+
+	// Wire the local snapshot store as the gravity snapshot-locality lookup
+	// (O10). Without this the snapshot_locality factor is inert and snapshot
+	// presence never influences placement. Only wired when a snapshot store
+	// exists (nil on runtime-less / snapshot-disabled nodes), so those
+	// calculators correctly skip the factor instead of scoring it at zero.
+	if n.snapshotStore != nil {
+		calcOpts = append(calcOpts, gravity.WithSnapshotLookup(
+			&electionSnapshotLookup{store: n.snapshotStore},
+		))
+	}
+	calc := gravity.NewCalculator(calcOpts...)
 
 	// Every cluster uses the delay strategy: each node scores only itself
 	// and publishes a Claim. There is no per-cluster strategy override;
