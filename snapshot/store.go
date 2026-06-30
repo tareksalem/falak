@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +28,13 @@ type Record struct {
 	LastAccessed time.Time
 	TTL          time.Duration
 	InUse        bool // true while a container is running from this snapshot
+	// Pinned marks a standby replica held for high-availability (O11).
+	// Standby copies are NOT InUse (no container runs from them on the
+	// holder), so the LRU/over-cap eviction pass would otherwise reclaim
+	// exactly the replicas that keep the K-count whole. Pinned records are
+	// protected from over-cap eviction up to their TTL; once the TTL
+	// expires EvictExpired still reclaims them so the disk is bounded.
+	Pinned bool
 }
 
 // Store manages snapshot metadata in SQLite and coordinates eviction.
@@ -67,9 +75,10 @@ func New(dbPath, baseDir string, opts ...StoreOption) (*Store, error) {
 	return s, nil
 }
 
-// migrate creates the snapshots table if it doesn't exist.
+// migrate creates the snapshots table if it doesn't exist and applies
+// idempotent column additions for older databases.
 func (s *Store) migrate() error {
-	_, err := s.db.Exec(`
+	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS snapshots (
 			capsule_id    TEXT NOT NULL,
 			tag           TEXT NOT NULL,
@@ -80,12 +89,24 @@ func (s *Store) migrate() error {
 			last_accessed DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			ttl_seconds   INTEGER NOT NULL DEFAULT 259200,
 			in_use        INTEGER NOT NULL DEFAULT 0,
+			pinned        INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (capsule_id, tag)
 		);
 		CREATE INDEX IF NOT EXISTS idx_snapshots_capsule ON snapshots(capsule_id);
 		CREATE INDEX IF NOT EXISTS idx_snapshots_accessed ON snapshots(last_accessed);
-	`)
-	return err
+	`); err != nil {
+		return err
+	}
+
+	// Idempotent column addition for databases created before the O11
+	// standby-pin column existed. SQLite has no ADD COLUMN IF NOT EXISTS,
+	// so a duplicate-column error is treated as "already migrated".
+	if _, err := s.db.Exec(`ALTER TABLE snapshots ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("add pinned column: %w", err)
+		}
+	}
+	return nil
 }
 
 // Put inserts or replaces a snapshot record.
@@ -95,11 +116,11 @@ func (s *Store) Put(rec Record) error {
 
 	_, err := s.db.Exec(`
 		INSERT OR REPLACE INTO snapshots
-			(capsule_id, tag, size, path, checksum, created_at, last_accessed, ttl_seconds, in_use)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(capsule_id, tag, size, path, checksum, created_at, last_accessed, ttl_seconds, in_use, pinned)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rec.CapsuleID, rec.Tag, rec.Size, rec.Path, rec.Checksum,
 		rec.CreatedAt, rec.LastAccessed, int64(rec.TTL.Seconds()),
-		boolToInt(rec.InUse))
+		boolToInt(rec.InUse), boolToInt(rec.Pinned))
 	return err
 }
 
@@ -109,7 +130,7 @@ func (s *Store) Get(capsuleID, tag string) (*Record, error) {
 	defer s.mu.Unlock()
 
 	row := s.db.QueryRow(`
-		SELECT capsule_id, tag, size, path, checksum, created_at, last_accessed, ttl_seconds, in_use
+		SELECT capsule_id, tag, size, path, checksum, created_at, last_accessed, ttl_seconds, in_use, pinned
 		FROM snapshots WHERE capsule_id = ? AND tag = ?`, capsuleID, tag)
 
 	rec, err := scanRecord(row)
@@ -129,7 +150,7 @@ func (s *Store) ListByCapsule(capsuleID string) ([]Record, error) {
 	defer s.mu.Unlock()
 
 	rows, err := s.db.Query(`
-		SELECT capsule_id, tag, size, path, checksum, created_at, last_accessed, ttl_seconds, in_use
+		SELECT capsule_id, tag, size, path, checksum, created_at, last_accessed, ttl_seconds, in_use, pinned
 		FROM snapshots WHERE capsule_id = ?
 		ORDER BY created_at DESC`, capsuleID)
 	if err != nil {
@@ -164,6 +185,20 @@ func (s *Store) SetInUse(capsuleID, tag string, inUse bool) error {
 	return err
 }
 
+// SetPinned marks a snapshot as a pinned standby replica (or clears the
+// flag). Pinned standbys are protected from over-cap/LRU eviction up to
+// their TTL so a holder cannot silently drop the cluster below the
+// replication factor K. TTL-based expiry (EvictExpired) still applies.
+func (s *Store) SetPinned(capsuleID, tag string, pinned bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		UPDATE snapshots SET pinned = ? WHERE capsule_id = ? AND tag = ?`,
+		boolToInt(pinned), capsuleID, tag)
+	return err
+}
+
 // Delete removes a snapshot record from the database. Does NOT delete
 // the on-disk files — the caller is responsible for that.
 func (s *Store) Delete(capsuleID, tag string) error {
@@ -193,7 +228,7 @@ func (s *Store) EvictExpired() ([]Record, error) {
 
 	now := time.Now()
 	rows, err := s.db.Query(`
-		SELECT capsule_id, tag, size, path, checksum, created_at, last_accessed, ttl_seconds, in_use
+		SELECT capsule_id, tag, size, path, checksum, created_at, last_accessed, ttl_seconds, in_use, pinned
 		FROM snapshots
 		WHERE in_use = 0
 		  AND (julianday(?) - julianday(last_accessed)) * 86400 > ttl_seconds`,
@@ -223,7 +258,7 @@ func (s *Store) EvictOverCap(capsuleID string, maxPerCapsule int) ([]Record, err
 	defer s.mu.Unlock()
 
 	rows, err := s.db.Query(`
-		SELECT capsule_id, tag, size, path, checksum, created_at, last_accessed, ttl_seconds, in_use
+		SELECT capsule_id, tag, size, path, checksum, created_at, last_accessed, ttl_seconds, in_use, pinned
 		FROM snapshots WHERE capsule_id = ?
 		ORDER BY created_at DESC`, capsuleID)
 	if err != nil {
@@ -236,15 +271,20 @@ func (s *Store) EvictOverCap(capsuleID string, maxPerCapsule int) ([]Record, err
 		return nil, err
 	}
 
-	// Keep the newest maxPerCapsule, evict the rest (if not in use).
+	// Records are newest-first. A record is protected from over-cap
+	// eviction when it is InUse (a container runs from it) OR Pinned (a
+	// standby replica held for HA — O11). Protected records are always
+	// kept and never count against the cap. Among the unprotected
+	// records we keep the newest maxPerCapsule and evict the rest.
 	var evicted []Record
-	kept := 0
+	keptUnprotected := 0
 	for _, rec := range all {
-		if kept < maxPerCapsule || rec.InUse {
-			if !rec.InUse || kept < maxPerCapsule {
-				kept++
-				continue
-			}
+		if rec.InUse || rec.Pinned {
+			continue // always kept; does not consume the cap
+		}
+		if keptUnprotected < maxPerCapsule {
+			keptUnprotected++
+			continue
 		}
 		s.db.Exec(`DELETE FROM snapshots WHERE capsule_id = ? AND tag = ?`,
 			rec.CapsuleID, rec.Tag)
@@ -289,15 +329,16 @@ type scannable interface {
 func scanRecord(row scannable) (*Record, error) {
 	var rec Record
 	var ttlSec int64
-	var inUse int
+	var inUse, pinned int
 	err := row.Scan(
 		&rec.CapsuleID, &rec.Tag, &rec.Size, &rec.Path, &rec.Checksum,
-		&rec.CreatedAt, &rec.LastAccessed, &ttlSec, &inUse)
+		&rec.CreatedAt, &rec.LastAccessed, &ttlSec, &inUse, &pinned)
 	if err != nil {
 		return nil, err
 	}
 	rec.TTL = time.Duration(ttlSec) * time.Second
 	rec.InUse = inUse != 0
+	rec.Pinned = pinned != 0
 	return &rec, nil
 }
 
@@ -306,14 +347,15 @@ func scanRecords(rows *sql.Rows) ([]Record, error) {
 	for rows.Next() {
 		var rec Record
 		var ttlSec int64
-		var inUse int
+		var inUse, pinned int
 		if err := rows.Scan(
 			&rec.CapsuleID, &rec.Tag, &rec.Size, &rec.Path, &rec.Checksum,
-			&rec.CreatedAt, &rec.LastAccessed, &ttlSec, &inUse); err != nil {
+			&rec.CreatedAt, &rec.LastAccessed, &ttlSec, &inUse, &pinned); err != nil {
 			return nil, err
 		}
 		rec.TTL = time.Duration(ttlSec) * time.Second
 		rec.InUse = inUse != 0
+		rec.Pinned = pinned != 0
 		out = append(out, rec)
 	}
 	return out, rows.Err()

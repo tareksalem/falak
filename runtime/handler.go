@@ -31,13 +31,13 @@ type ElectionWon struct {
 // decide how to start the container. The node wiring layer populates
 // it from the full capsule.CapsuleSpec.
 type CapsuleSpec struct {
-	Name         string
-	Image        string
-	ImageDigest  string
-	Env          map[string]string
-	NetworkMode  NetworkMode
-	Ports        []PortMapping
-	Resources    ResourceLimits
+	Name          string
+	Image         string
+	ImageDigest   string
+	Env           map[string]string
+	NetworkMode   NetworkMode
+	Ports         []PortMapping
+	Resources     ResourceLimits
 	Command       []string
 	LogRetention  LogRetention
 	SnapshotTTL   time.Duration
@@ -156,6 +156,16 @@ type SnapshotBroadcaster interface {
 	BroadcastAvailable(capsuleID, tag, checksum string, size int64) error
 }
 
+// SnapshotReplicator is the narrow interface used to trigger holder-driven
+// replication of a freshly-captured snapshot to K standby peers (O11 HA
+// fast-restart). Replicate MUST be non-blocking: it hands the work to a
+// bounded background worker pool so the capture path and container start
+// are never gated on replication. Satisfied by snapshot.Replicator behind
+// a node-side adapter.
+type SnapshotReplicator interface {
+	Replicate(capsuleID, tag, checksum string, size int64)
+}
+
 // StatsRegistry is the narrow interface for registering per-capsule
 // metrics providers. The runtime handler feeds container stats into
 // this registry so scaling rules can evaluate live data. Satisfied by
@@ -184,18 +194,19 @@ type runningContainer struct {
 // snapshot or cold-start, manages the container lifecycle, and reports
 // outcomes back to the capsule lifecycle.
 type Handler struct {
-	runtime           Runtime
-	capsuleStore      CapsuleStore
-	snapshotStore     SnapshotStore
-	snapshotPuller    SnapshotPuller
-	snapshotBC        SnapshotBroadcaster
-	lifecycle         LifecycleNotifier
-	statsRegistry     StatsRegistry
-	groupView         GroupView
-	groupEmitter      GroupEventEmitter
-	depTimeout        time.Duration
-	pullHeartbeatTick time.Duration
-	logger            *zap.Logger
+	runtime            Runtime
+	capsuleStore       CapsuleStore
+	snapshotStore      SnapshotStore
+	snapshotPuller     SnapshotPuller
+	snapshotBC         SnapshotBroadcaster
+	snapshotReplicator SnapshotReplicator // guarded by mu (settable post-Start)
+	lifecycle          LifecycleNotifier
+	statsRegistry      StatsRegistry
+	groupView          GroupView
+	groupEmitter       GroupEventEmitter
+	depTimeout         time.Duration
+	pullHeartbeatTick  time.Duration
+	logger             *zap.Logger
 
 	// Event/reconcile tuning (functional options, no magic numbers).
 	reconcileInterval     time.Duration // periodic reconcile sweep cadence
@@ -219,9 +230,9 @@ type Handler struct {
 	// goes through the normal per-replica flow.
 	groupDispatched map[string]struct{}
 
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 
 	// group is the parked-start coordinator. nil when the handler runs
 	// without a GroupView (e.g. tests with no group module).
@@ -261,6 +272,14 @@ func WithLifecycleNotifier(n LifecycleNotifier) HandlerOption {
 // snapshot to the mesh.
 func WithSnapshotBroadcaster(bc SnapshotBroadcaster) HandlerOption {
 	return func(h *Handler) { h.snapshotBC = bc }
+}
+
+// WithSnapshotReplicator wires the holder-driven replicator invoked after
+// a successful capture to push K standby copies to peers (O11). Optional:
+// without it, capture still broadcasts availability but keeps a single
+// copy (the pre-O11 behaviour).
+func WithSnapshotReplicator(r SnapshotReplicator) HandlerOption {
+	return func(h *Handler) { h.snapshotReplicator = r }
 }
 
 // WithStatsRegistry wires the per-capsule metrics registry so
@@ -390,6 +409,58 @@ func NewHandler(rt Runtime, opts ...HandlerOption) *Handler {
 		opt(h)
 	}
 	return h
+}
+
+// SetSnapshotReplicator wires (or replaces) the holder-driven replicator
+// after construction. The snapshot mesh (Discovery + Replicator) is
+// created per-cluster on join, which happens AFTER the handler is built at
+// node start, so the node wiring injects the replicator here. Guarded by
+// the handler mutex because captureSnapshot reads it from a background
+// goroutine.
+func (h *Handler) SetSnapshotReplicator(r SnapshotReplicator) {
+	h.mu.Lock()
+	h.snapshotReplicator = r
+	h.mu.Unlock()
+}
+
+// snapshotReplicatorRef returns the currently-wired replicator under the
+// handler mutex.
+func (h *Handler) snapshotReplicatorRef() SnapshotReplicator {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.snapshotReplicator
+}
+
+// snapshotBroadcaster returns the currently-wired broadcaster under the
+// handler mutex. Guarded because SetSnapshotMesh may install it after the
+// handler has started its background capture goroutines.
+func (h *Handler) snapshotBroadcaster() SnapshotBroadcaster {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.snapshotBC
+}
+
+// snapshotPullerRef returns the currently-wired puller under the handler
+// mutex (settable post-start via SetSnapshotMesh).
+func (h *Handler) snapshotPullerRef() SnapshotPuller {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.snapshotPuller
+}
+
+// SetSnapshotMesh installs the full snapshot mesh (availability
+// broadcaster, remote puller, holder-driven replicator) after
+// construction. The mesh's Discovery + Replicator are created per-cluster
+// on join, which is AFTER the handler is built at node start, so the node
+// wiring injects them here. Any argument may be nil to leave that role
+// unwired. Guarded because the capture/start paths read these fields from
+// background goroutines.
+func (h *Handler) SetSnapshotMesh(bc SnapshotBroadcaster, puller SnapshotPuller, rep SnapshotReplicator) {
+	h.mu.Lock()
+	h.snapshotBC = bc
+	h.snapshotPuller = puller
+	h.snapshotReplicator = rep
+	h.mu.Unlock()
 }
 
 // markGroupDispatched marks every member capsule listed in ids as
@@ -565,8 +636,8 @@ func (h *Handler) startContainer(event ElectionWon) {
 		return
 	}
 
-	if h.snapshotPuller != nil {
-		path, pullErr := h.snapshotPuller.Pull(ctx, capsuleID, tag)
+	if puller := h.snapshotPullerRef(); puller != nil {
+		path, pullErr := puller.Pull(ctx, capsuleID, tag)
 		if pullErr == nil && path != "" {
 			h.restoreFromSnapshot(ctx, cID, capsuleID, tag, spec)
 			return
@@ -741,12 +812,21 @@ func (h *Handler) captureSnapshot(capsuleID, cID, tag string, spec *CapsuleSpec)
 	}
 
 	// Announce to the mesh that this node now has the snapshot.
-	if h.snapshotBC != nil {
-		if err := h.snapshotBC.BroadcastAvailable(capsuleID, tag, checksum, snapSize); err != nil {
+	if bc := h.snapshotBroadcaster(); bc != nil {
+		if err := bc.BroadcastAvailable(capsuleID, tag, checksum, snapSize); err != nil {
 			h.logger.Warn("runtime: snapshot broadcast failed",
 				zap.String("capsule_id", capsuleID),
 				zap.Error(err))
 		}
+	}
+
+	// Replicate to K standby peers for HA fast-restart (O11). The call is
+	// non-blocking — it enqueues onto a bounded background worker pool — so
+	// the capture path and container are never gated on replication. Done
+	// AFTER BroadcastAvailable so the replicator's holder count reflects
+	// any copies already known to the index.
+	if rep := h.snapshotReplicatorRef(); rep != nil {
+		rep.Replicate(capsuleID, tag, checksum, snapSize)
 	}
 
 	h.logger.Info("runtime: snapshot captured",

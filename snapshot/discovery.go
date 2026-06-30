@@ -92,11 +92,11 @@ type Discovery struct {
 	mu    sync.RWMutex
 	index map[indexKey][]indexEntry // capsule+tag → list of holders
 
-	topic *pubsub.Topic
-	sub   *pubsub.Subscription
-	ctx   context.Context
+	topic  *pubsub.Topic
+	sub    *pubsub.Subscription
+	ctx    context.Context
 	cancel context.CancelFunc
-	wg    sync.WaitGroup
+	wg     sync.WaitGroup
 }
 
 // DiscoveryOption configures a Discovery.
@@ -217,6 +217,52 @@ func (d *Discovery) FindHolders(capsuleID, tag string) []string {
 		out = append(out, e.NodeID)
 	}
 	return out
+}
+
+// PruneNode removes every index entry held by the given node across all
+// (capsule, tag) keys. It is the load-bearing half of the O11 HA story:
+// when a node fails or departs, the puller must stop targeting it.
+// Without this, addToIndex keeps returning a dead holder, the re-election
+// winner pulls from a corpse, the pull fails, and the capsule cold-starts
+// even though a replica existed elsewhere.
+//
+// The node-side wiring subscribes this method to the NodeFailed and
+// NodeDeparting events (event-driven, no cross-module call). Returns the
+// number of index entries pruned — useful for observability and tests.
+func (d *Discovery) PruneNode(nodeID string) int {
+	if nodeID == "" {
+		return 0
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	pruned := 0
+	for key, entries := range d.index {
+		kept := entries[:0]
+		for _, e := range entries {
+			if e.NodeID == nodeID {
+				pruned++
+				continue
+			}
+			kept = append(kept, e)
+		}
+		if len(kept) == 0 {
+			delete(d.index, key)
+			continue
+		}
+		// kept aliases entries' backing array; copy to a right-sized slice
+		// so the dropped tail does not retain stale entries.
+		trimmed := make([]indexEntry, len(kept))
+		copy(trimmed, kept)
+		d.index[key] = trimmed
+	}
+
+	if pruned > 0 {
+		d.logger.Info("snapshot index: pruned failed/departed holder",
+			zap.String("node", nodeID),
+			zap.Int("count", pruned))
+	}
+	return pruned
 }
 
 // QueryPeer sends a direct query to a specific peer asking if it holds

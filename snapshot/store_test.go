@@ -25,14 +25,14 @@ func TestPutAndGet(t *testing.T) {
 	s, _ := tempStore(t)
 
 	rec := Record{
-		CapsuleID: "cap1",
-		Tag:       "v1",
-		Size:      1024,
-		Path:      "/data/cap1/v1",
-		Checksum:  "abc123",
-		CreatedAt: time.Now(),
+		CapsuleID:    "cap1",
+		Tag:          "v1",
+		Size:         1024,
+		Path:         "/data/cap1/v1",
+		Checksum:     "abc123",
+		CreatedAt:    time.Now(),
 		LastAccessed: time.Now(),
-		TTL:       72 * time.Hour,
+		TTL:          72 * time.Hour,
 	}
 	if err := s.Put(rec); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -204,6 +204,73 @@ func TestEvictOverCap(t *testing.T) {
 	remaining, _ := s.ListByCapsule("cap1")
 	if len(remaining) != 2 {
 		t.Errorf("expected 2 remaining, got %d", len(remaining))
+	}
+}
+
+func TestSetPinned(t *testing.T) {
+	s, _ := tempStore(t)
+	now := time.Now()
+	s.Put(Record{CapsuleID: "cap1", Tag: "v1", Path: "/a", CreatedAt: now, LastAccessed: now, TTL: 72 * time.Hour})
+
+	if err := s.SetPinned("cap1", "v1", true); err != nil {
+		t.Fatalf("SetPinned: %v", err)
+	}
+	got, _ := s.Get("cap1", "v1")
+	if got == nil || !got.Pinned {
+		t.Fatalf("record should be pinned, got %+v", got)
+	}
+
+	s.SetPinned("cap1", "v1", false)
+	got, _ = s.Get("cap1", "v1")
+	if got.Pinned {
+		t.Error("record should not be pinned after clear")
+	}
+}
+
+// TestEvictOverCap_ProtectsPinnedStandby proves a pinned standby replica
+// survives over-cap eviction so a holder cannot silently drop below K
+// (plan part 7).
+func TestEvictOverCap_ProtectsPinnedStandby(t *testing.T) {
+	s, _ := tempStore(t)
+	now := time.Now()
+	// Three snapshots; the OLDEST is a pinned standby. With cap=2 the oldest
+	// would normally be evicted — but pinning protects it.
+	s.Put(Record{CapsuleID: "cap1", Tag: "standby", Path: "/a", CreatedAt: now.Add(-3 * time.Hour), LastAccessed: now, TTL: 72 * time.Hour, Pinned: true})
+	s.Put(Record{CapsuleID: "cap1", Tag: "v2", Path: "/b", CreatedAt: now.Add(-2 * time.Hour), LastAccessed: now, TTL: 72 * time.Hour})
+	s.Put(Record{CapsuleID: "cap1", Tag: "v3", Path: "/c", CreatedAt: now.Add(-1 * time.Hour), LastAccessed: now, TTL: 72 * time.Hour})
+
+	evicted, err := s.EvictOverCap("cap1", 2)
+	if err != nil {
+		t.Fatalf("EvictOverCap: %v", err)
+	}
+	for _, e := range evicted {
+		if e.Tag == "standby" {
+			t.Fatal("pinned standby must not be over-cap evicted")
+		}
+	}
+	if got, _ := s.Get("cap1", "standby"); got == nil {
+		t.Fatal("pinned standby should still exist after over-cap eviction")
+	}
+	// The two unprotected snapshots stay; pinned is extra on top of the cap.
+	all, _ := s.ListByCapsule("cap1")
+	if len(all) != 3 {
+		t.Errorf("expected 3 records (pinned + cap of 2), got %d", len(all))
+	}
+}
+
+// TestEvictExpired_ReclaimsPinnedAtTTL confirms pinning protects only from
+// over-cap eviction, not from TTL expiry — so disk stays bounded.
+func TestEvictExpired_ReclaimsPinnedAtTTL(t *testing.T) {
+	s, _ := tempStore(t)
+	old := time.Now().Add(-48 * time.Hour)
+	s.Put(Record{CapsuleID: "cap1", Tag: "old", Path: "/a", CreatedAt: old, LastAccessed: old, TTL: 1 * time.Second, Pinned: true})
+
+	evicted, err := s.EvictExpired()
+	if err != nil {
+		t.Fatalf("EvictExpired: %v", err)
+	}
+	if len(evicted) != 1 || evicted[0].Tag != "old" {
+		t.Errorf("pinned-but-TTL-expired standby should still be reclaimed, got %+v", evicted)
 	}
 }
 

@@ -158,6 +158,48 @@ overriding.
 | `WithMaxInspectErrors(n)` | `5` | Consecutive transient inspect failures tolerated during reconcile before a container is declared "runtime unreachable" and re-elected. |
 | `WithEventReconnectBackoff(d)` | `1s` | Base (jittered) delay between event-stream reconnect attempts after the stream drops. |
 
+### Snapshot replication (O11 — HA fast-restart)
+
+After a successful cold-start capture the holder proactively replicates
+the CRIU snapshot to **K** standby peers so a re-election winner can
+restore locally instead of cold-starting when the original holder dies.
+Replication is holder-driven and push-after-capture: the holder picks
+targets and asks each (over `/falak/snapshot/replicate/1.0`) to pull the
+bytes back via the existing transfer protocol. It runs on a bounded
+background worker pool and never blocks the capture path or container
+start.
+
+Targets are selected for **failure-domain spread** (prefer a different
+datacenter/node than the holder and than each other), filtered by
+**disk headroom** (never push a large archive onto a nearly-full node),
+and tiebroken by **power-of-two-choices** on a suitability score (sample a
+couple of candidates, pick the better — NOT the global best, which would
+herd every replica onto the beefiest nodes). A received standby is
+**pinned** (protected from over-cap/LRU eviction up to its TTL) and
+re-broadcast so every node's availability index reflects all K holders.
+The index is reconciled against membership: a `NodeFailed`/`NodeDeparting`
+prunes that node from the index so the puller never targets a dead holder.
+
+These tunables are functional options on `snapshot.NewReplicator`
+(`snapshot.WithReplication…`), with production-sensible defaults:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithReplicationFactor(k)` | `2` | K — number of EXTRA standby copies beyond the holder (K=2 → 3 total copies survive one failure). |
+| `WithReplicationConcurrency(n)` | `2` | Per-node cap on simultaneous outbound replication sequences (thundering-herd control). |
+| `WithReplicationRetries(n)` | `2` | Retry attempts per target after the first try (jittered backoff between tries). |
+| `WithReplicationBackoff(d)` | `2s` | Base inter-retry delay; actual wait is `base + uniform[0,base)`. |
+| `WithReplicationPrePushJitter(d)` | `3s` | Maximum random delay before a post-capture push so a cluster-wide rolling deploy does not fire N×K transfers in lockstep. |
+| `WithReplicationDiskHeadroomMB(mb)` | `2048` | Skip targets with less free disk than this (0 disables the filter). |
+| `WithReplicationSampleSize(n)` | `2` | Power-of-two-choices sample size for the per-domain gravity tiebreak. |
+| `WithReplicationQueueSize(n)` | `256` | Bound on the pending-job backlog; on overflow the least-urgent job is dropped. |
+
+Pin/eviction interplay: pinning protects a standby from **over-cap/LRU**
+eviction only — TTL expiry (`EvictExpired`) still reclaims it, so disk
+stays bounded. A capsule at **0 replicated copies** outranks one already at
+**K-1** in the work queue, so the most under-replicated snapshots make
+progress first.
+
 ---
 
 ## Examples

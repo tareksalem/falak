@@ -165,8 +165,44 @@ shapes. Ties into the gravity work: replicate toward the nodes the
 re-election is most likely to pick. Bandwidth/disk cost is the tradeoff —
 hence configurable, default small.
 
-**Status: Open.** Architectural; part of the snapshot/placement cluster
-(O9 + O10 + O11).
+**Status: Fixed (Session 20).** Implemented holder-driven,
+push-after-capture replication per
+`.claude/plans/snapshot-replication-o11.md` (all 8 parts):
+- **K (default 2), all timings/thresholds configurable** via
+  `snapshot.Replicator` functional options
+  (`WithReplicationFactor`, `WithReplicationConcurrency`,
+  `WithReplicationRetries`, `WithReplicationBackoff`,
+  `WithReplicationPrePushJitter`, `WithReplicationDiskHeadroomMB`,
+  `WithReplicationSampleSize`, `WithReplicationQueueSize`).
+- **Push transport:** after `BroadcastAvailable`, `captureSnapshot`
+  enqueues a non-blocking replication job. A bounded worker pool selects
+  targets and opens `/falak/snapshot/replicate/1.0`; the target services
+  the request by PULLING the bytes back over the existing
+  `TransferServer`/`PullSnapshot`, so no new bulk protocol was added.
+- **Target selection** (`snapshot/replication_select.go`):
+  failure-domain-primary spread (different DC/node than holder + each
+  other), disk-headroom filter, power-of-two-choices gravity tiebreak
+  (NOT global argmax). Healthy (Active), not-already-holding.
+- **ACK + bounded jittered retry**; WARN on shortfall (< K copies).
+- **Receiver re-broadcast:** a node receiving a standby pins it and
+  re-`BroadcastAvailable`s so every index reflects all K holders.
+- **Index↔membership reconciliation (load-bearing):** `Discovery.PruneNode`
+  wired to `NodeFailed`/`NodeDeparting` so the puller never targets a dead
+  holder.
+- **Standby pinning:** received standbys are `pinned` in the store;
+  `EvictOverCap` respects the flag (TTL still applies) so eviction never
+  silently drops below K.
+- **Thundering-herd control:** per-node outbound concurrency semaphore
+  (worker pool), jittered pre-push delay, and a priority queue where a
+  0-copy capsule outranks one already at K-1.
+
+Production wiring: the mesh (Discovery + Replicator + reconciler) comes up
+on first cluster join and is injected into the runtime handler via
+`Handler.SetSnapshotMesh`. Gravity input for the tiebreak is a node-side
+suitability proxy (free-resource ratios + connection reliability) because
+the election gravity calculator is local-node-only by the Session-13
+`StateProvider.LocalNode` simplification; the snapshot package consumes
+only the resulting float and the selection algorithm is pure/table-tested.
 
 ---
 

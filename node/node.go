@@ -21,13 +21,9 @@ import (
 
 	"github.com/tareksalem/falak/capsule"
 	"github.com/tareksalem/falak/election"
-	"github.com/tareksalem/falak/network/proxy"
-	falakrt "github.com/tareksalem/falak/runtime"
-	"github.com/tareksalem/falak/shared"
-	"github.com/tareksalem/falak/shared/secrets"
-	"github.com/tareksalem/falak/snapshot"
 	"github.com/tareksalem/falak/election/delay"
 	"github.com/tareksalem/falak/election/gravity"
+	"github.com/tareksalem/falak/network/proxy"
 	"github.com/tareksalem/falak/node/auth"
 	"github.com/tareksalem/falak/node/auth/certs"
 	"github.com/tareksalem/falak/node/health"
@@ -36,6 +32,10 @@ import (
 	"github.com/tareksalem/falak/node/phonebook"
 	"github.com/tareksalem/falak/node/reliability"
 	nodesync "github.com/tareksalem/falak/node/sync"
+	falakrt "github.com/tareksalem/falak/runtime"
+	"github.com/tareksalem/falak/shared"
+	"github.com/tareksalem/falak/shared/secrets"
+	"github.com/tareksalem/falak/snapshot"
 )
 
 // NodeState represents the lifecycle state of a node.
@@ -175,13 +175,18 @@ type Node struct {
 	// Service handler (created at Start when service.enabled=true).
 	// Owns the service.Manager, gossip publisher/subscriber, and the
 	// proxy manager. Default disabled — opt in via WithServiceConfig.
-	serviceHandler   *ServiceHandler
-	serviceConfig    ServiceConfig
+	serviceHandler    *ServiceHandler
+	serviceConfig     ServiceConfig
 	serviceConfigured bool
 
 	// Snapshot store + discovery (created alongside runtime handler).
 	snapshotStore     *snapshot.Store
 	snapshotDiscovery *snapshot.Discovery
+	// Snapshot replication mesh (O11 HA fast-restart). Created on first
+	// cluster join (needs the cluster-scoped gossip topic). nil on
+	// runtime-less nodes.
+	snapshotReplicator *snapshot.Replicator
+	snapshotReconciler *snapshotReconciler
 
 	// Secrets encryption key (derived from PSK on cluster join).
 	// Used to decrypt registry credentials at container start.
@@ -209,9 +214,9 @@ type Node struct {
 
 // ClusterConfig holds configuration for joining a cluster.
 type ClusterConfig struct {
-	Path           string                  // region/datacenter/cluster
-	PSK            []byte                  // Pre-shared key for authentication
-	BootstrapPeers []string                // Multiaddrs of bootstrap peers
+	Path           string                   // region/datacenter/cluster
+	PSK            []byte                   // Pre-shared key for authentication
+	BootstrapPeers []string                 // Multiaddrs of bootstrap peers
 	Certificates   *certs.ClusterCertConfig // nil = auto mode, set = external CA mode
 
 	// Orbits is the list of orbits to subscribe to in this cluster.
@@ -705,6 +710,20 @@ func (n *Node) cleanup() {
 		n.runtimeHandler.Stop()
 	}
 
+	// Tear down the snapshot replication mesh (O11). Order: reconciler
+	// (event subscriptions) → replicator (worker pool + stream handler) →
+	// discovery (gossip consumer + query handler). Done after the runtime
+	// handler so no in-flight capture can enqueue a new replication job.
+	if n.snapshotReconciler != nil {
+		n.snapshotReconciler.Stop()
+	}
+	if n.snapshotReplicator != nil {
+		n.snapshotReplicator.Stop()
+	}
+	if n.snapshotDiscovery != nil {
+		n.snapshotDiscovery.Stop()
+	}
+
 	// Stop election handler + manager — they sit on top of capsules,
 	// metrics, and pubsub, so we tear them down before their dependencies.
 	if n.electionHandler != nil {
@@ -859,6 +878,11 @@ func (n *Node) Join(ctx context.Context, cfg ClusterConfig) error {
 						zap.Error(err))
 				}
 			}
+
+			// Bring up the snapshot replication mesh (O11 HA fast-restart)
+			// now that the cluster's gossip topic is available. Best-effort
+			// and idempotent: only the first cluster gets the mesh.
+			n.startSnapshotReplication(cfg.Path)
 
 			// Derive the secrets encryption key from the PSK. Same on
 			// every node in the cluster — used to decrypt registry
@@ -1847,4 +1871,3 @@ func (n *Node) defaultDataDir() string {
 
 	return filepath.Join(baseDir, nodeName)
 }
-
