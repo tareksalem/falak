@@ -72,6 +72,13 @@ const defaultOrphanGrace = 30 * time.Second
 // also bounds how many distinct nodes the group will be attempted on.
 const defaultPlacementRetryCap = 3
 
+// defaultDeleteStopGrace is the graceful-stop window handed to the
+// runtime when tearing down a deleted capsule's local container. A
+// user-initiated delete is an orderly teardown, so the container is
+// given a chance to exit cleanly before being force-removed.
+// Configurable via WithCapsuleHandlerDeleteStopGrace.
+const defaultDeleteStopGrace = 10 * time.Second
+
 // placementFailedEntry holds the per-group bookkeeping the capsule
 // handler retains while it accumulates rollback rounds and after it
 // gives up on a same-node group placement. The 10.17 recovery path
@@ -159,6 +166,11 @@ type CapsuleHandler struct {
 	// group to arrive before reaping a received member capsule whose
 	// GroupID points nowhere. Default defaultOrphanGrace.
 	orphanGrace time.Duration
+
+	// deleteStopGrace is the graceful-stop window handed to the runtime
+	// when stopping a deleted capsule's local container. Default
+	// defaultDeleteStopGrace.
+	deleteStopGrace time.Duration
 
 	// pendingReaps holds the per-member cancel functions for in-flight
 	// orphan reap timers. Indexed by member capsule ID. Protected by mu.
@@ -317,6 +329,18 @@ func WithCapsuleHandlerOrphanGrace(d time.Duration) CapsuleHandlerOption {
 	}
 }
 
+// WithCapsuleHandlerDeleteStopGrace sets the graceful-stop window the
+// handler hands to the runtime when stopping a deleted capsule's local
+// container. Defaults to defaultDeleteStopGrace when the option is
+// omitted; non-positive values are ignored and the default is kept.
+func WithCapsuleHandlerDeleteStopGrace(d time.Duration) CapsuleHandlerOption {
+	return func(h *CapsuleHandler) {
+		if d > 0 {
+			h.deleteStopGrace = d
+		}
+	}
+}
+
 // NewCapsuleHandler creates a new capsule handler with an owned capsule manager.
 // The manager is created internally and its event handler is wired to the handler's
 // onManagerEvent method, which bridges capsule events to the node event bus AND
@@ -332,6 +356,7 @@ func NewCapsuleHandler(manager *capsule.Manager, opts ...CapsuleHandlerOption) *
 		placementRetryCap:     defaultPlacementRetryCap,
 		placementFailedGroups: make(map[capsule.CapsuleID]placementFailedEntry),
 		orphanGrace:           defaultOrphanGrace,
+		deleteStopGrace:       defaultDeleteStopGrace,
 		logger:                zap.NewNop(),
 	}
 	for _, opt := range opts {
@@ -2056,6 +2081,17 @@ func (h *CapsuleHandler) onManagerEvent(event capsule.ManagerEvent) {
 		}
 
 	case capsule.EventCapsuleDeleted:
+		// Stop+remove any container this node hosts for the deleted
+		// capsule BEFORE the rest of the teardown. This is the fix for
+		// O8: without it the Podman container is orphaned (still
+		// running, untracked) after the capsule metadata is gone. The
+		// same EventCapsuleDeleted path fires on the originating node
+		// (CLI delete) AND on every peer that processes the orbit
+		// withdrawal (onOrbitMessage -> manager.Delete), so wiring the
+		// stop here covers both the local-delete and withdrawal-received
+		// paths — each node tears down only the replicas it hosts.
+		h.stopLocalReplicas(event.Capsule)
+
 		h.eventBus.Publish(events.CapsuleWithdrawn{
 			BaseEvent:   events.NewBaseEvent(),
 			CapsuleID:   event.CapsuleID.String(),
@@ -2116,6 +2152,62 @@ func (h *CapsuleHandler) onManagerEvent(event capsule.ManagerEvent) {
 			ClusterPath:     event.Capsule.ClusterID,
 			PreviousGroupID: previous,
 		})
+	}
+}
+
+// stopLocalReplicas stops and removes the runtime container for every
+// replica of c that this node hosts (replica.NodeID == h.nodeID). It is
+// the O8 fix: capsule deletion must tear the local container down, not
+// just drop metadata and withdraw the orbit announcement.
+//
+// The stop is routed through runtimeGroupRollback.StopContainer — the
+// SAME intentional-teardown method the group-rollback path uses. That
+// method adds the container to the runtime handler's self-removal ignore
+// set BEFORE issuing Stop/Remove, so the resulting Podman died/remove
+// events are suppressed and this orderly teardown does NOT self-trigger
+// the O2 crash/re-election path (CapsuleExecutionFailed).
+//
+// Idempotent: a replica whose container is already gone (deleted on
+// another node, or never started locally) makes StopContainer return an
+// error, which is logged at Warn and tolerated — deletion always
+// completes even when the stop fails.
+func (h *CapsuleHandler) stopLocalReplicas(c *capsule.Capsule) {
+	if c == nil {
+		return
+	}
+
+	h.mu.RLock()
+	rollback := h.runtimeRollback
+	grace := h.deleteStopGrace
+	h.mu.RUnlock()
+
+	// Without a runtime rollback hook (tests, runtime-disabled
+	// deployments) there is no local container to stop.
+	if rollback == nil {
+		return
+	}
+	if grace <= 0 {
+		grace = defaultDeleteStopGrace
+	}
+
+	for _, replica := range c.Replicas {
+		if replica.NodeID != h.nodeID {
+			continue
+		}
+		if err := rollback.StopContainer(c.ID.String(), string(replica.ReplicaID), grace); err != nil {
+			// Tolerate: the container may already be gone (idempotent
+			// teardown). Deletion must complete regardless.
+			h.logger.Warn("failed to stop local container on capsule delete (often expected: container already gone)",
+				zap.String("capsule", c.ID.String()),
+				zap.String("replica", string(replica.ReplicaID)),
+				zap.String("node", h.nodeID),
+				zap.Error(err))
+			continue
+		}
+		h.logger.Info("stopped local container for deleted capsule",
+			zap.String("capsule", c.ID.String()),
+			zap.String("replica", string(replica.ReplicaID)),
+			zap.String("node", h.nodeID))
 	}
 }
 

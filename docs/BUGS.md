@@ -239,8 +239,30 @@ self-removal ignore-set added in O2/F28 — this is an intentional
 teardown, not a crash). Add an integration test: create → running →
 delete → assert container stopped AND no re-election fired.
 
-**Status: Open.** Higher priority — leaves orphaned containers on every
-delete.
+**Status: FIXED (Session 20).** `CapsuleHandler.stopLocalReplicas`
+(`node/capsule_handler.go`) is invoked from the `EventCapsuleDeleted`
+branch of `onManagerEvent` BEFORE the rest of the teardown. It iterates
+`event.Capsule.Replicas` and, for every replica where
+`replica.NodeID == h.nodeID`, calls
+`runtimeGroupRollback.StopContainer(capsuleID, replicaID, grace)` — the
+SAME intentional-stop method the group-rollback path uses, which adds the
+container to the runtime handler's self-removal ignore set BEFORE issuing
+Stop/Remove (runtime `handler.go:1600`), so the resulting Podman
+died/remove events are suppressed and the delete does NOT self-trigger
+the O2 re-election. Both the local CLI-delete path and the
+withdrawal-received path (`onOrbitMessage` "withdrawal" branch) converge
+on `capsule.Manager.Delete` → `EventCapsuleDeleted`, so one wiring covers
+both; each node stops only the replicas it hosts. Idempotent: a missing
+container makes `StopContainer` return an error which is logged at Warn
+and tolerated (deletion always completes). Grace window is configurable
+via `WithCapsuleHandlerDeleteStopGrace` (default 10s).
+Tests: `node/capsule_handler_delete_test.go`
+(`TestEventCapsuleDeleted_StopsLocalContainer`,
+`TestEventCapsuleDeleted_SkipsRemoteReplica`,
+`TestEventCapsuleDeleted_IdempotentWhenNoLocalContainer`,
+`TestEventCapsuleDeleted_NoRollbackHookNoPanic`); the O2 runtime-level
+guard `TestHandler_IntentionalRemoveIgnored` covers the ignore-set
+suppression that delete reuses.
 
 ---
 
