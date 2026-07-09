@@ -171,13 +171,61 @@ func (m *Manager) runGroupElection(
 		}
 	}
 
-	// Local group claim dedup: a second concurrent HandleGroupClaimRequest
-	// for the same group on the same node must not publish twice.
-	if !m.tryLocalGroupClaim(req.GroupID) {
-		m.logger.Debug("local node already has a group claim in flight",
+	// Reserve the local group-claim slot before publishing. If another
+	// round on this node beat us to it, park on the slot's release channel
+	// (bounded by the round deadline) rather than jumping straight to the
+	// remote verdict. On release we RE-RUN CalculateCombinedFit against the
+	// current node state — which now includes any reservation the prior
+	// round recorded on Won — and re-decide:
+	//   - still eligible  → the prior round did not commit this node to a
+	//     conflicting group (or committed THIS group, which the caller's
+	//     re-election intends to re-place): acquire the slot and publish.
+	//   - now ineligible  → a live reservation from a DIFFERENT concurrent
+	//     group over-commits the node: step aside to the remote verdict.
+	//
+	// This is the group twin of the single-replica park-wake-redecide loop
+	// in runElection (manager.go), minus the per-replica fan-out: a group
+	// is claimed as a unit, so there is no replica dimension to re-decide.
+	// It is what makes releasing the slot on Won safe — a same-node
+	// re-election can re-acquire and re-place the group instead of timing
+	// out with "no claim heard" (O5).
+	//
+	// NOTE: the "different concurrent group over-commits the node" branch
+	// relies on CalculateCombinedFit observing the committed capacity of an
+	// existing reservation. That requires the StateProvider to subtract the
+	// node's held pendingReservations from free capacity. The production
+	// provider (node/metrics/provider.go) does not yet do this, so today the
+	// over-commit refusal on this branch is only exercised by tests wired
+	// with a reservation-aware provider. Two concurrent rounds for the SAME
+	// group cannot reach this loop in production — HandleGroupClaimRequest
+	// dedupes by groupInflight under m.mu before any round spawns — so the
+	// same-group self-dedup is guaranteed upstream; this loop's re-decide is
+	// the different-group anti-over-commit dimension only.
+	for !m.tryLocalGroupClaim(req.GroupID) {
+		m.logger.Debug("local group-claim slot taken while waiting; awaiting sibling outcome",
 			zap.String("group", string(req.GroupID)))
-		m.waitForRemoteGroupVerdict(ctx, req, deadline, claimsCh)
-		return
+		if !m.waitForGroupClaimReleased(ctx, req.GroupID, deadline) {
+			m.waitForRemoteGroupVerdict(ctx, req, deadline, claimsCh)
+			return
+		}
+		// Slot released — re-decide against the latest node state. Refresh
+		// the state snapshot so the re-run observes the current reservation
+		// picture rather than the stale snapshot from round start.
+		state, err = m.provider.LocalNode(req.ClusterPath)
+		if err != nil {
+			m.reportGroup(req, GroupClaimOutcomeEnum.Failed(), "", 0, "local node state lookup failed: "+err.Error())
+			return
+		}
+		fit = calc.CalculateCombinedFit(members, state)
+		if !fit.Result.Eligible {
+			m.logger.Debug("group no longer eligible after sibling round resolved; awaiting remote verdict",
+				zap.String("group", string(req.GroupID)),
+				zap.String("ineligible_member", fit.IneligibleMember))
+			m.waitForRemoteGroupVerdict(ctx, req, deadline, claimsCh)
+			return
+		}
+		// Refresh the score so the claim we publish reflects the re-run.
+		score = float64(fit.Result.Score)
 	}
 
 	publishedAt := time.Now()
@@ -208,6 +256,16 @@ func (m *Manager) runGroupElection(
 		remaining := time.Until(tiebreakDeadline)
 		if remaining <= 0 {
 			m.recordReservation(req, m.nodeID, score)
+			// Release the local group slot only AFTER the reservation is
+			// durably recorded. Order is load-bearing (O5): a same-node
+			// re-election parked in waitForGroupClaimReleased can only
+			// re-decide once the slot frees, and by then the reservation is
+			// visible so its CalculateCombinedFit re-run reflects the
+			// committed capacity. Releasing here (instead of retaining the
+			// slot across a Won round) is what unblocks a group re-election
+			// on the same node after a member crash. reportGroup's Won arm
+			// does NOT release — that would double-release.
+			m.releaseLocalGroupClaim(req.GroupID)
 			m.reportGroup(req, GroupClaimOutcomeEnum.Won(), m.nodeID, score, "")
 			return
 		}
@@ -233,6 +291,9 @@ func (m *Manager) runGroupElection(
 			}
 		case <-time.After(remaining):
 			m.recordReservation(req, m.nodeID, score)
+			// Release AFTER the reservation is recorded (see the sibling
+			// Won arm above for the O5 ordering rationale).
+			m.releaseLocalGroupClaim(req.GroupID)
 			m.reportGroup(req, GroupClaimOutcomeEnum.Won(), m.nodeID, score, "")
 			return
 		}
@@ -352,7 +413,13 @@ func (m *Manager) removeGroupInflight(id capsule.CapsuleID) {
 // tryLocalGroupClaim atomically marks a group as locally claimed and
 // returns true when the caller obtained the slot. Subsequent callers
 // for the same group receive false until releaseLocalGroupClaim is
-// invoked.
+// invoked; they should wait via waitForGroupClaimReleased before
+// retrying or stepping aside.
+//
+// Mirrors tryClaimCapsule: it also installs a fresh release channel for
+// this generation so a round parked in waitForGroupClaimReleased wakes
+// when the slot frees. The channel is (re)installed only when absent,
+// matching the single-replica generation semantics.
 func (m *Manager) tryLocalGroupClaim(id capsule.CapsuleID) bool {
 	m.localGroupClaimsMu.Lock()
 	defer m.localGroupClaimsMu.Unlock()
@@ -360,16 +427,70 @@ func (m *Manager) tryLocalGroupClaim(id capsule.CapsuleID) bool {
 		return false
 	}
 	m.localGroupClaims[id] = true
+	if _, ok := m.groupClaimReleased[id]; !ok {
+		m.groupClaimReleased[id] = make(chan struct{})
+	}
 	return true
 }
 
 // releaseLocalGroupClaim clears the local group-claim flag so a future
-// round (e.g. after a remote loss + retry on a different node) can
-// publish.
+// round (e.g. after a remote loss + retry on a different node, or a
+// same-node re-election after this round won) can publish.
+//
+// Mirrors releaseCapsuleClaim: closing the per-group release channel
+// wakes every goroutine parked in waitForGroupClaimReleased, then the
+// channel is dropped so the next tryLocalGroupClaim allocates a fresh
+// one for the next generation of waiters. Idempotent: a group with no
+// installed channel (never claimed, or already released) is a no-op, so
+// this never closes a closed channel.
 func (m *Manager) releaseLocalGroupClaim(id capsule.CapsuleID) {
 	m.localGroupClaimsMu.Lock()
 	defer m.localGroupClaimsMu.Unlock()
 	delete(m.localGroupClaims, id)
+	if ch, ok := m.groupClaimReleased[id]; ok {
+		close(ch)
+		delete(m.groupClaimReleased, id)
+	}
+}
+
+// waitForGroupClaimReleased blocks until the local group-claim slot for
+// group id is released, ctx is cancelled, or the deadline passes.
+// Returns true when the slot was released (caller may re-decide and
+// retry); false on cancellation or timeout (caller should step aside to
+// waitForRemoteGroupVerdict).
+//
+// Mirrors waitForCapsuleClaimReleased: the wait is broadcast — every
+// goroutine parked for the same group wakes when the slot frees and each
+// retries tryLocalGroupClaim independently; only one succeeds and the
+// rest park again on the next generation channel.
+func (m *Manager) waitForGroupClaimReleased(ctx context.Context, id capsule.CapsuleID, deadline time.Time) bool {
+	m.localGroupClaimsMu.Lock()
+	if !m.localGroupClaims[id] {
+		// Already released between the caller's tryClaim and this wait.
+		m.localGroupClaimsMu.Unlock()
+		return true
+	}
+	ch, ok := m.groupClaimReleased[id]
+	if !ok {
+		// Defensive: the holder didn't install a channel. Treat as
+		// released so the caller retries immediately.
+		m.localGroupClaimsMu.Unlock()
+		return true
+	}
+	m.localGroupClaimsMu.Unlock()
+
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-ch:
+		return true
+	case <-time.After(remaining):
+		return false
+	}
 }
 
 // recordReservation installs (or refreshes) a group capacity reservation

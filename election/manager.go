@@ -209,7 +209,16 @@ type Manager struct {
 	// group ID on the local node. Without this guard, two concurrent
 	// HandleGroupClaimRequest calls for the same group would both
 	// publish, doubling cluster traffic and confusing the tiebreak.
+	//
+	// groupClaimReleased mirrors claimReleased for the group dimension: a
+	// fresh channel is installed per group when the slot is acquired and
+	// closed-then-deleted when the slot is released. A round parked in
+	// waitForGroupClaimReleased watches this channel and re-decides group
+	// eligibility on close — this is what lets a same-node re-election
+	// re-place a group after the prior round released its slot on Won
+	// (O5). Both maps are guarded by localGroupClaimsMu.
 	localGroupClaims   map[capsule.CapsuleID]bool
+	groupClaimReleased map[capsule.CapsuleID]chan struct{}
 	localGroupClaimsMu sync.Mutex
 
 	// pendingReservations records group capacity reservations on the
@@ -334,6 +343,7 @@ func NewManager(defaultStrategy Strategy, opts ...ManagerOption) *Manager {
 		localClaims:           make(map[string]bool),
 		claimReleased:         make(map[string]chan struct{}),
 		localGroupClaims:      make(map[capsule.CapsuleID]bool),
+		groupClaimReleased:    make(map[capsule.CapsuleID]chan struct{}),
 		pendingReservations:   make(map[capsule.CapsuleID]*groupReservation),
 		perClusterCalc:        make(map[string]*gravity.Calculator),
 		perClusterTimeout:     make(map[string]time.Duration),
@@ -1056,4 +1066,16 @@ func (m *Manager) CancelGroupInFlight(id capsule.CapsuleID) {
 	if ok && entry.cancel != nil {
 		entry.cancel()
 	}
+}
+
+// HasGroupInFlight reports whether a group election round for the given
+// group is currently in flight. Used by tests (and the node handler's
+// same-node re-election coordination) to ensure a prior round has fully
+// drained before a re-election is re-fired, so the re-fire is not deduped
+// by the still-running original round.
+func (m *Manager) HasGroupInFlight(id capsule.CapsuleID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.groupInflight[id]
+	return ok
 }

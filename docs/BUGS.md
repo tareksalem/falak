@@ -398,9 +398,109 @@ the durable-state replacement for the retained slot needs its own design
 with the reservation as the durable anti-over-commit guard). Needs
 architect review before implementing.
 
-**Status: Open — deferred (out of O4 scope by plan).** No live repro yet;
-the likely trigger is single-node group crash recovery. The O4 fix
-(F30) closes the standalone-capsule loop only.
+**Status: FIXED (Session 20).** Three-part fix in `election/manager.go`,
+`election/manager_group.go`, `node/capsule_handler.go`:
+- **(a) Release the group slot on Won after the reservation is recorded.**
+  Added `groupClaimReleased map[capsule.CapsuleID]chan struct{}` alongside
+  `localGroupClaims` (guarded by `localGroupClaimsMu`); `tryLocalGroupClaim`
+  installs a fresh channel, `releaseLocalGroupClaim` closes-and-deletes it
+  idempotently, and new `waitForGroupClaimReleased` parks on it — all mirroring
+  the single-replica helpers. Both Won arms of `runGroupElection` now
+  `releaseLocalGroupClaim(req.GroupID)` AFTER `recordReservation` and BEFORE
+  `reportGroup(...Won())`. `reportGroup`'s Won arm does NOT release (no
+  double-release). The Failed-arm release is unchanged.
+- **(b) Park-wake-redecide loop.** The `tryLocalGroupClaim`-fails jump to
+  `waitForRemoteGroupVerdict` is replaced by a loop that parks on
+  `waitForGroupClaimReleased` (bounded by the round deadline) and, on release,
+  re-runs `CalculateCombinedFit` against the current node state: still eligible
+  → acquire slot + publish; ineligible (a live reservation from a DIFFERENT
+  group over-commits the node) → step aside. Group twin of the single-replica
+  loop, minus the per-replica fan-out.
+- **(c) Clear the stale reservation on same-node re-election triggers.** AUDIT
+  finding: the single-node MEMBER-CRASH / rollback path
+  (`onMemberPlacementFailed`) ALREADY cleared the reservation before refiring
+  (`CancelGroupInFlight` → `ClearGroupReservation` → `GroupReelectionRequested`)
+  — so the single-node O5 is a SLOT deadlock, closed by (a)+(b), not a
+  reservation deadlock. The plan's premise (that the node-FAILURE path already
+  cleared) was inverted: the node-failure paths
+  (`emitGroupReelectionForGroup`, `maybeEmitGroupReelection`) only cancelled
+  in-flight; they now also `ClearGroupReservation` in the same
+  cancel→clear→refire order, removing a guaranteed-stale reservation (held by
+  the failed node) that would otherwise over-commit the surviving node.
+
+Tests (`election/manager_group_o5_test.go`, `node/capsule_group_o5_test.go`):
+`TestRunGroupElection_WonReleasesGroupSlot`,
+`TestGroupReElection_SameNode_MidFanout` (manager-level, reservation-live
+re-win), `TestGroupClaim_ConcurrentSameGroup_NoDoubleClaim`,
+`TestGroupClaim_ConcurrentDifferentGroups_ReservationRefuses`,
+`TestGroupReElection_SameNode_AfterWin` (node-level end-to-end). The two
+SameNode/slot-release tests fail on the pre-fix code with "group election
+timeout (no claim heard)" / "group slot not released after win" and pass after.
+Concurrency tests green at `-count=20`.
+
+---
+
+### O5b. Same-node group re-election is refused by member self-anti-affinity (stale member bindings never cleared)
+
+**Found (Session 20, while landing O5):** a same-node group re-election is
+refused by MEMBER self-anti-affinity before the group election can win.
+Trace: each group member's per-replica election records a durable
+replica→node binding (`WinElectionWithBinding`→`AssignReplica`, `NodeID` set).
+When a same-node group re-election runs `CalculateCombinedFit`, `IsEligible`
+per member consults `electionCapsuleLookup.NodesRunningCapsule`
+(`node/election_handler.go`), which returns any node with a member replica
+whose `NodeID != ""` — so a still-bound member makes the local node
+self-anti-affinity-excluded → "group ineligible: member X does not fit" →
+`GroupClaimFailed`.
+
+**Root cause:** no same-node group re-election trigger clears member bindings.
+`emitGroupReelectionForGroup` / `maybeEmitGroupReelection` / the
+`onMemberPlacementFailed` rollback resync sibling FSM state (`SyncStatus`→
+Announced / `StopCapsule`) and clear the group reservation, but NONE call
+`capsule.Manager.UnassignReplica` on siblings. The only production caller of
+`UnassignReplica` is `onContainerCrash` (the O3 per-replica crash path).
+
+**Severity:** latent on multi-node (masked whenever a fresh, never-bound node
+can satisfy fit); FATAL on single-node and under capacity pressure (when the
+only eligible home is a previously-bound node, the group wedges — the same
+failure O5 targets, just via a different axis). The fix mirrors O3: add
+`UnassignReplica`-per-sibling to the same-node group re-election trigger paths
+before refiring. Separate from O5 (reservation-slot lifecycle) — this is
+replica-binding lifecycle.
+
+**Status: Open — filed, NOT fixed under O5 (orthogonal axis; own tests owed).**
+The O5 node-level `TestGroupReElection_SameNode_AfterWin` clears member
+bindings in test setup (with a TRIPWIRE comment pointing here) to isolate the
+O5 slot mechanic; when O5b lands, that manual clear should be removed and the
+test driven through the real trigger.
+
+---
+
+### O13. 3-node join convergence gap — joiner gets an incomplete roster (`expected N, got N-1`)
+
+**Observed:** ~10 3-node integration tests fail at CLUSTER-JOIN (before any
+restart) with `expected N phonebook entries ... got N-1 (timeout)`. This is
+the long-standing "pre-existing O1 failures" set — but the architect (Session
+19) flags it as a SEPARATE convergence bug, NOT O1's restart-reconnect issue:
+no connection dropped, the third entry never *propagated* in time.
+
+**Hypothesis (architect, needs confirmation):** the roster handed to a joiner
+at AuthComplete (`ClusterMembersReceived` path) is the voucher's OWN phonebook
+snapshot, which is itself incomplete at that instant (e.g. node2 vouches node3
+before node2 has finished recording node1). There is no anti-entropy that
+SYNCHRONOUSLY completes the roster before the test asserts — delta-sync heals
+it eventually but too late for the assertion. Classic push-incomplete-roster
++ async-sync-heals-late gossip gap. Alternatives: PendingAuth entries not
+counted; sync latency vs assertion timing.
+
+**Next step:** trace `ClusterMembersReceived` roster construction + the
+voucher's roster-send at AuthComplete; confirm whether the joiner inserts ALL
+members. Fix = ensure the join path converges the full roster synchronously
+(or the test waits for a sync round).
+
+**Status: Open.** Distinct from O1. Fixing O1 will NOT turn these green (only
+`TestElection_NodeFailureReElection`, which has a real node drop, should go
+green from O1).
 
 ---
 
@@ -433,10 +533,12 @@ a per-peer reconnect with jittered backoff is a good fit; key it off
 phonebook entries and the SWIM `failed`/`departed → seen-again`
 transitions.
 
-**Status: Open — ON HOLD (deferred by request, Session 18).** Note: this
-gap is what surfaces as the `TestElection_NodeFailureReElection`
-integration failure (`expected 3 phonebook entries, got 2`); fixing O1
-is expected to turn that test green.
+**Status: Open.** Architect-designed Session 19 (phonebook-driven
+reconnector that DRIVES re-auth via a ReauthWithPeerRequested event, not
+dial-only; --bootstrap as permanent seeds; skip Departed; PendingAuth gate
++ per-peer capped backoff). Note: fixing O1 turns `TestElection_NodeFailureReElection`
+green but NOT the other 3-node join failures — those are O13 (separate
+convergence bug).
 
 ---
 

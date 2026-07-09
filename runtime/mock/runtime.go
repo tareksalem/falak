@@ -37,9 +37,10 @@ type Runtime struct {
 	pulled     map[string]bool // image -> pulled
 
 	// Injected behaviors for testing.
-	pullErr        error
-	pullErrByImage map[string]error
-	createErr      error
+	pullErr          error
+	pullErrByImage   map[string]error
+	pullDelayByImage map[string]time.Duration
+	createErr        error
 	startErr       error
 	stopErr        error
 	checkpointErr  error
@@ -94,6 +95,21 @@ func WithPullErrorForImage(image string, err error) Option {
 	}
 }
 
+// WithPullDelayForImage makes Pull block for d before succeeding when
+// called with the matching image string. Useful for tests that need one
+// member of a group to lag behind Running (so the group's capacity
+// reservation stays live) WITHOUT injecting a failure that would trigger
+// the placement-rollback path. The delay is applied before the container
+// bookkeeping runs and does not hold the runtime lock.
+func WithPullDelayForImage(image string, d time.Duration) Option {
+	return func(r *Runtime) {
+		if r.pullDelayByImage == nil {
+			r.pullDelayByImage = make(map[string]time.Duration)
+		}
+		r.pullDelayByImage[image] = d
+	}
+}
+
 // WithCreateError injects an error on every Create call.
 func WithCreateError(err error) Option {
 	return func(r *Runtime) { r.createErr = err }
@@ -145,7 +161,23 @@ func (r *Runtime) record(method, id, image, path string) {
 // registered via WithPullErrorForImage it takes precedence over the
 // global WithPullError; otherwise the call succeeds and records the
 // image as pulled.
-func (r *Runtime) Pull(_ context.Context, image string, opts ...runtime.PullOption) error {
+func (r *Runtime) Pull(ctx context.Context, image string, opts ...runtime.PullOption) error {
+	// Apply any configured pull delay BEFORE taking the lock so the mock
+	// stays usable by other goroutines while one image "pulls" slowly.
+	// The delay is honoured only when the pull would otherwise succeed.
+	r.mu.Lock()
+	delay, hasDelay := r.pullDelayByImage[image]
+	r.mu.Unlock()
+	if hasDelay && delay > 0 {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.record("Pull", "", image, "")

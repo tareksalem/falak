@@ -1694,13 +1694,22 @@ func (h *CapsuleHandler) emitGroupReelectionForGroup(
 	}
 
 	// Cancel any in-flight original group election so the new
-	// reelection event is not deduped. Safe no-op when no round is
-	// active.
+	// reelection event is not deduped, THEN clear the stale capacity
+	// reservation before re-firing. Ordering is load-bearing and mirrors
+	// the member-crash path (onMemberPlacementFailed): cancel-round
+	// (releases the group-claim slot) → clear-reservation → refire. The
+	// reservation holder is the failed node (this variant is only reached
+	// after onNodeFailed's ReservationNodeID == failed.NodeID filter), so
+	// the reservation is definitively stale; leaving it would over-commit
+	// the surviving node's headroom and reproduce the O5 reservation
+	// deadlock the re-election is trying to escape. Both calls are
+	// idempotent no-ops when nothing is in flight / reserved.
 	h.mu.RLock()
 	forget := h.electionForget
 	h.mu.RUnlock()
 	if forget != nil {
 		forget.CancelGroupInFlight(group.ID)
+		forget.ClearGroupReservation(group.ID)
 	}
 
 	h.eventBus.Publish(events.GroupReelectionRequested{
@@ -1812,12 +1821,21 @@ func (h *CapsuleHandler) maybeEmitGroupReelection(
 	}
 
 	// Cancel any in-flight group round so the new GroupReelectionRequested
-	// is not deduped by an old round still walking the wait timer.
+	// is not deduped by an old round still walking the wait timer, THEN
+	// clear the stale capacity reservation before re-firing. Same
+	// ordering as the member-crash path (onMemberPlacementFailed):
+	// cancel-round (releases the group-claim slot) → clear-reservation →
+	// refire. On the node-failure path the reservation is held by the
+	// failed node (or already absent); ClearGroupReservation is
+	// idempotent, so clearing it here removes a guaranteed-stale
+	// reservation that would otherwise over-commit the surviving node and
+	// reproduce the O5 reservation deadlock.
 	h.mu.RLock()
 	forget := h.electionForget
 	h.mu.RUnlock()
 	if forget != nil {
 		forget.CancelGroupInFlight(groupID)
+		forget.ClearGroupReservation(groupID)
 	}
 
 	h.eventBus.Publish(events.GroupReelectionRequested{
