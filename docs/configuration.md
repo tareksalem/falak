@@ -200,6 +200,50 @@ stays bounded. A capsule at **0 replicated copies** outranks one already at
 **K-1** in the work queue, so the most under-replicated snapshots make
 progress first.
 
+### Reconnection (O1 — active re-dial + re-auth)
+
+Bootstrap peers are dialed once at startup, and the only inbound-reconnect
+path is the libp2p Notifiee reacting to a gracefully-departed peer that
+dials **us**. Neither covers a killed-and-restarted seed node that has no
+`--bootstrap` of its own: it dials nobody, and its former peers never
+re-dial it, so the cluster stays partitioned even though every persistent
+phonebook still holds the dead node's entry and multiaddrs.
+
+The **reconnector** closes that gap. On a jittered tick it walks every
+joined cluster and builds a candidate set of dial-worthy phonebook entries
+unioned with the permanent `--bootstrap` seeds (deduped). A candidate is
+**dial-worthy** when its status is one of `Active`, `Suspected`,
+`Quarantined`, or `Failed` (never `Departed` — the returning peer re-dials
+us), it is **not currently connected**, it is **past its backoff deadline**,
+and it has at least one stored address. For a `Failed`/absent candidate the
+reconnector first flips the phonebook status to `PendingAuth` so the SWIM
+monitor does not immediately re-probe-and-fail a peer whose re-auth is still
+mid-flight. On a successful dial it publishes a `ReauthWithPeerRequested`
+event; the auth module's re-auth subscriber picks that up and
+re-authenticates the pinned peer (falling back to another phonebook peer if
+that specific peer refuses). The dial and the re-auth are split across the
+event bus because a re-dialed libp2p connection is **not** cluster
+membership.
+
+Per-peer dial backoff is capped exponential (`min(base·2^fails, max)` with
+jitter) and reset on a successful dial. The backoff map is pruned every tick
+against current membership, so a peer SWIM removed from the phonebook simply
+stops being a candidate — except `--bootstrap` seeds, which are **permanent**
+candidates every tick but remain backoff-bounded, so a permanently-dead seed
+is never thrashed.
+
+These tunables are functional options on `node.NewReconnector`, with
+production-sensible defaults:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithReconnectInterval(d)` | `15s` | Base sweep interval; each tick is jittered ±`WithReconnectJitter`. |
+| `WithReconnectJitter(f)` | `0.2` | Fractional (0..1) jitter applied to the tick interval and every backoff deadline (de-synchronises cluster-wide re-dials). |
+| `WithReconnectBaseBackoff(d)` | `5s` | Base per-peer dial backoff after the first failed dial. |
+| `WithReconnectMaxBackoff(d)` | `5m` | Cap on the per-peer exponential backoff. |
+| `WithReconnectDialTimeout(d)` | `10s` | Timeout for a single `host.Connect` dial. |
+| `WithBootstrapSeeds([]string)` | — | Permanent seed multiaddrs (the node feeds each cluster's `--bootstrap` list here at join time). |
+
 ---
 
 ## Examples

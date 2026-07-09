@@ -17,9 +17,21 @@ const (
 	ReauthSyncReason = "post_reauth"
 )
 
+// Reauthenticator is the minimal authenticator surface the ReauthSubscriber
+// drives. *Authenticator satisfies it. Depending on the interface (not the
+// concrete type) keeps the subscriber unit-testable without a libp2p host.
+type Reauthenticator interface {
+	// GetSession returns the current session for a cluster.
+	GetSession(clusterPath string) (*Session, error)
+	// RefreshSession refreshes a stale session back to authenticated.
+	RefreshSession(clusterPath string)
+	// Authenticate performs (re)authentication against a specific peer.
+	Authenticate(ctx context.Context, clusterPath string, targetPeer peer.ID) (*Session, error)
+}
+
 // ReauthSubscriber handles automatic re-authentication when sessions become stale.
 type ReauthSubscriber struct {
-	authenticator *Authenticator
+	authenticator Reauthenticator
 	phonebook     phonebook.IPhonebook
 	eventBus      events.Bus
 	logger        *zap.Logger
@@ -40,8 +52,9 @@ func WithReauthContext(ctx context.Context) ReauthOption {
 	}
 }
 
-// WithReauthAuthenticator sets the authenticator.
-func WithReauthAuthenticator(a *Authenticator) ReauthOption {
+// WithReauthAuthenticator sets the authenticator. Accepts the Reauthenticator
+// interface so tests can inject a fake; production passes *Authenticator.
+func WithReauthAuthenticator(a Reauthenticator) ReauthOption {
 	return func(r *ReauthSubscriber) {
 		r.authenticator = a
 	}
@@ -100,11 +113,18 @@ func (r *ReauthSubscriber) Start() error {
 	}
 
 	sessionStaleCh := r.eventBus.Subscribe(events.TypeSessionStale)
+	reauthPeerCh := r.eventBus.Subscribe(events.TypeReauthWithPeer)
 
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
 		r.handleSessionStaleLoop(sessionStaleCh)
+	}()
+
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		r.handleReauthWithPeerLoop(reauthPeerCh)
 	}()
 
 	r.logger.Debug("reauth subscriber started")
@@ -137,6 +157,65 @@ func (r *ReauthSubscriber) handleSessionStaleLoop(ch <-chan events.Event) {
 			r.attemptReauth(e.ClusterPath)
 		}
 	}
+}
+
+// handleReauthWithPeerLoop processes ReauthWithPeerRequested events emitted
+// by the reconnector after it re-dials a specific known peer.
+func (r *ReauthSubscriber) handleReauthWithPeerLoop(ch <-chan events.Event) {
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+
+			e, ok := event.(events.ReauthWithPeerRequested)
+			if !ok {
+				continue
+			}
+
+			r.attemptReauthWithPeer(e.ClusterPath, e.PeerID)
+		}
+	}
+}
+
+// attemptReauthWithPeer drives re-authentication targeting a SPECIFIC peer
+// that the reconnector just re-dialed. It pins the requested peer first and
+// only falls back to other phonebook peers if that specific peer refuses —
+// this is the reconnector-driven twin of attemptReauth, whose target is the
+// stale session's original voucher instead of a freshly re-dialed peer.
+func (r *ReauthSubscriber) attemptReauthWithPeer(clusterPath, peerID string) {
+	r.logger.Info("attempting re-authentication with re-dialed peer",
+		zap.String("cluster", clusterPath),
+		zap.String("peer", peerID))
+
+	targetPeerID, err := peer.Decode(peerID)
+	if err != nil {
+		r.logger.Warn("invalid peer ID in reauth-with-peer request, falling back to best peers",
+			zap.String("cluster", clusterPath),
+			zap.String("peer", peerID),
+			zap.Error(err))
+		r.tryAlternatePeerExcluding(clusterPath, "")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.ctx, AuthTimeout)
+	_, err = r.authenticator.Authenticate(ctx, clusterPath, targetPeerID)
+	cancel()
+	if err != nil {
+		r.logger.Warn("re-authentication with re-dialed peer failed, trying alternates",
+			zap.String("cluster", clusterPath),
+			zap.String("peer", targetPeerID.String()),
+			zap.Error(err))
+		// Fall back to any other phonebook peer, excluding the one we
+		// just failed on so we don't immediately retry it.
+		r.tryAlternatePeerExcluding(clusterPath, targetPeerID.String())
+		return
+	}
+
+	r.onReauthSuccess(clusterPath, targetPeerID)
 }
 
 // attemptReauth attempts to re-authenticate to a cluster.
@@ -216,12 +295,20 @@ func (r *ReauthSubscriber) attemptReauth(clusterPath string) {
 	}
 
 	// Success - session is already updated by Authenticate()
+	r.onReauthSuccess(clusterPath, targetPeerID)
+}
+
+// onReauthSuccess logs a successful re-auth and requests a catch-up sync
+// from the peer we just re-authenticated with. Shared by every re-auth
+// entry point (stale-session, alternate-peer fallback, reconnector-pinned).
+func (r *ReauthSubscriber) onReauthSuccess(clusterPath string, targetPeerID peer.ID) {
 	r.logger.Info("re-authentication successful",
 		zap.String("cluster", clusterPath),
 		zap.String("peer", targetPeerID.String()))
 
-	// Request sync to catch up on any missed updates during stale period
-	// Use the peer we just re-authenticated with as preferred sync target
+	// Request sync to catch up on any missed updates during the stale
+	// period. Use the peer we just re-authenticated with as the preferred
+	// sync target.
 	r.eventBus.Publish(events.SyncRequested{
 		BaseEvent:     events.NewBaseEvent(),
 		ClusterPath:   clusterPath,
@@ -230,18 +317,29 @@ func (r *ReauthSubscriber) attemptReauth(clusterPath string) {
 	})
 }
 
-// tryAlternatePeer attempts re-auth with a different peer from phonebook.
+// tryAlternatePeer attempts re-auth with a different peer from the
+// phonebook, skipping the stale session's original voucher.
 func (r *ReauthSubscriber) tryAlternatePeer(clusterPath string) {
 	session, _ := r.authenticator.GetSession(clusterPath)
+	excludeNodeID := ""
+	if session != nil {
+		excludeNodeID = session.VoucherNodeID
+	}
+	r.tryAlternatePeerExcluding(clusterPath, excludeNodeID)
+}
 
+// tryAlternatePeerExcluding attempts re-auth with any phonebook peer other
+// than excludeNodeID (the peer already tried and failed). excludeNodeID may
+// be empty to consider every peer.
+func (r *ReauthSubscriber) tryAlternatePeerExcluding(clusterPath, excludeNodeID string) {
 	peers, err := r.phonebook.GetBestPeers(clusterPath, 3)
 	if err != nil || len(peers) == 0 {
 		return
 	}
 
 	for _, p := range peers {
-		// Skip the original voucher we already tried
-		if session != nil && p.NodeID == session.VoucherNodeID {
+		// Skip the peer we already tried.
+		if excludeNodeID != "" && p.NodeID == excludeNodeID {
 			continue
 		}
 
@@ -255,18 +353,7 @@ func (r *ReauthSubscriber) tryAlternatePeer(clusterPath string) {
 		cancel()
 
 		if err == nil {
-			r.logger.Info("re-authentication successful with alternate peer",
-				zap.String("cluster", clusterPath),
-				zap.String("peer", targetPeerID.String()))
-
-			// Request sync to catch up on any missed updates
-			// Use the peer we just re-authenticated with as preferred sync target
-			r.eventBus.Publish(events.SyncRequested{
-				BaseEvent:     events.NewBaseEvent(),
-				ClusterPath:   clusterPath,
-				Reason:        ReauthSyncReason,
-				PreferredPeer: targetPeerID.String(),
-			})
+			r.onReauthSuccess(clusterPath, targetPeerID)
 			return
 		}
 

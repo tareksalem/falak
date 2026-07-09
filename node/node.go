@@ -135,6 +135,13 @@ type Node struct {
 	syncer              *nodesync.Syncer
 	reauthSubscriber    *auth.ReauthSubscriber
 
+	// reconnector actively re-dials known-but-disconnected cluster peers
+	// (and permanent --bootstrap seeds) and drives their re-authentication
+	// via the ReauthWithPeerRequested event. Closes the O1 partition gap
+	// where a restarted seed node dials nobody and its former peers never
+	// re-dial it. Created at Start, stopped in cleanup before host.Close.
+	reconnector *Reconnector
+
 	// Health: ping handler (registered at Start, shared across clusters)
 	pingHandler *health.PingHandler
 	// Health monitors per cluster (started on ClusterJoined)
@@ -558,6 +565,25 @@ func (n *Node) Start() error {
 		return fmt.Errorf("failed to start reauth subscriber: %w", err)
 	}
 
+	// 10a. Create and start the Reconnector (O1). Depends on the host,
+	// phonebook, and event bus being up (all above). It re-dials
+	// disconnected peers and publishes ReauthWithPeerRequested, which the
+	// ReauthSubscriber just started above consumes. Bootstrap seeds are
+	// added per-cluster in Join (they arrive with each ClusterConfig).
+	n.reconnector = NewReconnector(
+		WithReconnectContext(n.ctx),
+		WithReconnectHost(n.host),
+		WithReconnectPhonebook(n.phonebook),
+		WithReconnectEventBus(n.eventBus),
+		WithReconnectSelfID(n.host.ID().String()),
+		WithJoinedClustersFunc(n.JoinedClusters),
+		WithReconnectLogger(n.logger.Named("reconnector")),
+	)
+	if err := n.reconnector.Start(); err != nil {
+		n.cleanup()
+		return fmt.Errorf("failed to start reconnector: %w", err)
+	}
+
 	// 11. Create and start metrics manager — must come before the capsule
 	// handler so the gravity StateProvider has somewhere to read from.
 	if err := n.initializeMetricsManager(); err != nil {
@@ -779,6 +805,12 @@ func (n *Node) cleanup() {
 		n.pingHandler.Unregister()
 	}
 
+	// Stop the reconnector before the reauth subscriber and host: it must
+	// stop emitting re-dial + ReauthWithPeerRequested events before their
+	// consumers and the host tear down.
+	if n.reconnector != nil {
+		n.reconnector.Stop()
+	}
 	if n.reauthSubscriber != nil {
 		n.reauthSubscriber.Stop()
 	}
@@ -820,6 +852,13 @@ func (n *Node) Join(ctx context.Context, cfg ClusterConfig) error {
 	// Register per-cluster cert config with authenticator if provided
 	if cfg.Certificates != nil {
 		n.authenticator.RegisterCertConfig(cfg.Path, cfg.Certificates)
+	}
+
+	// Register this cluster's --bootstrap peers as permanent reconnector
+	// seeds so a restarted seed node is re-dialed every tick even if it
+	// never appears in (or is pruned from) the phonebook.
+	if n.reconnector != nil && len(cfg.BootstrapPeers) > 0 {
+		n.reconnector.AddBootstrapSeeds(cfg.BootstrapPeers)
 	}
 
 	// Subscribe to response events

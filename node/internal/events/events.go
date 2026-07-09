@@ -45,6 +45,7 @@ const (
 	TypeNewMemberReceived    = "auth.new_member_received"
 	TypeAuthenticationFailed = "auth.authentication_failed"
 	TypeSessionStale         = "auth.session_stale"
+	TypeReauthWithPeer       = "auth.reauth_with_peer"
 )
 
 // PeerAuthenticated is emitted when we successfully authenticate to a cluster.
@@ -101,6 +102,22 @@ type SessionStale struct {
 }
 
 func (e SessionStale) EventType() string { return TypeSessionStale }
+
+// ReauthWithPeerRequested is emitted by the reconnector after it has
+// re-dialed a specific known-but-disconnected peer and re-established a
+// libp2p connection. A re-dialed connection is NOT cluster membership —
+// the session must be re-authenticated. The ReauthSubscriber consumes
+// this and drives the existing Authenticate flow pinned to PeerID (with
+// a phonebook fallback if that specific peer refuses). Keeping the
+// re-auth logic in the auth module preserves the module boundary: the
+// reconnector only dials and emits; auth owns the handshake.
+type ReauthWithPeerRequested struct {
+	BaseEvent
+	ClusterPath string
+	PeerID      string
+}
+
+func (e ReauthWithPeerRequested) EventType() string { return TypeReauthWithPeer }
 
 // --- Cluster Lifecycle Events ---
 

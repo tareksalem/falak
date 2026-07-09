@@ -533,12 +533,39 @@ a per-peer reconnect with jittered backoff is a good fit; key it off
 phonebook entries and the SWIM `failed`/`departed → seen-again`
 transitions.
 
-**Status: Open.** Architect-designed Session 19 (phonebook-driven
-reconnector that DRIVES re-auth via a ReauthWithPeerRequested event, not
-dial-only; --bootstrap as permanent seeds; skip Departed; PendingAuth gate
-+ per-peer capped backoff). Note: fixing O1 turns `TestElection_NodeFailureReElection`
-green but NOT the other 3-node join failures — those are O13 (separate
-convergence bug).
+**Status: FIXED (Session 21).** Implemented the phonebook-driven
+reconnector per `.claude/plans/reconnector-o1.md`:
+
+- **`node/reconnector.go`** — a single WaitGroup-tracked goroutine on a
+  jittered tick, ctx-cancelled on Stop. Per tick, for each joined cluster it
+  builds a candidate set = dial-worthy `GetByCluster` entries ∪ `--bootstrap`
+  seeds (deduped). Dial-worthiness = status ∈ {Active, Suspected,
+  Quarantined, Failed} (NOT Departed) AND not `network.Connected` AND past
+  per-peer backoff AND has ≥1 address. Failed/absent candidates are flipped
+  to `PendingAuth` **before** dialing (SWIM false-suspect gate). On dial
+  success it publishes `ReauthWithPeerRequested{ClusterPath, PeerID}`; on
+  failure it bumps a capped-exponential per-peer backoff
+  (`min(base·2^fails, max)` ± jitter) and resets it on a successful dial. The
+  backoff map is pruned every tick against current membership (bounded).
+  `--bootstrap` seeds are permanent, backoff-bounded candidates.
+- **`ReauthWithPeerRequested`** event (`node/internal/events/events.go`) —
+  the dial↔re-auth boundary. The reconnector only dials + emits; auth owns
+  the handshake.
+- **`node/auth/reauth.go`** — `ReauthSubscriber` subscribes to the new event
+  and re-authenticates the pinned peer via the existing `Authenticate` flow
+  (falling back to another phonebook peer if that peer refuses). Refactored
+  onto a small `Reauthenticator` interface for testability.
+- **`node/node.go`** — constructs the Reconnector in Start (after
+  host+phonebook+auth), feeds each cluster's `--bootstrap` list as seeds in
+  Join, and Stops it in cleanup before host.Close.
+
+Note on `TestElection_NodeFailureReElection`: the Session-19 plan tentatively
+predicted this might go green from O1. It does NOT — verified against the
+pre-O1 baseline, it fails at the IDENTICAL initial-join barrier
+(`election_integration_test.go:219`, `expected 3 phonebook entries, got 2`)
+with AND without O1. That barrier is O13 (the 3-node join-convergence gap)
+and executes at test setup, before the node drop that O1's re-dial + re-auth
+would heal. O13 remains a separate, open bug.
 
 ---
 
