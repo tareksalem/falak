@@ -246,6 +246,57 @@ production-sensible defaults:
 
 ---
 
+### Member sync & join convergence (O13)
+
+When a new member joins via a voucher, every *other* existing member must
+learn about it. Historically the only path for a peer that had already
+finished its own one-shot post-join sync was the voucher's best-effort Step-2
+`NewMemberAnnounced` PubSub broadcast — and if that peer's gossipsub mesh was
+not ready when the voucher published, it missed the announcement and waited a
+full steady sync interval (then 5m) to heal. On small clusters this showed up
+as `expected N phonebook entries, got N-1`.
+
+Three layers now close that gap, all configurable as functional options on
+`nodesync.New` (Layer 3 lives on the authenticator):
+
+**Layer 1 — voucher fan-out push (deterministic).** The voucher emits
+`MemberAdmitted`; the syncer actively pushes the new member to every existing
+**Active** peer over `/falak/sync/push/1.0`. The receiver applies the same
+authentication gate as pull sync and inserts idempotently.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithMemberPushEnabled(b)` | `true` | Toggle Layer-1 fan-out (tests disable it to exercise the Layer-2 backstop alone). |
+| `WithMemberPushConcurrency(n)` | `8` | Max existing peers pushed to concurrently — bounds stream fan-out on mass join. |
+| `WithMemberPushTimeout(d)` | `5s` | Timeout for a single push delivery. |
+
+**Layer 2 — convergence-burst anti-entropy (guaranteed-eventual backstop).**
+On `ClusterJoined` and every membership change the periodic sync loop enters a
+fast burst, then settles to the steady interval. Jitter is mandatory in
+production to prevent synchronised sync storms on mass join.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithBurstInterval(d)` | `1s` | Base interval between anti-entropy syncs during a convergence burst. |
+| `WithBurstDuration(d)` | `30s` | How long a burst runs after the last membership change before settling to steady. |
+| `WithBurstJitter(d)` | `250ms` | ± jitter applied to each burst interval (de-synchronises peers). |
+| `WithSyncInterval(d)` | `90s` | Steady-state anti-entropy interval (dropped from the historical 5m as defense-in-depth). |
+| `WithSyncRateLimit(n)` | `60` | Max sync/push requests accepted per peer per window; raised from 20 so a 1/s×30s burst is never self-throttled. |
+| `WithSyncRateWindow(d)` | `1m` | Rate-limiting window. |
+| `WithClock(c)` | real clock | Injectable clock for the burst loop (deterministic tests). |
+
+**Layer 3 — Step-2 mesh-readiness gate (hardening).** Before the first
+`new_member` publish, the voucher briefly waits for the auth topic's gossipsub
+mesh to have at least one peer, then publishes anyway on timeout so a join
+never stalls. Options on `auth.New`:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithStep2MeshWaitTimeout(d)` | `2s` | Max wait for ≥1 mesh peer before the first Step-2 publish (0 disables the gate). |
+| `WithStep2MeshPollInterval(d)` | `50ms` | How often the mesh peer count is re-checked while waiting. |
+
+---
+
 ## Examples
 
 ### Single Node (First in Cluster)

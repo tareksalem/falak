@@ -71,6 +71,19 @@ const (
 
 	// MinConfirmationsRequired is the minimum number of confirmations needed (if cluster has enough nodes).
 	MinConfirmationsRequired = 1
+
+	// DefaultStep2MeshWaitTimeout bounds how long publishStep2 waits for the
+	// gossipsub mesh on the auth topic to have at least one peer before the
+	// first new_member publish (Layer 3 of the O13 join-convergence fix).
+	// This closes the window where a voucher publishes the announcement
+	// before a just-joined peer's mesh is ready, causing that peer to miss it.
+	// We publish anyway on timeout — Layers 1/2 are the backstop — so a join
+	// can never stall indefinitely here.
+	DefaultStep2MeshWaitTimeout = 2 * time.Second
+
+	// DefaultStep2MeshPollInterval is how often publishStep2 re-checks the
+	// mesh peer count while waiting.
+	DefaultStep2MeshPollInterval = 50 * time.Millisecond
 )
 
 var (
@@ -135,6 +148,10 @@ type Authenticator struct {
 	sessionStaleThreshold time.Duration
 	staleCheckInterval    time.Duration
 	maxStaleDuration      time.Duration
+
+	// Step-2 mesh-readiness gate config (Layer 3, O13)
+	step2MeshWaitTimeout  time.Duration
+	step2MeshPollInterval time.Duration
 
 	// Rate limiting
 	rateLimiter *ratelimit.Limiter
@@ -295,6 +312,24 @@ func WithStaleCheckInterval(d time.Duration) Option {
 	}
 }
 
+// WithStep2MeshWaitTimeout sets how long publishStep2 waits for the auth
+// topic's gossipsub mesh to have at least one peer before the first
+// new_member publish (Layer 3, O13). Publishes anyway on timeout so joins
+// never stall. Set to 0 to disable the gate entirely.
+func WithStep2MeshWaitTimeout(d time.Duration) Option {
+	return func(a *Authenticator) {
+		a.step2MeshWaitTimeout = d
+	}
+}
+
+// WithStep2MeshPollInterval sets how often publishStep2 re-checks the mesh
+// peer count while waiting for readiness.
+func WithStep2MeshPollInterval(d time.Duration) Option {
+	return func(a *Authenticator) {
+		a.step2MeshPollInterval = d
+	}
+}
+
 // New creates a new Authenticator with the given options.
 func New(opts ...Option) *Authenticator {
 	a := &Authenticator{
@@ -309,6 +344,8 @@ func New(opts ...Option) *Authenticator {
 		sessionStaleThreshold: DefaultSessionStaleThreshold,
 		staleCheckInterval:    DefaultStaleCheckInterval,
 		maxStaleDuration:      DefaultMaxStaleDuration,
+		step2MeshWaitTimeout:  DefaultStep2MeshWaitTimeout,
+		step2MeshPollInterval: DefaultStep2MeshPollInterval,
 		rateLimiter:           ratelimit.NewLimiter(DefaultAuthRateLimit, DefaultAuthRateWindow),
 		messageDedup:          NewMessageDedup(MaxMessageAge, MaxMessageAge/3),
 	}
@@ -1440,6 +1477,13 @@ func (a *Authenticator) publishAuthMessage(ctx context.Context, clusterPath, msg
 
 // publishStep2 publishes Step 2 broadcast with extended retries.
 func (a *Authenticator) publishStep2(ctx context.Context, clusterPath string, announcement *authpb.NewMemberAnnouncement) error {
+	// Layer 3 (O13): wait for the gossipsub mesh on the auth topic to have at
+	// least one peer before the first publish, so a just-joined peer whose
+	// mesh is still forming does not miss the new_member announcement. Bounded
+	// by step2MeshWaitTimeout; we publish anyway on timeout (Layers 1/2 are
+	// the backstop) so a join can never stall here.
+	a.waitForStep2Mesh(ctx, clusterPath)
+
 	cfg := shared.RetryConfig{
 		MaxRetries: Step2MaxRetries,
 		Delay:      Step2RetryDelay,
@@ -1448,6 +1492,55 @@ func (a *Authenticator) publishStep2(ctx context.Context, clusterPath string, an
 	return shared.Retry(ctx, cfg, func() error {
 		return a.publishAuthMessage(ctx, clusterPath, "new_member", announcement)
 	})
+}
+
+// waitForStep2Mesh blocks until the auth topic's gossipsub mesh has at least
+// one peer or step2MeshWaitTimeout elapses (whichever first). It never blocks
+// indefinitely and returns immediately if the gate is disabled (timeout 0),
+// the topic is missing, or a peer is already present.
+func (a *Authenticator) waitForStep2Mesh(ctx context.Context, clusterPath string) {
+	if a.step2MeshWaitTimeout <= 0 {
+		return
+	}
+
+	a.topicMu.RLock()
+	topic, ok := a.authTopics[clusterPath]
+	a.topicMu.RUnlock()
+	if !ok || topic == nil {
+		return
+	}
+
+	if len(topic.ListPeers()) > 0 {
+		return
+	}
+
+	poll := a.step2MeshPollInterval
+	if poll <= 0 {
+		poll = DefaultStep2MeshPollInterval
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, a.step2MeshWaitTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-waitCtx.Done():
+			a.logger.Debug("step2 mesh wait elapsed, publishing anyway",
+				zap.String("cluster", clusterPath),
+				zap.Int("peersOnTopic", len(topic.ListPeers())))
+			return
+		case <-ticker.C:
+			if len(topic.ListPeers()) > 0 {
+				a.logger.Debug("step2 mesh ready",
+					zap.String("cluster", clusterPath),
+					zap.Int("peersOnTopic", len(topic.ListPeers())))
+				return
+			}
+		}
+	}
 }
 
 // authMessageContent builds the canonical bytes for signing/verifying an AuthMessage envelope.

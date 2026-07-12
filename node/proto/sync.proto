@@ -30,6 +30,26 @@ message SyncResponse {
     repeated RevocationEntry revocations = 7;     // Certificate revocations to merge
 }
 
+// SyncPush actively delivers a single newly-admitted member to an existing
+// peer (Layer 1 of the O13 join-convergence design). Unlike SyncRequest /
+// SyncResponse (pull), this is a push initiated by the voucher's fan-out so
+// existing members learn about a new node without waiting for the best-effort
+// Step-2 PubSub broadcast or the periodic anti-entropy tail. The receiver
+// verifies the sender is an authenticated peer (same phonebook.Exists gate as
+// SyncRequest) and inserts the member via the idempotent processMember path.
+message SyncPush {
+    string cluster_path = 1;                      // Cluster the member belongs to
+    MemberInfo member = 2;                        // The newly-admitted member to insert
+    string push_id = 3;                           // For correlation / logging
+}
+
+// SyncPushAck acknowledges a SyncPush.
+message SyncPushAck {
+    string push_id = 1;                           // Correlation with the push
+    bool accepted = 2;                            // True if the member was inserted/updated
+    string error = 3;                             // Non-empty on rejection
+}
+
 // RevocationEntry describes a revoked certificate
 message RevocationEntry {
     string cert_fingerprint = 1;                  // SHA-256 of the certificate bytes

@@ -2236,6 +2236,19 @@ func (h *CapsuleHandler) stopLocalReplicas(c *capsule.Capsule) {
 // operators don't have to pre-declare an `orbits:` list in the daemon
 // config just to create a capsule.
 func (h *CapsuleHandler) announceCapsule(c *capsule.Capsule) {
+	// Serialize from a race-safe snapshot, not the live event pointer. The
+	// manager emits events carrying the LIVE *Capsule; the announce path
+	// walks c.Replicas via replicaStatesToProto, which would race a
+	// concurrent AssignReplica / SyncStatus that mutates that same slice
+	// under the manager mutex. Manager.Get deep-copies Replicas under
+	// m.mu.RLock — the sanctioned accessor for exactly this read. If the
+	// capsule was deleted between emit and here, fall back to the live
+	// pointer (the delete-announce/withdrawal path needs to fire even though
+	// the row is gone; its Replicas are no longer being mutated).
+	if snap := h.manager.Get(c.ID); snap != nil {
+		c = snap
+	}
+
 	h.mu.RLock()
 	ann, ok := h.announcers[c.ClusterID]
 	orbitMgr := h.orbits[c.ClusterID]

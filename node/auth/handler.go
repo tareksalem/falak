@@ -363,6 +363,24 @@ func (a *Authenticator) handleAuthStream(stream network.Stream) {
 	a.logger.Info("authenticated new member",
 		zap.String("peer", joinReq.NodeId),
 		zap.String("cluster", joinReq.ClusterPath))
+
+	// Emit MemberAdmitted so the syncer can actively push this new member to
+	// every existing Active peer (Layer 1 of the O13 join-convergence fix).
+	// This is an event-driven seam — auth never calls the syncer directly.
+	// We carry the full member info the JoinRequest already gave us so the
+	// syncer builds the push without a phonebook re-read that would race the
+	// joiner's own Add. JoinedAt is stamped now (the moment of admission).
+	a.eventBus.Publish(events.MemberAdmitted{
+		BaseEvent:   events.NewBaseEvent(),
+		ClusterPath: joinReq.ClusterPath,
+		NewMember: events.MemberInfo{
+			NodeID:       joinReq.NodeId,
+			Addresses:    joinReq.Addresses,
+			PublicKey:    joinReq.PublicKey,
+			Capabilities: caps,
+			JoinedAt:     timestamppb.Now(),
+		},
+	})
 }
 
 // sendStep1Result sends a Step1Result message.

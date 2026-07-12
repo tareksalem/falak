@@ -493,14 +493,68 @@ it eventually but too late for the assertion. Classic push-incomplete-roster
 + async-sync-heals-late gossip gap. Alternatives: PendingAuth entries not
 counted; sync latency vs assertion timing.
 
-**Next step:** trace `ClusterMembersReceived` roster construction + the
-voucher's roster-send at AuthComplete; confirm whether the joiner inserts ALL
-members. Fix = ensure the join path converges the full roster synchronously
-(or the test waits for a sync round).
+**Confirmed mechanism (Session 21):** node1 seed; node2 AND node3 both vouch
+via node1. node3 gets the full roster from node1's AuthComplete. The gap is
+**node2 learning node3**: node2's one-shot post-join sync already fired before
+node3 existed; its only path to node3 was node1's best-effort Step-2
+`NewMemberAnnounced` PubSub broadcast — if node2's gossipsub mesh wasn't ready
+when node1 published, node2 missed it and waited `DefaultSyncInterval` (then
+5m) >> the 10s test window.
 
-**Status: Open.** Distinct from O1. Fixing O1 will NOT turn these green (only
-`TestElection_NodeFailureReElection`, which has a real node drop, should go
-green from O1).
+**Fix (Session 21, layered — one deterministic path + one guaranteed-eventual
+backstop):**
+- **Layer 1 — voucher fan-out push (primary, deterministic).** The voucher
+  emits `events.MemberAdmitted` after AuthComplete; the syncer subscribes
+  (event-driven seam — auth never calls sync directly) and actively pushes the
+  new member to every existing **Active** peer over a dedicated
+  `/falak/sync/push/1.0` stream (`SyncPush`/`SyncPushAck`). The receiver
+  applies the SAME `phonebook.Exists` auth gate as pull sync and inserts via
+  the existing idempotent `processMember`. Bounded by a concurrency semaphore
+  (`WithMemberPushConcurrency`, default 8) and a per-push timeout
+  (`WithMemberPushTimeout`, default 5s). Best-effort per target; failures fall
+  through to Layer 2.
+- **Layer 2 — convergence-burst anti-entropy (backstop, guaranteed-eventual).**
+  The single-rate periodic loop became two-rate: on `ClusterJoined` and every
+  membership change (`NewMemberReceived`, `MemberAdmitted`) it enters a burst
+  window syncing every `burstInterval` (1s, jittered ±250ms) for
+  `burstDuration` (30s), then settles to the steady `syncInterval`. Injectable
+  clock for deterministic tests; mandatory jitter prevents mass-join sync
+  storms.
+- **Layer 3 — Step-2 mesh-readiness gate (hardening).** `publishStep2` waits
+  (bounded by `WithStep2MeshWaitTimeout`, default 2s) for the auth topic's
+  gossipsub mesh to have ≥1 peer before the first publish, then publishes
+  anyway on timeout so a join never stalls.
+- **Rate limit raised** 20→60/min/peer so a 1/s×30s burst never trips the
+  receiver limiter (silent rejection would defeat the backstop).
+- **Steady interval dropped** 5m→90s as defense-in-depth for the worst-case
+  tail.
+
+**Status: Fixed.** Deterministic unit tests in `node/sync/` (push fan-out,
+burst backstop via mock clock, voucher-death, mass-join storm) pass under
+`-race -count=20`; the previously-flaky 3-node integration tests pass under
+`-race -count=10`. Distinct from O1.
+
+**O13-adjacent (fixed as part of landing O13):** making convergence
+deterministic let `TestCapsuleGroup_NonCascadeDelete_3Node` reach the
+group-delete → announce path that the phonebook-convergence barrier had
+always masked, exposing a **pre-existing capsule-module data race**: the
+manager emits events carrying the LIVE `*Capsule`, and the announce path
+(`CapsuleHandler.announceCapsule` → `orbit.AnnounceOn` →
+`replicaStatesToProto`) iterated `c.Replicas` with no lock while
+`Manager.AssignReplica` mutated that same slice under `m.mu`. This race is
+reachable outside O13 too (any group-delete-triggered announce concurrent
+with an election-lost `AssignReplica`); O13 merely made it deterministically
+hit in CI. **Fix:** `announceCapsule` now serializes from a race-safe
+`Manager.Get(c.ID)` snapshot (deep-copies `Replicas` under `m.mu.RLock` — the
+sanctioned accessor) instead of the live pointer. Verified with
+`TestCapsuleGroup_NonCascadeDelete_3Node -race -count=20`.
+
+**Follow-up smell (separate ticket):** the capsule event bus emits LIVE
+mutable `*Capsule` pointers (`Manager.emit`), so every event consumer is one
+lockless mutable-field read away from this class of race. The correct
+long-term fix is for `emit` to carry immutable snapshots; deferred here to
+avoid perturbing the event-bus contract other consumers rely on under an O13
+ticket.
 
 ---
 

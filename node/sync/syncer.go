@@ -4,6 +4,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -24,11 +25,24 @@ import (
 )
 
 const (
-	// ProtocolID is the protocol identifier for sync streams.
+	// ProtocolID is the protocol identifier for sync streams (pull:
+	// SyncRequest/SyncResponse).
 	ProtocolID = "/falak/sync/1.0"
 
-	// DefaultSyncInterval is the default interval for periodic sync.
-	DefaultSyncInterval = 5 * time.Minute
+	// PushProtocolID is the protocol identifier for member push streams
+	// (Layer 1 of O13: SyncPush/SyncPushAck). A dedicated protocol keeps the
+	// pull and push wire formats unambiguous — both use bare length-prefixed
+	// protos with no in-band type discriminator, so multiplexing them onto
+	// one protocol would risk a silent mis-parse.
+	PushProtocolID = "/falak/sync/push/1.0"
+
+	// DefaultSyncInterval is the default steady-state interval for periodic
+	// sync (anti-entropy). Dropped from the historical 5m to 90s as
+	// defense-in-depth for O13: it bounds the worst-case convergence tail
+	// when the Layer-1 push failed AND the convergence burst already
+	// elapsed AND the Step-2 PubSub announcement was missed. Configurable
+	// via WithSyncInterval.
+	DefaultSyncInterval = 90 * time.Second
 
 	// DefaultSyncTimeout is the default timeout for sync requests.
 	DefaultSyncTimeout = 30 * time.Second
@@ -37,10 +51,34 @@ const (
 	DefaultMaxMembersPerResponse = 1000
 
 	// DefaultSyncRateLimit is the max sync requests per peer per window.
-	DefaultSyncRateLimit = 20
+	// Raised from the historical 20 to 60 so the O13 convergence burst
+	// (1 sync/s for 30s against a single preferred peer) does not trip the
+	// receiver-side rate limiter — a silent rejection there would defeat
+	// the whole backstop. Configurable via WithSyncRateLimit.
+	DefaultSyncRateLimit = 60
 
 	// DefaultSyncRateWindow is the rate limiting window.
 	DefaultSyncRateWindow = 1 * time.Minute
+
+	// DefaultMemberPushConcurrency bounds the Layer-1 voucher fan-out: at
+	// most this many existing peers are pushed to concurrently when a new
+	// member is admitted. Prevents a sync storm on mass join.
+	DefaultMemberPushConcurrency = 8
+
+	// DefaultMemberPushTimeout bounds each individual SyncPush delivery.
+	DefaultMemberPushTimeout = 5 * time.Second
+
+	// DefaultBurstInterval is the base interval between anti-entropy syncs
+	// during a convergence burst (Layer 2). Jittered by ±DefaultBurstJitter.
+	DefaultBurstInterval = 1 * time.Second
+
+	// DefaultBurstDuration is how long a convergence burst runs after the
+	// last membership-change event before settling back to DefaultSyncInterval.
+	DefaultBurstDuration = 30 * time.Second
+
+	// DefaultBurstJitter is the ± jitter applied to each burst interval to
+	// desynchronise peers and prevent synchronised sync storms on mass join.
+	DefaultBurstJitter = 250 * time.Millisecond
 
 	// MaxConsecutiveFailsBeforeQuarantine is the number of consecutive connection
 	// failures before marking a peer as quarantined.
@@ -84,6 +122,25 @@ type Syncer struct {
 	syncTimeout           time.Duration
 	maxMembersPerResponse int
 	enablePeriodicSync    bool
+	rateLimit             int
+	rateWindow            time.Duration
+
+	// Layer 1 — voucher fan-out push configuration (O13)
+	memberPushEnabled     bool
+	memberPushConcurrency int
+	memberPushTimeout     time.Duration
+
+	// Layer 2 — convergence-burst anti-entropy configuration (O13)
+	burstInterval time.Duration
+	burstDuration time.Duration
+	burstJitter   time.Duration
+	clock         Clock
+
+	// Guards against starting more than one periodic (burst-capable) loop
+	// per cluster when both ClusterJoined and MemberAdmitted fire.
+	periodicMu      sync.Mutex
+	periodicStarted map[string]chan struct{} // clusterPath -> re-arm signal
+	peerCursor      map[string]int           // clusterPath -> round-robin peer index
 
 	// Track last sync times per cluster
 	lastSyncMu sync.RWMutex
@@ -174,6 +231,76 @@ func WithRevocationSource(rs RevocationSource) Option {
 	}
 }
 
+// WithSyncRateLimit sets the max sync requests accepted per peer per window.
+func WithSyncRateLimit(n int) Option {
+	return func(s *Syncer) {
+		s.rateLimit = n
+	}
+}
+
+// WithSyncRateWindow sets the sync rate-limiting window.
+func WithSyncRateWindow(d time.Duration) Option {
+	return func(s *Syncer) {
+		s.rateWindow = d
+	}
+}
+
+// WithMemberPushEnabled toggles Layer-1 voucher fan-out push (O13). Default
+// true. Tests disable it to exercise the Layer-2 backstop in isolation.
+func WithMemberPushEnabled(enabled bool) Option {
+	return func(s *Syncer) {
+		s.memberPushEnabled = enabled
+	}
+}
+
+// WithMemberPushConcurrency bounds how many existing peers the voucher pushes
+// a newly-admitted member to concurrently.
+func WithMemberPushConcurrency(n int) Option {
+	return func(s *Syncer) {
+		s.memberPushConcurrency = n
+	}
+}
+
+// WithMemberPushTimeout bounds each individual SyncPush delivery.
+func WithMemberPushTimeout(d time.Duration) Option {
+	return func(s *Syncer) {
+		s.memberPushTimeout = d
+	}
+}
+
+// WithBurstInterval sets the base interval between anti-entropy syncs during
+// a convergence burst (Layer 2).
+func WithBurstInterval(d time.Duration) Option {
+	return func(s *Syncer) {
+		s.burstInterval = d
+	}
+}
+
+// WithBurstDuration sets how long a convergence burst runs after the last
+// membership-change event before settling to the steady sync interval.
+func WithBurstDuration(d time.Duration) Option {
+	return func(s *Syncer) {
+		s.burstDuration = d
+	}
+}
+
+// WithBurstJitter sets the ± jitter applied to each burst interval. Jitter is
+// mandatory in production (desynchronises peers); tests may set it to zero
+// for exact deterministic timing.
+func WithBurstJitter(d time.Duration) Option {
+	return func(s *Syncer) {
+		s.burstJitter = d
+	}
+}
+
+// WithClock injects the clock used by the burst anti-entropy loop. Tests pass
+// a mock clock to drive convergence deterministically without real sleeps.
+func WithClock(c Clock) Option {
+	return func(s *Syncer) {
+		s.clock = c
+	}
+}
+
 // New creates a new Syncer with the given options.
 func New(opts ...Option) *Syncer {
 	s := &Syncer{
@@ -182,13 +309,30 @@ func New(opts ...Option) *Syncer {
 		syncTimeout:           DefaultSyncTimeout,
 		maxMembersPerResponse: DefaultMaxMembersPerResponse,
 		enablePeriodicSync:    true,
+		rateLimit:             DefaultSyncRateLimit,
+		rateWindow:            DefaultSyncRateWindow,
+		memberPushEnabled:     true,
+		memberPushConcurrency: DefaultMemberPushConcurrency,
+		memberPushTimeout:     DefaultMemberPushTimeout,
+		burstInterval:         DefaultBurstInterval,
+		burstDuration:         DefaultBurstDuration,
+		burstJitter:           DefaultBurstJitter,
+		periodicStarted:       make(map[string]chan struct{}),
+		peerCursor:            make(map[string]int),
 		lastSync:              make(map[string]time.Time),
-		rateLimiter:           ratelimit.NewLimiter(DefaultSyncRateLimit, DefaultSyncRateWindow),
 	}
 
 	// Apply options first to capture parentCtx if provided
 	for _, opt := range opts {
 		opt(s)
+	}
+
+	// Rate limiter is built from the (possibly overridden) settings.
+	s.rateLimiter = ratelimit.NewLimiter(s.rateLimit, s.rateWindow)
+
+	// Default to the real clock when a mock was not injected.
+	if s.clock == nil {
+		s.clock = newRealClock()
 	}
 
 	// Derive context from parent if provided, otherwise use Background
@@ -216,6 +360,7 @@ func (s *Syncer) Start() error {
 	}
 
 	s.host.SetStreamHandler(ProtocolID, s.handleSyncStream)
+	s.host.SetStreamHandler(PushProtocolID, s.handlePushStream)
 
 	// Subscribe to sync request events
 	syncReqCh := s.eventBus.Subscribe(events.TypeSyncRequested)
@@ -231,6 +376,25 @@ func (s *Syncer) Start() error {
 	go func() {
 		defer s.wg.Done()
 		s.clusterJoinedLoop(clusterJoinedCh)
+	}()
+
+	// Subscribe to membership-change events to re-arm the convergence burst
+	// (Layer 2). NewMemberReceived fires on peers that learn of a new member
+	// via PubSub; MemberAdmitted fires on the voucher. Either way we want the
+	// burst window to (re)start so anti-entropy converges fast.
+	newMemberCh := s.eventBus.Subscribe(events.TypeNewMemberReceived)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.membershipChangeLoop(newMemberCh)
+	}()
+
+	// Subscribe to MemberAdmitted to drive Layer-1 voucher fan-out push (O13).
+	memberAdmittedCh := s.eventBus.Subscribe(events.TypeMemberAdmitted)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.memberAdmittedLoop(memberAdmittedCh)
 	}()
 
 	return nil
@@ -250,7 +414,11 @@ func (s *Syncer) syncRequestLoop(ch <-chan events.Event) {
 			if !ok {
 				continue
 			}
-			go s.handleSyncRequest(evt)
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				s.handleSyncRequest(evt)
+			}()
 		}
 	}
 }
@@ -275,15 +443,85 @@ func (s *Syncer) clusterJoinedLoop(ch <-chan events.Event) {
 				zap.String("voucher", evt.VoucherNodeID))
 
 			// Trigger initial sync with voucher as preferred peer (with fallback to others)
-			go s.handleSyncRequest(events.SyncRequested{
-				BaseEvent:     events.NewBaseEvent(),
-				ClusterPath:   evt.ClusterPath,
-				Reason:        "post_join",
-				PreferredPeer: evt.VoucherNodeID,
-			})
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				s.handleSyncRequest(events.SyncRequested{
+					BaseEvent:     events.NewBaseEvent(),
+					ClusterPath:   evt.ClusterPath,
+					Reason:        "post_join",
+					PreferredPeer: evt.VoucherNodeID,
+				})
+			}()
 
-			// Start periodic sync for this cluster
+			// Start the periodic (burst-capable) sync loop for this cluster
+			// and arm the first convergence burst — a fresh join is exactly
+			// when membership is most volatile.
 			s.StartPeriodicSync(evt.ClusterPath)
+			s.armBurst(evt.ClusterPath)
+		}
+	}
+}
+
+// membershipChangeLoop re-arms the convergence burst whenever this node
+// observes a membership change via PubSub (NewMemberReceived). Ensures a
+// peer that learns of a new member starts syncing aggressively so any peer
+// that missed the announcement converges quickly.
+func (s *Syncer) membershipChangeLoop(ch <-chan events.Event) {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case e, ok := <-ch:
+			if !ok {
+				return
+			}
+			evt, ok := e.(events.NewMemberReceived)
+			if !ok {
+				continue
+			}
+			// Ensure a loop exists (a node that received a member before it
+			// finished its own join still needs anti-entropy) and re-arm.
+			s.StartPeriodicSync(evt.ClusterPath)
+			s.armBurst(evt.ClusterPath)
+		}
+	}
+}
+
+// memberAdmittedLoop drives Layer-1 voucher fan-out (O13). On each
+// MemberAdmitted the voucher actively pushes the new member to every existing
+// Active peer, and also re-arms its own convergence burst.
+func (s *Syncer) memberAdmittedLoop(ch <-chan events.Event) {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case e, ok := <-ch:
+			if !ok {
+				return
+			}
+			evt, ok := e.(events.MemberAdmitted)
+			if !ok {
+				continue
+			}
+
+			// Re-arm the burst so the voucher's own anti-entropy keeps the
+			// backstop warm even if the fan-out below partially fails.
+			s.StartPeriodicSync(evt.ClusterPath)
+			s.armBurst(evt.ClusterPath)
+
+			if !s.memberPushEnabled {
+				s.logger.Debug("member push disabled, relying on burst backstop",
+					zap.String("cluster", evt.ClusterPath),
+					zap.String("node", evt.NewMember.NodeID))
+				continue
+			}
+
+			s.wg.Add(1)
+			go func(admit events.MemberAdmitted) {
+				defer s.wg.Done()
+				s.fanOutNewMember(admit)
+			}(evt)
 		}
 	}
 }
@@ -293,19 +531,57 @@ func (s *Syncer) Stop() {
 	s.cancel()
 	s.wg.Wait()
 	s.host.RemoveStreamHandler(ProtocolID)
+	s.host.RemoveStreamHandler(PushProtocolID)
 }
 
-// StartPeriodicSync starts the periodic sync loop for a cluster.
+// StartPeriodicSync starts the two-rate anti-entropy loop for a cluster if
+// one is not already running. Idempotent: multiple triggers (ClusterJoined,
+// NewMemberReceived, MemberAdmitted) all funnel to a single loop per cluster.
 func (s *Syncer) StartPeriodicSync(clusterPath string) {
 	if !s.enablePeriodicSync {
 		return
 	}
 
+	s.periodicMu.Lock()
+	if _, running := s.periodicStarted[clusterPath]; running {
+		s.periodicMu.Unlock()
+		return
+	}
+	// Buffered re-arm signal: a burst request that arrives while the loop is
+	// mid-tick is not lost, and a second one collapses into the first.
+	rearm := make(chan struct{}, 1)
+	// Pre-seed one re-arm so the loop enters its burst window on the very
+	// first iteration. A loop is only ever started in response to a
+	// membership change (ClusterJoined / NewMemberReceived / MemberAdmitted),
+	// which is exactly when we want to converge fast — and pre-seeding closes
+	// the race between launching the goroutine and an external armBurst call.
+	rearm <- struct{}{}
+	s.periodicStarted[clusterPath] = rearm
+	s.periodicMu.Unlock()
+
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.periodicSyncLoop(clusterPath)
+		s.periodicSyncLoop(clusterPath, rearm)
 	}()
+}
+
+// armBurst signals the cluster's anti-entropy loop to (re)enter its fast
+// convergence-burst window. Safe to call before the loop exists — the signal
+// is delivered when StartPeriodicSync wires the channel; callers invoke
+// StartPeriodicSync first, so by the time armBurst runs the channel is set.
+func (s *Syncer) armBurst(clusterPath string) {
+	s.periodicMu.Lock()
+	rearm := s.periodicStarted[clusterPath]
+	s.periodicMu.Unlock()
+	if rearm == nil {
+		return
+	}
+	// Non-blocking: a pending re-arm already covers this request.
+	select {
+	case rearm <- struct{}{}:
+	default:
+	}
 }
 
 // SyncFrom requests a full member list sync from a specific peer.
@@ -690,24 +966,120 @@ func (s *Syncer) sendSyncError(stream network.Stream, requestID, errMsg string) 
 	shared.WriteProto(stream, resp)
 }
 
-// periodicSyncLoop runs the periodic sync for a cluster.
-func (s *Syncer) periodicSyncLoop(clusterPath string) {
-	ticker := time.NewTicker(s.syncInterval)
-	defer ticker.Stop()
+// periodicSyncLoop runs two-rate anti-entropy for a cluster (Layer 2 of the
+// O13 join-convergence design). It normally ticks at the steady syncInterval,
+// but on a membership change (delivered via the rearm channel) it enters a
+// convergence burst: it ticks every burstInterval (jittered) until
+// burstDuration elapses with no further re-arm, then settles back to steady.
+//
+// The loop is timer-driven (compute next interval, wait, sync, recompute)
+// rather than a fixed ticker so jitter can vary each burst tick and the
+// injected Clock can drive it deterministically in tests.
+func (s *Syncer) periodicSyncLoop(clusterPath string, rearm <-chan struct{}) {
+	// burstUntil is the wall-clock (per the injected Clock) instant at which
+	// the current burst window ends. Zero => steady state.
+	var burstUntil time.Time
 
 	for {
+		// Drain any pending re-arm signals BEFORE computing this tick's
+		// interval. A membership change that arrived while we were mid-tick
+		// (or before the very first tick) must move us into the burst window
+		// now — otherwise we would register a steady-interval waiter and only
+		// notice the burst on the next iteration, which under a mock clock
+		// leaves an orphaned long waiter and non-determinism.
+		if s.consumeRearm(rearm) {
+			burstUntil = s.clock.Now().Add(s.burstDuration)
+		}
+
+		now := s.clock.Now()
+		bursting := burstUntil.After(now)
+
+		interval := s.syncInterval
+		if bursting {
+			interval = s.nextBurstInterval()
+		}
+
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-rearm:
+			// Membership changed — (re)start the burst window on the next
+			// iteration (consumeRearm at the top handles the state change so
+			// the accounting lives in one place).
+			burstUntil = s.clock.Now().Add(s.burstDuration)
+			s.drainRearm(rearm)
+			continue
+		case <-s.clock.After(interval):
 			s.performPeriodicSync(clusterPath)
+			// If the burst window has elapsed, fall back to steady on the
+			// next iteration (bursting recomputed from burstUntil at top).
 		}
 	}
 }
 
-// performPeriodicSync selects peers and syncs from them until one succeeds.
-// Probes all non-failed peers (including quarantined) so they can either
-// recover back to active or reach the removal threshold.
+// consumeRearm reports whether at least one re-arm signal was pending and
+// drains all of them. Non-blocking.
+func (s *Syncer) consumeRearm(rearm <-chan struct{}) bool {
+	armed := false
+	for {
+		select {
+		case <-rearm:
+			armed = true
+		default:
+			return armed
+		}
+	}
+}
+
+// drainRearm empties any additional pending re-arm signals so a burst is
+// armed exactly once per membership-change flurry.
+func (s *Syncer) drainRearm(rearm <-chan struct{}) {
+	for {
+		select {
+		case <-rearm:
+		default:
+			return
+		}
+	}
+}
+
+// nextBurstInterval returns burstInterval with ± burstJitter applied. Jitter
+// desynchronises peers to avoid synchronised sync storms on mass join. When
+// burstJitter is zero (tests) the interval is exact and deterministic.
+func (s *Syncer) nextBurstInterval() time.Duration {
+	base := s.burstInterval
+	if s.burstJitter <= 0 {
+		return base
+	}
+	// Uniform in [-jitter, +jitter]. rand is fine here — jitter only needs
+	// to break synchronisation, not be cryptographically strong.
+	delta := time.Duration(rand.Int63n(int64(2*s.burstJitter+1))) - s.burstJitter
+	interval := base + delta
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	return interval
+}
+
+// nextPeerCursor returns the next round-robin start index for a cluster,
+// bounded by n. It advances a per-cluster cursor so consecutive ticks prefer
+// different peers without depending on the wall clock.
+func (s *Syncer) nextPeerCursor(clusterPath string, n int) int {
+	if n <= 0 {
+		return 0
+	}
+	s.periodicMu.Lock()
+	idx := s.peerCursor[clusterPath] % n
+	s.peerCursor[clusterPath] = idx + 1
+	s.periodicMu.Unlock()
+	return idx
+}
+
+// performPeriodicSync selects one peer and syncs from it, preferring a
+// different peer than the previous tick to spread load and cover the case
+// where the last-picked peer was the one missing the new member. Probes all
+// non-failed peers (including quarantined) so they can either recover back to
+// active or reach the removal threshold.
 func (s *Syncer) performPeriodicSync(clusterPath string) {
 	peers, err := s.phonebook.GetByCluster(clusterPath)
 	if err != nil || len(peers) == 0 {
@@ -732,10 +1104,12 @@ func (s *Syncer) performPeriodicSync(clusterPath string) {
 		return
 	}
 
-	// Shuffle candidates for load balancing (start from random index)
-	startIdx := int(time.Now().UnixNano() % int64(len(candidates)))
+	// Advance a per-cluster round-robin cursor so successive ticks prefer
+	// different peers. Deterministic (no wall-clock dependency) so it works
+	// under the mock clock.
+	startIdx := s.nextPeerCursor(clusterPath, len(candidates))
 
-	// Try candidates in order (starting from random index) until one succeeds
+	// Try candidates in order (starting from the rotated index) until one succeeds
 	for i := 0; i < len(candidates); i++ {
 		idx := (startIdx + i) % len(candidates)
 		selected := candidates[idx]

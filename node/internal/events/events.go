@@ -46,6 +46,7 @@ const (
 	TypeAuthenticationFailed = "auth.authentication_failed"
 	TypeSessionStale         = "auth.session_stale"
 	TypeReauthWithPeer       = "auth.reauth_with_peer"
+	TypeMemberAdmitted       = "auth.member_admitted"
 )
 
 // PeerAuthenticated is emitted when we successfully authenticate to a cluster.
@@ -119,6 +120,28 @@ type ReauthWithPeerRequested struct {
 
 func (e ReauthWithPeerRequested) EventType() string { return TypeReauthWithPeer }
 
+// MemberAdmitted is emitted by the voucher immediately after it has fully
+// authenticated a new cluster member (AuthComplete sent, joiner promoted to
+// Active). It is the event-driven seam that triggers Layer 1 of the join
+// convergence design (O13): the syncer subscribes and actively pushes the
+// new member to every existing Active peer so nobody has to wait for the
+// best-effort Step-2 PubSub broadcast or the periodic anti-entropy tail.
+//
+// This is an internal event (the syncer reacts to it). Auth never calls the
+// syncer directly — it publishes MemberAdmitted and the syncer owns the push.
+//
+// NewMember carries the full member info the voucher already holds from the
+// JoinRequest, so the syncer can build the push payload without a phonebook
+// re-read (which would race the very Add the joiner triggered).
+type MemberAdmitted struct {
+	BaseEvent
+	ClusterPath string
+	NewMember   MemberInfo
+}
+
+// EventType returns the event type identifier for MemberAdmitted.
+func (e MemberAdmitted) EventType() string { return TypeMemberAdmitted }
+
 // --- Cluster Lifecycle Events ---
 
 const (
@@ -187,9 +210,11 @@ type Capabilities struct {
 // --- Sync Events ---
 
 const (
-	TypeSyncCompleted = "sync.completed"
-	TypeSyncFailed    = "sync.failed"
-	TypeSyncRequested = "sync.requested"
+	TypeSyncCompleted        = "sync.completed"
+	TypeSyncFailed           = "sync.failed"
+	TypeSyncRequested        = "sync.requested"
+	TypeMemberPushDelivered  = "sync.member_push_delivered"
+	TypeMemberPushFanoutDone = "sync.member_push_fanout_done"
 )
 
 // SyncCompleted is emitted after successful member list synchronization.
@@ -224,6 +249,37 @@ type SyncRequested struct {
 }
 
 func (e SyncRequested) EventType() string { return TypeSyncRequested }
+
+// MemberPushDelivered is emitted by the Layer-1 voucher fan-out after a
+// SyncPush carrying a newly-admitted member has been successfully delivered
+// to one existing peer (the receiver ACKed with no error). It is an
+// observable event: tests block on it to assert deterministic convergence
+// (no sleeps), and operators can use it to trace fan-out.
+type MemberPushDelivered struct {
+	BaseEvent
+	ClusterPath  string
+	NewMemberID  string // the member being propagated
+	TargetPeer   string // the existing peer we pushed to
+}
+
+// EventType returns the event type identifier for MemberPushDelivered.
+func (e MemberPushDelivered) EventType() string { return TypeMemberPushDelivered }
+
+// MemberPushFanoutDone is emitted once the Layer-1 fan-out for a single
+// MemberAdmitted has finished attempting every Active target. Delivered is
+// the count of successful pushes; Targets is the total attempted. Tests use
+// this to block until the whole fan-out round completes regardless of how
+// many targets there were.
+type MemberPushFanoutDone struct {
+	BaseEvent
+	ClusterPath string
+	NewMemberID string
+	Targets     int
+	Delivered   int
+}
+
+// EventType returns the event type identifier for MemberPushFanoutDone.
+func (e MemberPushFanoutDone) EventType() string { return TypeMemberPushFanoutDone }
 
 // --- Health Events ---
 
