@@ -9,6 +9,39 @@ worth doing.
 
 ## Open
 
+### O14. Election split-brain — nodes disagree on the winner → "no winner observed" (rare)
+
+**Observed (Session 21, unmasked by O13):** `TestElection_3Node_SinglePicker`
+flakes ~1/13 with `election_integration_test.go:177: no winner observed within
+deadline`. Logs show the three nodes naming TWO DIFFERENT winners and ALL THREE
+logging "election lost" — nobody claims → no winner runs the capsule.
+
+**Why now:** pre-existing, not an O13 regression. Before O13 this test failed
+EARLIER at the phonebook-count convergence barrier, MASKING this rarer election
+race. O13 fixed convergence (the test now gets past setup), exposing the
+split-brain. So O13 is strictly an improvement; this is a distinct, older bug.
+
+**Hypothesis (needs investigation):** election claim/verdict agreement race —
+two nodes each compute a different winner (tiebreak on score→timestamp→nodeID)
+and both step aside, so no node claims. Possible contributors: (a) the new
+gravity scoring (Step-2) producing near-equal scores that hit the tiebreak more
+often; (b) claim-propagation timing under the O13 burst-sync churn; (c) a
+genuine tiebreak-asymmetry where nodes don't deterministically agree. The many
+"rejected sync request from unauthenticated peer" WARNs during the burst window
+(O13 burst races peer auth) are noise here (phonebooks did converge) but worth
+reducing separately (burst should back off a peer that rejects as unauth).
+
+**Next step:** trace the election claim/tiebreak agreement path; determine why
+two nodes name different winners. Likely needs architect review (election-core
+agreement). Distinct from O5/O5b (those are the group/slot axis).
+
+**Status: Open.** Rare (~7%); election agreement correctness. Does NOT block
+O13 (committed, fixed the dominant convergence flake — TestCapsuleLifecycle_3Node
+10/10, NodeFailureReElection 5/5, CascadeDelete 5/5).
+
+---
+
+
 ### Gravity + Snapshot cluster (O9/O10/O11) — architect-reviewed design + sequencing
 
 > Reviewed by falak-architect Session 19. Supersedes the per-entry
