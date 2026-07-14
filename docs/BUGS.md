@@ -473,7 +473,7 @@ Concurrency tests green at `-count=20`.
 
 ---
 
-### O5b. Same-node group re-election is refused by member self-anti-affinity (stale member bindings never cleared)
+### O5b. Same-node group re-election is refused by member self-anti-affinity (stale member bindings never cleared) — FIXED (Session 22)
 
 **Found (Session 20, while landing O5):** a same-node group re-election is
 refused by MEMBER self-anti-affinity before the group election can win.
@@ -501,11 +501,35 @@ failure O5 targets, just via a different axis). The fix mirrors O3: add
 before refiring. Separate from O5 (reservation-slot lifecycle) — this is
 replica-binding lifecycle.
 
-**Status: Open — filed, NOT fixed under O5 (orthogonal axis; own tests owed).**
-The O5 node-level `TestGroupReElection_SameNode_AfterWin` clears member
-bindings in test setup (with a TRIPWIRE comment pointing here) to isolate the
-O5 slot mechanic; when O5b lands, that manual clear should be removed and the
-test driven through the real trigger.
+**Status: FIXED (Session 22).** Mirrors O3's `onContainerCrash` clear. Added a
+per-sibling `UnassignReplica` loop — iterating each sibling's snapshot
+`Replicas` (robust; not hardcoding replica "0") — to every same-node group
+re-election trigger path, positioned inside the existing sibling-rollback loop
+and BEFORE the `GroupReelectionRequested` publish so the re-election evaluates
+member eligibility against cleared bindings. Idempotent (`UnassignReplica`
+no-ops an already-unbound replica); errors logged at Debug and skipped so the
+rollback always completes. Trigger paths fixed (`node/capsule_handler.go`):
+- `onMemberPlacementFailed` — the core same-node fatal case (member-crash /
+  placement-failure rollback).
+- `emitGroupReelectionForGroup` — the onNodeFailed reservation-holder path;
+  the binding points at the DEAD node, so the clear is hygiene (a stale
+  dead-node member binding otherwise skews `NodesRunningCapsule` for the other
+  members' placement).
+- `maybeEmitGroupReelection` — the onNodeFailed per-member path; it already
+  walks siblings, so the clear starts the node-failure re-election from cleared
+  bindings too.
+
+**Test tripwire removed.** The O5 node-level
+`TestGroupReElection_SameNode_AfterWin` previously cleared member bindings in
+setup (`resetGroupForSameNodeReelection`, with a TRIPWIRE comment pointing
+here). That manual clear + helper is deleted; the test now drives the real
+production trigger (`onMemberPlacementFailed` → `GroupReelectionRequested`) and
+still re-wins on the same node. New `TestGroupReElection_SameNode_O5b_
+ClearsBindingsThenReWins` drives the same real trigger and asserts BOTH halves:
+(1) every member replica binding is cleared (`NodeID == ""`) after
+`onMemberPlacementFailed` (the unit-level assertion mirroring O3's crash-path
+binding-clear test), and (2) the refired same-node re-election re-wins on the
+only node — proving eligibility was restored with NO manual `UnassignReplica`.
 
 ---
 

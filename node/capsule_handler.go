@@ -1286,6 +1286,28 @@ func (h *CapsuleHandler) onMemberPlacementFailed(failed events.MemberPlacementFa
 					zap.Error(err))
 			}
 		}
+
+		// O5b: clear every sibling replica binding BEFORE the
+		// GroupReelectionRequested publish below. Each member's per-replica
+		// election records a durable replica->node binding (AssignReplica);
+		// left in place, member self-anti-affinity
+		// (electionCapsuleLookup.NodesRunningCapsule) counts the still-bound
+		// member and self-excludes the local node, so a same-node group
+		// re-election is refused ("member does not fit") -> GroupClaimFailed.
+		// Mirrors O3's onContainerCrash clear. Iterate the snapshot's
+		// Replicas (Get copies under the manager mutex) rather than
+		// hardcoding replica "0": robust to any replica shape. Idempotent —
+		// UnassignReplica no-ops an already-unbound replica; log at Debug and
+		// continue on error so the rollback always completes.
+		for _, r := range snap.Replicas {
+			if err := h.manager.UnassignReplica(sib.ID, r.ReplicaID); err != nil {
+				h.logger.Debug("placement rollback: sibling replica unbind failed",
+					zap.String("group_id", failed.GroupID),
+					zap.String("sibling", sib.ID.String()),
+					zap.String("replica", string(r.ReplicaID)),
+					zap.Error(err))
+			}
+		}
 	}
 
 	// Release the capacity reservation for this group so a re-election
@@ -1686,6 +1708,25 @@ func (h *CapsuleHandler) emitGroupReelectionForGroup(
 					zap.Error(err))
 			}
 		}
+
+		// O5b: clear every sibling replica binding BEFORE the
+		// GroupReelectionRequested publish. Here the binding points at the
+		// DEAD node, so the surviving node's own self-exclusion is not the
+		// immediate symptom — but a stale dead-node member binding otherwise
+		// leaves NodesRunningCapsule reporting the dead node as a member
+		// holder, skewing anti-affinity/gravity for the OTHER members'
+		// placement. Clearing is correct binding hygiene, consistent with O3
+		// and with onMemberPlacementFailed. Idempotent; log at Debug and
+		// continue on error.
+		for _, r := range snap.Replicas {
+			if err := h.manager.UnassignReplica(sib.ID, r.ReplicaID); err != nil {
+				h.logger.Debug("group reelection: sibling replica unbind failed",
+					zap.String("group", group.ID.String()),
+					zap.String("sibling", sib.ID.String()),
+					zap.String("replica", string(r.ReplicaID)),
+					zap.Error(err))
+			}
+		}
 	}
 
 	memberIDs := make([]string, 0, len(group.Spec.Group.MemberIDs))
@@ -1810,6 +1851,22 @@ func (h *CapsuleHandler) maybeEmitGroupReelection(
 				h.logger.Debug("group reelection: sibling stop failed",
 					zap.String("group", groupID.String()),
 					zap.String("sibling", sib.ID.String()),
+					zap.Error(err))
+			}
+		}
+
+		// O5b: clear every sibling replica binding BEFORE the
+		// GroupReelectionRequested publish, so a node-failure-driven group
+		// re-election evaluates member eligibility against cleared bindings
+		// (the failed-node holder no longer skews NodesRunningCapsule). Same
+		// hygiene as emitGroupReelectionForGroup and onMemberPlacementFailed;
+		// mirrors O3. Idempotent; log at Debug and continue on error.
+		for _, r := range snap.Replicas {
+			if err := h.manager.UnassignReplica(sib.ID, r.ReplicaID); err != nil {
+				h.logger.Debug("group reelection: sibling replica unbind failed",
+					zap.String("group", groupID.String()),
+					zap.String("sibling", sib.ID.String()),
+					zap.String("replica", string(r.ReplicaID)),
 					zap.Error(err))
 			}
 		}
