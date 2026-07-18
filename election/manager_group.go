@@ -278,6 +278,7 @@ func (m *Manager) runGroupElection(
 			// does NOT release — that would double-release.
 			m.releaseLocalGroupClaim(req.GroupID)
 			m.reportGroup(req, GroupClaimOutcomeEnum.Won(), m.nodeID, score, "")
+			m.reconcileGroupAfterWin(ctx, req, score, publishAt, claimsCh)
 			return
 		}
 		select {
@@ -312,6 +313,85 @@ func (m *Manager) runGroupElection(
 			// Won arm above for the O5 ordering rationale).
 			m.releaseLocalGroupClaim(req.GroupID)
 			m.reportGroup(req, GroupClaimOutcomeEnum.Won(), m.nodeID, score, "")
+			m.reconcileGroupAfterWin(ctx, req, score, publishAt, claimsCh)
+			return
+		}
+	}
+}
+
+// reconcileGroupAfterWin is the O14c post-hoc yield window for the group
+// path — the group twin of reconcileAfterWin. It runs AFTER reportGroup(Won)
+// (the members have been dispatched to StartGroup) and keeps draining rival
+// group claims for reconcileWindow. If a strictly-better rival arrives
+// (its gossip was delayed past the tiebreak window), the local node yields:
+//
+//   - It re-points the group's capacity reservation to the winner via a
+//     SINGLE recordReservation(req, rival...) call. recordReservation
+//     cancels the prior (self) watchdog and re-arms a fresh one for the
+//     winner atomically (no clear-then-record window, no spurious
+//     GroupClaimFailed), and this is the IDENTICAL call the tiebreak-loop
+//     Lost arm already makes — reservation bookkeeping stays inside the
+//     Manager, where pendingReservations lives.
+//   - It emits GroupClaimYielded so the node bridge stops every member it
+//     started (through the O2 ignore-set) and mirrors the winner as remote.
+//     It does NOT fire a re-election and does NOT consume a placement-retry
+//     slot — the winner is already known.
+//
+// isBetterGroup is reused VERBATIM against the SAME published (score,
+// publishAt): under the O14 strict total order, exactly one of two rival
+// group claims yields. Yielding is TERMINAL (one-shot); the function
+// returns and the round never re-elects off the yield.
+func (m *Manager) reconcileGroupAfterWin(
+	ctx context.Context,
+	req GroupClaimRequest,
+	score float64,
+	publishAt time.Time,
+	claimsCh <-chan *electionpb.GroupClaim,
+) {
+	// Drop the group in-flight dedup slot so a fresh group re-election
+	// (member crash, node failure) is not deduped while this goroutine
+	// drains late rivals. The goroutine's deferred removeGroupInflight is
+	// idempotent, so the double removal is safe. Mirrors the single-replica
+	// dropInflightForReconcile.
+	m.removeGroupInflight(req.GroupID)
+	if m.reconcileWindow <= 0 {
+		return
+	}
+	deadline := time.Now().Add(m.reconcileWindow)
+	m.logger.Debug("group reconcile-after-win window opened",
+		zap.String("group", string(req.GroupID)),
+		zap.Duration("window", m.reconcileWindow))
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			m.logger.Debug("group reconcile-after-win window closed; durable winner",
+				zap.String("group", string(req.GroupID)))
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case rival, ok := <-claimsCh:
+			if !ok {
+				return
+			}
+			if isBetterGroup(rival, score, publishAt, m.nodeID) {
+				// Strictly-worse node: un-win. Re-point the reservation to
+				// the winner (single atomic re-record) BEFORE emitting the
+				// yield so the reservation reflects the winner the instant
+				// the node bridge stops the local members.
+				m.recordReservation(req, rival.NodeId, rival.GravityScore)
+				m.logger.Info("group election yielded to strictly-better rival after win (O14c)",
+					zap.String("group", string(req.GroupID)),
+					zap.String("winner", rival.NodeId),
+					zap.Float64("rival_score", rival.GravityScore),
+					zap.Float64("our_score", score))
+				m.groupSink.EmitGroupYielded(req, rival.NodeId)
+				return
+			}
+		case <-time.After(remaining):
+			m.logger.Debug("group reconcile-after-win window closed; durable winner",
+				zap.String("group", string(req.GroupID)))
 			return
 		}
 	}

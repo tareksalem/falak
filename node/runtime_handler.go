@@ -384,10 +384,21 @@ type RuntimeBridge struct {
 	logger     *zap.Logger
 	capsuleMgr *capsule.Manager // optional; required for group-claim FSM advancement
 
+	// yieldStopGrace is the graceful-stop window used when an
+	// ElectionYielded / GroupClaimYielded event stops the briefly-run
+	// container(s) (O14c). Short by default — the container only ran for
+	// the reconcile window and the real winner is already starting.
+	yieldStopGrace time.Duration
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
+
+// defaultYieldStopGrace is the RuntimeBridge default graceful-stop window
+// for a yield-driven container stop (O14c). Matches the election
+// manager's defaultYieldStopGrace so the two halves of the yield agree.
+const defaultYieldStopGrace = 1 * time.Second
 
 // RuntimeBridgeOption configures a RuntimeBridge.
 type RuntimeBridgeOption func(*RuntimeBridge)
@@ -395,6 +406,17 @@ type RuntimeBridgeOption func(*RuntimeBridge)
 // WithRuntimeBridgeLogger sets the logger.
 func WithRuntimeBridgeLogger(logger *zap.Logger) RuntimeBridgeOption {
 	return func(b *RuntimeBridge) { b.logger = logger }
+}
+
+// WithRuntimeBridgeYieldStopGrace sets the graceful-stop window used when
+// a post-hoc election yield stops the briefly-run container(s) (O14c).
+// Non-positive values are ignored (default defaultYieldStopGrace).
+func WithRuntimeBridgeYieldStopGrace(d time.Duration) RuntimeBridgeOption {
+	return func(b *RuntimeBridge) {
+		if d > 0 {
+			b.yieldStopGrace = d
+		}
+	}
 }
 
 // WithRuntimeBridgeCapsuleManager wires the capsule manager used by
@@ -413,9 +435,10 @@ func WithRuntimeBridgeCapsuleManager(m *capsule.Manager) RuntimeBridgeOption {
 // runtime handler.
 func NewRuntimeBridge(handler *falakrt.Handler, bus events.Bus, opts ...RuntimeBridgeOption) *RuntimeBridge {
 	b := &RuntimeBridge{
-		handler:  handler,
-		eventBus: bus,
-		logger:   zap.NewNop(),
+		handler:        handler,
+		eventBus:       bus,
+		logger:         zap.NewNop(),
+		yieldStopGrace: defaultYieldStopGrace,
 	}
 	for _, opt := range opts {
 		opt(b)
@@ -423,14 +446,16 @@ func NewRuntimeBridge(handler *falakrt.Handler, bus events.Bus, opts ...RuntimeB
 	return b
 }
 
-// Start begins listening for ElectionWon, CapsuleRunning, and
-// GroupClaimWon events.
+// Start begins listening for ElectionWon, CapsuleRunning, GroupClaimWon,
+// ElectionYielded, and GroupClaimYielded events.
 func (b *RuntimeBridge) Start(ctx context.Context) {
 	b.ctx, b.cancel = context.WithCancel(ctx)
-	b.wg.Add(3)
+	b.wg.Add(5)
 	go b.electionLoop()
 	go b.runningLoop()
 	go b.groupLoop()
+	go b.yieldLoop()
+	go b.groupYieldLoop()
 }
 
 // Stop cancels the listeners and waits for clean exit.
@@ -538,6 +563,94 @@ func (b *RuntimeBridge) groupLoop() {
 				NodeID:      won.NodeID,
 				Score:       won.Score,
 			})
+		}
+	}
+}
+
+// yieldLoop dispatches ElectionYielded events (O14c) to the runtime
+// handler's StopContainer. StopContainer plants the O2 self-removal
+// ignore-set entry BEFORE Stop+Remove, so the yield-stop is suppressed at
+// the container event consumer and does NOT self-trigger a re-election
+// (HARD INVARIANT #1). The stop also covers the start-vs-stop race: if the
+// container has not been created yet, StopContainer is a clean no-op that
+// still leaves the ignore entry standing, so the async start (if it lands)
+// is suppressed by the handler's onContainerRunning backstop.
+//
+// The binding re-point (UnassignReplica → AssignReplica(winner)) and the
+// FSM mirror (SyncStatus Assigned) are driven by the CapsuleHandler's own
+// ElectionYielded subscriber — HARD INVARIANT #2 lives on the capsule side
+// where the binding state does.
+func (b *RuntimeBridge) yieldLoop() {
+	defer b.wg.Done()
+	ch := b.eventBus.Subscribe(events.TypeElectionYielded)
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			yielded, ok := ev.(events.ElectionYielded)
+			if !ok {
+				continue
+			}
+			b.logger.Info("runtime bridge: stopping yielded container (O14c)",
+				zap.String("capsule_id", yielded.CapsuleID),
+				zap.String("replica_id", yielded.ReplicaID),
+				zap.String("winner", yielded.WinnerNodeID))
+			if err := b.handler.StopContainer(yielded.CapsuleID, yielded.ReplicaID, b.yieldStopGrace); err != nil {
+				// Tolerate: the container may never have been created (start
+				// lost the race) — the ignore entry is planted regardless,
+				// which is the point. Debug, not Warn: this is the common,
+				// benign case.
+				b.logger.Debug("runtime bridge: yield stop returned error (often expected: container not yet started)",
+					zap.String("capsule_id", yielded.CapsuleID),
+					zap.String("replica_id", yielded.ReplicaID),
+					zap.Error(err))
+			}
+		}
+	}
+}
+
+// groupYieldLoop dispatches GroupClaimYielded events (O14c) by stopping
+// every member the local node started, each through StopContainer (the O2
+// ignore-set — HARD INVARIANT #1). Members of a same-node group are
+// started with the fixed replica ID "0" (StartGroup's assignment), so the
+// stop uses the same replica ID. The reservation was already re-pointed to
+// the winner inside the election manager's reconcile; the FSM mirror +
+// binding clears are driven by the CapsuleHandler's GroupClaimYielded
+// subscriber. This loop is the container-teardown half only.
+func (b *RuntimeBridge) groupYieldLoop() {
+	defer b.wg.Done()
+	ch := b.eventBus.Subscribe(events.TypeGroupClaimYielded)
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			yielded, ok := ev.(events.GroupClaimYielded)
+			if !ok {
+				continue
+			}
+			b.logger.Info("runtime bridge: stopping yielded group members (O14c)",
+				zap.String("group_id", yielded.GroupID),
+				zap.String("winner", yielded.WinnerNodeID),
+				zap.Int("members", len(yielded.MemberIDs)))
+			// Also cancel any parked starts for this group so a
+			// dependency-released member does not start after we stop it.
+			b.handler.CancelGroupStarts(yielded.GroupID)
+			for _, mid := range yielded.MemberIDs {
+				if err := b.handler.StopContainer(mid, "0", b.yieldStopGrace); err != nil {
+					b.logger.Debug("runtime bridge: group yield member stop returned error (often expected: member not yet started)",
+						zap.String("group_id", yielded.GroupID),
+						zap.String("member", mid),
+						zap.Error(err))
+				}
+			}
 		}
 	}
 }

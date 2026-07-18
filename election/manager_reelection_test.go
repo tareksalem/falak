@@ -136,11 +136,13 @@ func (l *recordingLifecycle) WinElectionWithBinding(id capsule.CapsuleID, replic
 // recordingSink counts outcome events so tests can assert on them without a
 // real event bus.
 type recordingSink struct {
-	mu          sync.Mutex
-	won         int
-	lost        int
-	failed      int
-	wonReplicas []string
+	mu            sync.Mutex
+	won           int
+	lost          int
+	failed        int
+	yielded       int
+	wonReplicas   []string
+	yieldWinners  []string
 }
 
 func (s *recordingSink) EmitWon(req Request, _ string, _ float64) {
@@ -162,9 +164,22 @@ func (s *recordingSink) EmitFailed(Request, string) {
 	s.mu.Unlock()
 }
 
-func (s *recordingSink) wonCount() int    { s.mu.Lock(); defer s.mu.Unlock(); return s.won }
-func (s *recordingSink) lostCount() int   { s.mu.Lock(); defer s.mu.Unlock(); return s.lost }
-func (s *recordingSink) failedCount() int { s.mu.Lock(); defer s.mu.Unlock(); return s.failed }
+func (s *recordingSink) EmitYielded(_ Request, winnerNodeID string) {
+	s.mu.Lock()
+	s.yielded++
+	s.yieldWinners = append(s.yieldWinners, winnerNodeID)
+	s.mu.Unlock()
+}
+
+func (s *recordingSink) wonCount() int     { s.mu.Lock(); defer s.mu.Unlock(); return s.won }
+func (s *recordingSink) lostCount() int    { s.mu.Lock(); defer s.mu.Unlock(); return s.lost }
+func (s *recordingSink) failedCount() int  { s.mu.Lock(); defer s.mu.Unlock(); return s.failed }
+func (s *recordingSink) yieldedCount() int { s.mu.Lock(); defer s.mu.Unlock(); return s.yielded }
+func (s *recordingSink) yieldWinnerList() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.yieldWinners...)
+}
 
 // gravityTestStrategy is a minimal Strategy that drives the REAL gravity
 // calculator (including the real self-anti-affinity check via the wired
@@ -224,6 +239,12 @@ func makeReplicaManager(t *testing.T, tracker *bindingTracker, opts ...ManagerOp
 		WithEventSink(sink),
 		WithElectionTimeout(300 * time.Millisecond),
 		WithTiebreakWindow(30 * time.Millisecond),
+		// Short reconcile window so the post-hoc yield phase does not keep
+		// the round goroutine alive for the production default (3s) — most
+		// helper-driven tests assert on in-flight drain / re-election
+		// timing. Tests that specifically exercise the reconcile/yield path
+		// override this via opts.
+		WithReconcileWindow(40 * time.Millisecond),
 		WithPublishTimeout(1 * time.Second),
 	}
 	combined = append(combined, opts...)

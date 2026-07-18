@@ -414,7 +414,7 @@ func (h *CapsuleHandler) HasPlacementFailedEntry(id capsule.CapsuleID) bool {
 func (h *CapsuleHandler) Start(ctx context.Context) {
 	h.ctx, h.cancel = context.WithCancel(ctx)
 
-	h.wg.Add(12)
+	h.wg.Add(14)
 	go func() {
 		defer h.wg.Done()
 		h.handleClusterJoined(h.ctx)
@@ -462,6 +462,14 @@ func (h *CapsuleHandler) Start(ctx context.Context) {
 	go func() {
 		defer h.wg.Done()
 		h.handleGroupClaimWon(h.ctx)
+	}()
+	go func() {
+		defer h.wg.Done()
+		h.handleElectionYielded(h.ctx)
+	}()
+	go func() {
+		defer h.wg.Done()
+		h.handleGroupClaimYielded(h.ctx)
 	}()
 
 	h.scalingMonitor.Start(h.ctx)
@@ -1237,78 +1245,15 @@ func (h *CapsuleHandler) onMemberPlacementFailed(failed events.MemberPlacementFa
 		_ = rollback.CancelGroupStarts(failed.GroupID)
 	}
 
-	// Walk siblings and roll each one back to a pre-placement state.
-	// Reuses the same Running -> Stop, Created/Assigned/Executing/Electing
-	// -> Announced shape as onNodeFailed's emitGroupReelectionForGroup.
-	//
-	// For Running siblings, both the FSM transition (via
-	// manager.StopCapsule) AND the runtime container stop (via
-	// runtimeRollback.StopContainer) are driven. The FSM transition
-	// alone is not sufficient: the winning node's actual container
-	// remains alive otherwise and races the new winner's StartGroup.
-	for _, sib := range siblings {
-		snap := h.manager.Get(sib.ID)
-		if snap == nil {
-			continue
-		}
-		switch snap.Status {
-		case enums.CapsuleStatusEnum.Created(),
-			enums.CapsuleStatusEnum.Assigned(),
-			enums.CapsuleStatusEnum.Executing(),
-			enums.CapsuleStatusEnum.Electing():
-			if err := h.manager.SyncStatus(sib.ID, enums.CapsuleStatusEnum.Announced()); err != nil {
-				h.logger.Debug("placement rollback: sibling resync to Announced failed",
-					zap.String("group_id", failed.GroupID),
-					zap.String("sibling", sib.ID.String()),
-					zap.String("status", string(snap.Status)),
-					zap.Error(err))
-			}
-		case enums.CapsuleStatusEnum.Running():
-			if err := h.manager.StopCapsule(sib.ID); err != nil {
-				h.logger.Debug("placement rollback: sibling stop failed",
-					zap.String("group_id", failed.GroupID),
-					zap.String("sibling", sib.ID.String()),
-					zap.Error(err))
-			}
-		}
-
-		// Drive the runtime stop regardless of FSM state — siblings
-		// in any post-Assigned state may have an active container on
-		// this node, and StopContainer is idempotent (it returns an
-		// error for unknown containers which we drop at Debug level).
-		// The replica ID for same-node group members is always "0"
-		// (matches StartGroup's fixed assignment).
-		if rollback != nil {
-			if err := rollback.StopContainer(sib.ID.String(), "0", time.Second); err != nil {
-				h.logger.Debug("placement rollback: sibling runtime stop failed (often expected: container not started)",
-					zap.String("group_id", failed.GroupID),
-					zap.String("sibling", sib.ID.String()),
-					zap.Error(err))
-			}
-		}
-
-		// O5b: clear every sibling replica binding BEFORE the
-		// GroupReelectionRequested publish below. Each member's per-replica
-		// election records a durable replica->node binding (AssignReplica);
-		// left in place, member self-anti-affinity
-		// (electionCapsuleLookup.NodesRunningCapsule) counts the still-bound
-		// member and self-excludes the local node, so a same-node group
-		// re-election is refused ("member does not fit") -> GroupClaimFailed.
-		// Mirrors O3's onContainerCrash clear. Iterate the snapshot's
-		// Replicas (Get copies under the manager mutex) rather than
-		// hardcoding replica "0": robust to any replica shape. Idempotent —
-		// UnassignReplica no-ops an already-unbound replica; log at Debug and
-		// continue on error so the rollback always completes.
-		for _, r := range snap.Replicas {
-			if err := h.manager.UnassignReplica(sib.ID, r.ReplicaID); err != nil {
-				h.logger.Debug("placement rollback: sibling replica unbind failed",
-					zap.String("group_id", failed.GroupID),
-					zap.String("sibling", sib.ID.String()),
-					zap.String("replica", string(r.ReplicaID)),
-					zap.Error(err))
-			}
-		}
-	}
+	// Walk siblings and roll each one back to a pre-placement state:
+	// stop the runtime container (through the ignore-set), downgrade the
+	// FSM, and clear every replica binding (O5b). The winning node's
+	// actual container must be stopped, not just its FSM transitioned,
+	// otherwise it races the new winner's StartGroup. Factored into
+	// rollbackGroupContainers so the O14c group-yield subscriber reuses
+	// the identical mechanism (stop+downgrade+unbind) without the
+	// retry-cap / re-election policy that follows here.
+	h.rollbackGroupContainers(failed.GroupID, siblings, rollback)
 
 	// Release the capacity reservation for this group so a re-election
 	// can proceed without the watchdog firing a spurious failure.

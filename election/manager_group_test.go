@@ -20,10 +20,11 @@ import (
 // fakeGroupSink records every emitted group-claim outcome so tests can
 // assert on it without a real event bus.
 type fakeGroupSink struct {
-	mu     sync.Mutex
-	won    []fakeGroupEvent
-	lost   []fakeGroupEvent
-	failed []fakeGroupEvent
+	mu      sync.Mutex
+	won     []fakeGroupEvent
+	lost    []fakeGroupEvent
+	failed  []fakeGroupEvent
+	yielded []fakeGroupEvent
 }
 
 type fakeGroupEvent struct {
@@ -51,6 +52,12 @@ func (s *fakeGroupSink) EmitGroupFailed(req GroupClaimRequest, reason string) {
 	s.failed = append(s.failed, fakeGroupEvent{GroupID: req.GroupID, Reason: reason})
 }
 
+func (s *fakeGroupSink) EmitGroupYielded(req GroupClaimRequest, winnerNodeID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.yielded = append(s.yielded, fakeGroupEvent{GroupID: req.GroupID, NodeID: winnerNodeID})
+}
+
 func (s *fakeGroupSink) snapshot() (won, lost, failed []fakeGroupEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -58,6 +65,13 @@ func (s *fakeGroupSink) snapshot() (won, lost, failed []fakeGroupEvent) {
 	l := append([]fakeGroupEvent(nil), s.lost...)
 	f := append([]fakeGroupEvent(nil), s.failed...)
 	return w, l, f
+}
+
+// yieldedEvents returns a copy of the recorded group-yield events.
+func (s *fakeGroupSink) yieldedEvents() []fakeGroupEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]fakeGroupEvent(nil), s.yielded...)
 }
 
 // fakeStore is an in-memory CapsuleStore for tests.
@@ -182,6 +196,10 @@ func makeGroupManager(t *testing.T, nodeState gravity.NodeState, opts ...Manager
 		WithGroupClaimSink(sink),
 		WithElectionTimeout(2 * time.Second),
 		WithTiebreakWindow(50 * time.Millisecond),
+		// Short reconcile window so the post-hoc group-yield phase does not
+		// keep the round goroutine alive for the production default. Tests
+		// that exercise the reconcile/yield path override this via opts.
+		WithReconcileWindow(50 * time.Millisecond),
 		WithPublishTimeout(1 * time.Second),
 	}
 	combined = append(combined, opts...)

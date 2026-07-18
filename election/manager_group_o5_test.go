@@ -97,6 +97,8 @@ func makeGroupManagerWithProvider(
 		WithGroupClaimSink(sink),
 		WithElectionTimeout(2 * time.Second),
 		WithTiebreakWindow(50 * time.Millisecond),
+		// Short reconcile window (O14c) so a Won round drains promptly.
+		WithReconcileWindow(50 * time.Millisecond),
 		WithPublishTimeout(1 * time.Second),
 	}
 	combined = append(combined, opts...)

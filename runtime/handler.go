@@ -612,6 +612,21 @@ func (h *Handler) startContainer(event ElectionWon) {
 	replicaID := event.ReplicaID
 	cID := containerID(capsuleID, replicaID)
 
+	// O14c start-vs-stop race guard (fast path). ElectionWon → start is
+	// async; a post-hoc election yield's StopContainer may plant an
+	// ignore-set entry for this container BEFORE this start goroutine
+	// runs. Honour it here as a clean no-op so the yield's teardown wins
+	// and no duplicate container is created. The onContainerRunning
+	// backstop below covers the narrower interleaving where the ignore
+	// entry is planted AFTER this check but BEFORE the container is
+	// registered.
+	if h.isIgnored(cID) {
+		h.logger.Debug("runtime: start suppressed by ignore-set (yield/stop landed first)",
+			zap.String("container_id", cID),
+			zap.String("capsule_id", capsuleID))
+		return
+	}
+
 	spec, err := h.capsuleStore.GetSpec(capsuleID)
 	if err != nil {
 		h.logger.Error("runtime: capsule spec lookup failed",
@@ -839,6 +854,46 @@ func (h *Handler) captureSnapshot(capsuleID, cID, tag string, spec *CapsuleSpec)
 // starts a health checker if configured, and starts a background watcher
 // for crashes.
 func (h *Handler) onContainerRunning(cID, capsuleID string, spec *CapsuleSpec) {
+	// O14c start-vs-stop race backstop. A post-hoc election yield's
+	// StopContainer may have planted an ignore-set entry for this
+	// container AFTER startContainer's top-of-function guard passed but
+	// while the create/start was in flight. If the entry is live now, the
+	// yield's teardown must win: do NOT MarkRunning, do NOT register a
+	// watcher (which would emit CapsuleRunning and resurrect the duplicate
+	// we are trying to kill), and tear the just-created container back
+	// down. The ignore entry is left standing (it ages out via
+	// sweepIgnored) so the died/removed events from this teardown stay
+	// suppressed at handleContainerEvent — HARD INVARIANT #1.
+	//
+	// The check is done under h.mu, on the raw map (not isIgnored, which
+	// re-locks h.mu) so it is atomic with the register/decline decision:
+	// no TOCTOU window between "not ignored" and "installed running
+	// entry". onContainerRunning is only ever reached on the cold-start /
+	// restore paths for the container's OWN cID (RollingUpdate registers a
+	// different -new cID; captureSnapshot restarts via runtime.Start
+	// directly, never through here), so a live same-cID ignore entry here
+	// can only be a stop-intent.
+	h.mu.Lock()
+	if deadline, ok := h.ignored[cID]; ok && time.Now().Before(deadline) {
+		h.mu.Unlock()
+		h.logger.Info("runtime: honouring concurrent stop; tearing down just-started container",
+			zap.String("container_id", cID),
+			zap.String("capsule_id", capsuleID))
+		// Stop+Remove OUTSIDE the lock — backend calls must never hold
+		// h.mu. Best-effort: errors are logged, not surfaced, because the
+		// container may already be gone (the yield's own Stop raced ahead).
+		if err := h.runtime.Stop(h.ctx, cID); err != nil {
+			h.logger.Debug("runtime: stop of yielded container failed (often expected: not yet fully started)",
+				zap.String("container_id", cID), zap.Error(err))
+		}
+		if err := h.runtime.Remove(h.ctx, cID); err != nil {
+			h.logger.Debug("runtime: remove of yielded container failed (often expected: already gone)",
+				zap.String("container_id", cID), zap.Error(err))
+		}
+		return
+	}
+	h.mu.Unlock()
+
 	h.logger.Info("runtime: container running",
 		zap.String("container_id", cID),
 		zap.String("capsule_id", capsuleID))
@@ -861,12 +916,33 @@ func (h *Handler) onContainerRunning(cID, capsuleID string, spec *CapsuleSpec) {
 	// this container ID (e.g. event-bus redelivery), cancel the old
 	// goroutines first to prevent orphans. A re-registration clears any
 	// stale ignore-set entry so a fresh container is watched again.
+	//
+	// The ignore-set is re-checked inside this same critical section
+	// because a stop-intent could have been planted between the decline
+	// check above releasing h.mu and this re-acquire; if so, decline here
+	// too rather than register a doomed watcher.
 	restartLimit := 0
 	if spec != nil {
 		restartLimit = spec.FailurePolicy.RestartLimit
 	}
 	watchCtx, watchCancel := context.WithCancel(h.ctx)
 	h.mu.Lock()
+	if deadline, ok := h.ignored[cID]; ok && time.Now().Before(deadline) {
+		h.mu.Unlock()
+		watchCancel()
+		h.logger.Info("runtime: honouring concurrent stop after MarkRunning; tearing down container",
+			zap.String("container_id", cID),
+			zap.String("capsule_id", capsuleID))
+		if err := h.runtime.Stop(h.ctx, cID); err != nil {
+			h.logger.Debug("runtime: stop of yielded container failed",
+				zap.String("container_id", cID), zap.Error(err))
+		}
+		if err := h.runtime.Remove(h.ctx, cID); err != nil {
+			h.logger.Debug("runtime: remove of yielded container failed",
+				zap.String("container_id", cID), zap.Error(err))
+		}
+		return
+	}
 	if old, exists := h.running[cID]; exists {
 		h.logger.Warn("runtime: replacing existing watcher for container",
 			zap.String("container_id", cID))

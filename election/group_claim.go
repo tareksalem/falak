@@ -125,6 +125,14 @@ type GroupClaimSink interface {
 	// EmitGroupFailed is called when no node could be elected.
 	// reason carries a human-readable explanation.
 	EmitGroupFailed(req GroupClaimRequest, reason string)
+
+	// EmitGroupYielded is called (O14c) when the local node briefly won
+	// the group election but stepped down during the post-hoc reconcile
+	// window after observing a strictly-better rival. winnerNodeID is the
+	// rival that won. The node bridge drives ONLY the container stops +
+	// FSM mirror from this — the manager has already re-pointed the
+	// capacity reservation to the winner, and no re-election is fired.
+	EmitGroupYielded(req GroupClaimRequest, winnerNodeID string)
 }
 
 // noopGroupSink is the default group sink — silently drops events. The
@@ -135,3 +143,4 @@ type noopGroupSink struct{}
 func (noopGroupSink) EmitGroupWon(GroupClaimRequest, string, float64) {}
 func (noopGroupSink) EmitGroupLost(GroupClaimRequest, string)         {}
 func (noopGroupSink) EmitGroupFailed(GroupClaimRequest, string)       {}
+func (noopGroupSink) EmitGroupYielded(GroupClaimRequest, string)      {}

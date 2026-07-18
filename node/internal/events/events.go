@@ -577,6 +577,13 @@ const (
 	TypeElectionWon       = "election.won"
 	TypeElectionLost      = "election.lost"
 	TypeElectionFailed    = "election.failed"
+	TypeElectionYielded   = "election.yielded"
+
+	// TypeGroupClaimYielded is the group twin of TypeElectionYielded: a
+	// node that briefly won a same-node group election but observed a
+	// strictly-better rival during the post-hoc reconcile window steps
+	// down, stopping every member it started.
+	TypeGroupClaimYielded = "election.group_claim_yielded"
 
 	// Group-mode election events (Phase 10.14). same-node CapsuleGroups
 	// elect atomically: one claim covers every member's combined
@@ -698,6 +705,53 @@ type ElectionFailed struct {
 }
 
 func (e ElectionFailed) EventType() string { return TypeElectionFailed }
+
+// ElectionYielded is emitted (O14c) when this node briefly reported Won
+// for a replica but, during the bounded post-hoc reconcile window,
+// observed a strictly-better rival claim and stepped down to avoid
+// duplicate execution. It is the "un-win" signal.
+//
+// Two subscribers react, in this order:
+//   - RuntimeBridge routes it to runtime.Handler.StopContainer, which
+//     plants the O2 self-removal ignore-set entry BEFORE Stop+Remove so
+//     the yield-stop does NOT self-trigger a re-election (HARD INVARIANT #1).
+//   - CapsuleHandler re-points the replica binding to the real winner
+//     (UnassignReplica then AssignReplica(winner)) and mirrors the winner
+//     as remote via SyncStatus(Assigned), identical to handleElectionLost
+//     (HARD INVARIANT #2). B becomes a clean loser that briefly ran.
+//
+// Yielding is one-shot and terminal: a yielded round never re-enters
+// reconcile and never re-elects off the yield.
+type ElectionYielded struct {
+	BaseEvent
+	CapsuleID    string
+	ReplicaID    string
+	ClusterPath  string
+	WinnerNodeID string
+}
+
+// EventType returns the event type identifier for ElectionYielded.
+func (e ElectionYielded) EventType() string { return TypeElectionYielded }
+
+// GroupClaimYielded is the group twin of ElectionYielded (O14c). When a
+// node that briefly won a same-node group election observes a
+// strictly-better rival during the reconcile window, it steps down and
+// stops every member it started. The election Manager re-points the
+// group's capacity reservation to the winner inside its reconcile loop
+// (a single recordReservation call, atomic watchdog re-arm); this event
+// drives ONLY the node-side container stops + FSM mirror. It does NOT
+// trigger a re-election and does NOT consume a placement-retry slot — the
+// winner is already known (WinnerNodeID).
+type GroupClaimYielded struct {
+	BaseEvent
+	GroupID      string
+	ClusterPath  string
+	MemberIDs    []string // topological order, as started
+	WinnerNodeID string
+}
+
+// EventType returns the event type identifier for GroupClaimYielded.
+func (e GroupClaimYielded) EventType() string { return TypeGroupClaimYielded }
 
 // GroupClaimRequested is fired locally on every node when a same-node
 // CapsuleGroup needs an atomic placement. Unlike per-replica

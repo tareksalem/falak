@@ -158,6 +158,34 @@ overriding.
 | `WithMaxInspectErrors(n)` | `5` | Consecutive transient inspect failures tolerated during reconcile before a container is declared "runtime unreachable" and re-elected. |
 | `WithEventReconnectBackoff(d)` | `1s` | Base (jittered) delay between event-stream reconnect attempts after the stream drops. |
 
+### Election (double-winner safety — O14c)
+
+If gossip propagation delay exceeds the tiebreak window, two nodes can each
+declare themselves the election winner before hearing the other and both
+start the same replica — duplicate execution. Falak bounds this with a
+**post-hoc yield**: after reporting Won (the container has started) a node
+keeps draining rival claims for a bounded **reconcile window**; if a
+strictly-better rival arrives it *yields* — stops the container through the
+self-removal ignore set (so the stop never self-triggers a re-election) and
+re-points the replica binding to the real winner. Under the total-order
+tiebreak exactly one of two rivals yields, so no duplicate survives.
+
+The tiebreak window is kept small (the container has not started yet, so
+happy-path placement stays fast); the reconcile window bounds the worst-case
+double-run duration. A propagation delay LONGER than the reconcile window is
+a partition — both nodes run until SWIM heals; that is membership's concern,
+not election's.
+
+These are functional options on the election manager (`election.With…`) and
+the runtime bridge (`node.WithRuntimeBridge…`), with production-sensible
+defaults.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithTiebreakWindow(d)` | `1s` | How long a node waits after publishing its claim, before declaring Won, for a strictly-better rival (~1 gossipsub heartbeat). Kept small — the container has not started during this window. |
+| `WithReconcileWindow(d)` | `3s` | How long a node keeps draining rival claims AFTER declaring Won. A strictly-better rival in this window triggers a yield. Bounds the worst-case double-run duration. Non-positive disables the reconcile phase. |
+| `WithYieldStopGrace(d)` / `node.WithRuntimeBridgeYieldStopGrace(d)` | `1s` | Graceful-stop window handed to the runtime when a yield stops the briefly-run container(s). |
+
 ### Snapshot replication (O11 — HA fast-restart)
 
 After a successful cold-start capture the holder proactively replicates

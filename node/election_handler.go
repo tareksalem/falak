@@ -186,6 +186,19 @@ func (s *electionEventSink) EmitFailed(req election.Request, reason string) {
 	})
 }
 
+// EmitYielded publishes an ElectionYielded event (O14c). The RuntimeBridge
+// stops the briefly-run container through the O2 ignore-set and the
+// CapsuleHandler re-points the replica binding to the winner.
+func (s *electionEventSink) EmitYielded(req election.Request, winnerNodeID string) {
+	s.bus.Publish(events.ElectionYielded{
+		BaseEvent:    events.NewBaseEvent(),
+		CapsuleID:    string(req.CapsuleID),
+		ReplicaID:    req.ReplicaID,
+		ClusterPath:  req.ClusterPath,
+		WinnerNodeID: winnerNodeID,
+	})
+}
+
 // groupClaimSinkAdapter implements election.GroupClaimSink by publishing
 // the outcome events onto the node's internal event bus. The runtime
 // handler subscribes to events.GroupClaimWon to start the group's
@@ -229,6 +242,25 @@ func (s *groupClaimSinkAdapter) EmitGroupFailed(req election.GroupClaimRequest, 
 		GroupID:     string(req.GroupID),
 		ClusterPath: req.ClusterPath,
 		Reason:      reason,
+	})
+}
+
+// EmitGroupYielded publishes a GroupClaimYielded event on the node bus
+// (O14c). The capsule handler stops every member the local node started
+// (through the O2 ignore-set) and mirrors the winner as remote. The
+// manager has already re-pointed the capacity reservation to the winner;
+// this event drives no re-election.
+func (s *groupClaimSinkAdapter) EmitGroupYielded(req election.GroupClaimRequest, winnerNodeID string) {
+	memberIDs := make([]string, 0, len(req.MemberIDs))
+	for _, mid := range req.MemberIDs {
+		memberIDs = append(memberIDs, string(mid))
+	}
+	s.bus.Publish(events.GroupClaimYielded{
+		BaseEvent:    events.NewBaseEvent(),
+		GroupID:      string(req.GroupID),
+		ClusterPath:  req.ClusterPath,
+		MemberIDs:    memberIDs,
+		WinnerNodeID: winnerNodeID,
 	})
 }
 

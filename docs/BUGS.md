@@ -30,24 +30,6 @@ this is the cleaner long-term shape.
 
 ---
 
-### O14c. Double-winner risk when claim propagation delay > tiebreakWindow
-
-**Pre-existing, surfaced while fixing O14 (Session 22).** The tiebreak window
-(`WithTiebreakWindow`, default 300ms) bounds how long a local winner waits after
-publishing before declaring itself Won. If a competing claim's gossip
-propagation delay EXCEEDS the tiebreak window, two nodes can each conclude Won
-before hearing the other, and there is no post-hoc reconciliation to demote the
-loser. This is independent of O14 (it is a window-vs-RTT sizing issue, not a
-tiebreak-asymmetry issue) and was not introduced by the O14 fix. Mitigation:
-size `tiebreakWindow` against measured gossipsub RTT for the target cluster
-size, or add a reconciliation step (later claim with a better key demotes an
-already-declared local winner). Needs its own investigation.
-
-**Status: Open.** Pre-existing; separate from O14.
-
----
-
-
 ### Gravity + Snapshot cluster (O9/O10/O11) — architect-reviewed design + sequencing
 
 > Reviewed by falak-architect Session 19. Supersedes the per-entry
@@ -694,6 +676,102 @@ Session 18 manual end-to-end pass.
 ---
 
 ## Fixed (manual testing pass)
+
+### F34. O14c — Double-winner safety via post-hoc yield (bounded reconcile window)
+
+**Observed / risk (Session 22, pre-existing; surfaced while fixing O14).** Even
+with O14's correct strict total order, the tiebreak window
+(`WithTiebreakWindow`) only bounds how long a local winner waits BEFORE
+declaring Won. If a competing claim's gossip propagation delay EXCEEDS the
+tiebreak window, two nodes each conclude Won before hearing the other → both
+start the container → duplicate execution of the same replica (port/volume
+conflicts, double external effects), with no reconciliation to demote the loser.
+
+**Fix — LAYERED (both).**
+- **Layer 1 (probability reducer):** default `tiebreakWindow` bumped 300ms → **1s**
+  (~1 gossipsub heartbeat), still configurable. Kept SMALL by design — the
+  container has NOT started during the tiebreak, so happy-path placement latency
+  stays low. Not a fix on its own (propagation is unbounded).
+- **Layer 2 (the real fix) — post-hoc yield.** After `report(Won)` the round no
+  longer returns; it enters `reconcileAfterWin` (single-replica) /
+  `reconcileGroupAfterWin` (group), which keep draining rival claims for a
+  configurable `reconcileWindow` (`WithReconcileWindow`, default **3s** ≈ 3×
+  tiebreak). *Start optimistically, reconcile pessimistically.* If a
+  strictly-better rival arrives (its gossip was delayed past the tiebreak
+  window), the local node is the strictly-worse node and **YIELDS** — an
+  "un-win". The comparison reuses `isBetter` / `isBetterGroup` VERBATIM against
+  the SAME published decision, so under the O14 total order EXACTLY ONE of two
+  rivals yields (both-yield and nobody-yield are impossible — the reason O14 had
+  to land first). Yielding is TERMINAL (one-shot; a yielded round never
+  re-enters reconcile and never re-elects off the yield).
+
+**Yield mechanics — two hard invariants.**
+- **INVARIANT #1 (route the stop through the O2 ignore-set).** The manager emits
+  `events.ElectionYielded` / `events.GroupClaimYielded`; `RuntimeBridge` routes
+  it to `runtime.Handler.StopContainer`, which plants the self-removal ignore-set
+  entry BEFORE Stop+Remove, so the yield-stop's died/remove events are suppressed
+  and do NOT self-trigger `onContainerCrash` → re-election storm. Never a raw
+  runtime Stop.
+- **INVARIANT #2 (re-point the binding to the real winner).** The node-side
+  `CapsuleHandler` yield subscriber clears the stale local binding
+  (`UnassignReplica`), records the winner (`AssignReplica(winner)`), and mirrors
+  the winner as remote (`SyncStatus(Assigned)`) — identical to
+  `handleElectionLost` — so `NodesRunningCapsule` converges on the winner, not
+  merely on nobody. For the GROUP path the reservation re-point lives inside the
+  manager: `reconcileGroupAfterWin` calls `recordReservation(req, rival…)`, a
+  SINGLE atomic re-record (it cancels the prior self-watchdog and re-arms for the
+  winner, avoiding a spurious `GroupClaimFailed`); the node subscriber then stops
+  every started member through the shared `rollbackGroupContainers` helper
+  (factored out of `onMemberPlacementFailed`, reusing the stop/downgrade/unbind
+  MECHANISM but NOT its retry-cap/re-election POLICY) and mirrors each member on
+  the winner.
+
+**Start-vs-stop race (targeted).** `EmitWon → RuntimeBridge → startContainer` is
+async, so a yield's `StopContainer` may race AHEAD of the start.
+`startContainer` now checks `isIgnored(cID)` at the top (stop-before-start → clean
+no-op, no container created) and `onContainerRunning` honors a live ignore entry
+under `h.mu` by tearing the just-created container back down instead of
+registering a watcher (stop-during-start). The ignore entry is left to age out via
+`sweepIgnored`. `onContainerRunning` is provably reached with a live same-cID
+ignore entry only on a real stop-intent (RollingUpdate uses a distinct `-new`
+cID; snapshot capture restarts via `runtime.Start` directly). The reconcile phase
+also drops the in-flight dedup slot BEFORE the window opens, so a legitimately-new
+re-election (crash recovery during the reconcile window) is not deduped.
+
+**Boundary (documented, NOT solved).** Partition-duration double-wins (delay >
+`reconcileWindow`): neither node sees the other's claim in time, so both run
+until SWIM heals — that is MEMBERSHIP's problem, not election's. Optional future
+hardening = a periodic placement audit (separate ticket; deliberately NOT folded
+in here). Encoded by `TestO14c_DelayBeyondReconcileWindow_BothRemainWinners`.
+
+**Tests.** `election/manager_o14c_test.go` — reconcile-decision unit (strictly-
+better→yield, strictly-worse→durable, ctx-cancel), the A/B symmetry invariant
+(`TestReconcile_ABSymmetry_ExactlyOneYields` — A does NOT yield AND B DOES via the
+real `isBetter`, the both-yield-impossible proof), the inject-delay integration
+repro on two connected gossipsub managers
+(`TestO14c_InjectDelay_DoubleWinner_ExactlyOneYields` — both momentarily Won, then
+exactly one yields to the isBetter winner), the documented delay>window boundary,
+and the group twins (`TestReconcileGroupAfterWin_*` — reservation re-pointed to
+winner and survives). `runtime/handler_o14c_test.go` — start-vs-stop race
+(`_StopBeforeStart_Suppressed`, `_StopDuringStart_TornDown`).
+`node/capsule_handler_yield_test.go` — the node-side re-point + FSM mirror + the
+O2 no-re-election guard for both single-replica and group yields.
+
+**Files:** `election/manager.go` (`reconcileAfterWin`, `WithReconcileWindow`,
+`WithYieldStopGrace`, `EventSink.EmitYielded`, default tiebreak 1s),
+`election/manager_group.go` (`reconcileGroupAfterWin`),
+`election/group_claim.go` (`GroupClaimSink.EmitGroupYielded`),
+`node/internal/events/events.go` (`ElectionYielded`, `GroupClaimYielded`),
+`node/election_handler.go` (sink emitters), `node/runtime_handler.go`
+(`yieldLoop`, `groupYieldLoop`, `WithRuntimeBridgeYieldStopGrace`),
+`node/capsule_handler_yield.go` (yield subscribers + `rollbackGroupContainers`),
+`runtime/handler.go` (`startContainer` guard + `onContainerRunning` ignore-honor).
+
+**Status: Fixed (Session 22).** `go vet` clean; `go test -race -count=1
+./election/... ./runtime/...` green; new node yield/crash-recovery tests green.
+NOT committed.
+
+---
 
 ### F33. O14 — Election split-brain: tiebreak keyed self on intended time, rivals on actual time (not a strict total order)
 

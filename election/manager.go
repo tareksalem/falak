@@ -54,6 +54,14 @@ type EventSink interface {
 	EmitWon(req Request, winnerNodeID string, score float64)
 	EmitLost(req Request, winnerNodeID string)
 	EmitFailed(req Request, reason string)
+
+	// EmitYielded is called (O14c) when the local node briefly reported
+	// Won for the replica but stepped down during the post-hoc reconcile
+	// window after observing a strictly-better rival. winnerNodeID is the
+	// rival that won. The node bridge routes this to the runtime handler's
+	// StopContainer (via the O2 ignore-set) and re-points the replica
+	// binding to the winner.
+	EmitYielded(req Request, winnerNodeID string)
 }
 
 // noopSink is the default sink — silently drops events.
@@ -62,6 +70,7 @@ type noopSink struct{}
 func (noopSink) EmitWon(Request, string, float64) {}
 func (noopSink) EmitLost(Request, string)         {}
 func (noopSink) EmitFailed(Request, string)       {}
+func (noopSink) EmitYielded(Request, string)      {}
 
 // defaultGroupImagePullTimeout bounds the per-member image-pull window
 // the manager assumes when computing the capacity-reservation deadline.
@@ -75,6 +84,28 @@ const defaultGroupImagePullTimeout = 5 * time.Minute
 // covers fixed-cost runtime overhead (container start, healthcheck
 // settling) that does not scale with member count.
 const defaultGroupReservationSlack = 30 * time.Second
+
+// defaultTiebreakWindow is how long a node waits after publishing its
+// claim, before reporting Won, for a strictly-better rival claim (O14c
+// Layer 1). Bumped to ~1 gossipsub heartbeat (1s) so the common case
+// where propagation is fast enough resolves entirely inside the tiebreak
+// (no yield). The container has NOT started during this window — kept
+// short so happy-path placement latency stays low. Configurable via
+// WithTiebreakWindow.
+const defaultTiebreakWindow = 1 * time.Second
+
+// defaultReconcileWindow is how long a node keeps draining rival claims
+// AFTER reporting Won (O14c Layer 2). The container HAS started during
+// this window; a strictly-better rival observed here triggers a yield.
+// ~3x the tiebreak window so a claim delayed just past the tiebreak
+// deadline is still caught. Configurable via WithReconcileWindow.
+const defaultReconcileWindow = 3 * time.Second
+
+// defaultYieldStopGrace is the graceful-stop window a yield hands the
+// runtime when stopping the briefly-run container. Short because the
+// container only ran for the reconcile window and the real winner is
+// already starting its own copy. Configurable via WithYieldStopGrace.
+const defaultYieldStopGrace = 1 * time.Second
 
 // StrategyRegistry maps cluster paths to the strategy they use.
 //
@@ -182,6 +213,8 @@ type Manager struct {
 	publishTimeout         time.Duration
 	electionTimeout        time.Duration
 	tiebreakWindow         time.Duration
+	reconcileWindow        time.Duration
+	yieldStopGrace         time.Duration
 	groupImagePullTimeout  time.Duration
 	perClusterTimeout      map[string]time.Duration
 
@@ -324,9 +357,45 @@ func WithElectionTimeout(d time.Duration) ManagerOption {
 }
 
 // WithTiebreakWindow sets how long the local winner waits after
-// publishing its claim to see if a better remote claim arrives.
+// publishing its claim to see if a better remote claim arrives. This
+// window is kept SMALL (the container has NOT started yet during it —
+// start optimistically): the O14c reconcile window bounds the
+// double-run duration afterwards.
 func WithTiebreakWindow(d time.Duration) ManagerOption {
 	return func(m *Manager) { m.tiebreakWindow = d }
+}
+
+// WithReconcileWindow sets how long the local winner keeps draining rival
+// claims AFTER reporting Won (O14c). During this window the container HAS
+// started; if a strictly-better rival claim arrives (propagation delay
+// exceeded the tiebreak window), the local node yields — stops the
+// container via the O2 ignore-set and re-points the binding to the
+// winner. Bounds the worst-case double-execution duration to this window
+// (plus gossip latency). Non-positive values are ignored (default kept).
+// Default defaultReconcileWindow (3s), ~3x the default tiebreak window.
+func WithReconcileWindow(d time.Duration) ManagerOption {
+	return func(m *Manager) {
+		if d > 0 {
+			m.reconcileWindow = d
+		}
+	}
+}
+
+// WithYieldStopGrace sets the graceful-stop window passed to the runtime
+// when a yield stops the briefly-run container (O14c). Non-positive
+// values are ignored. Default defaultYieldStopGrace (1s). Exposed as a
+// manager option for symmetry, though the grace is applied node-side; the
+// manager carries it so a single configuration surface governs the yield
+// timing. NOTE: the actual StopContainer grace is applied by the node's
+// yield subscriber, which reads its own configurable grace; this option
+// is retained for future manager-driven yield transports and documents
+// the intended default.
+func WithYieldStopGrace(d time.Duration) ManagerOption {
+	return func(m *Manager) {
+		if d > 0 {
+			m.yieldStopGrace = d
+		}
+	}
 }
 
 // NewManager constructs a Manager with the given default strategy and
@@ -349,7 +418,9 @@ func NewManager(defaultStrategy Strategy, opts ...ManagerOption) *Manager {
 		perClusterTimeout:     make(map[string]time.Duration),
 		publishTimeout:        3 * time.Second,
 		electionTimeout:       10 * time.Second,
-		tiebreakWindow:        300 * time.Millisecond,
+		tiebreakWindow:        defaultTiebreakWindow,
+		reconcileWindow:       defaultReconcileWindow,
+		yieldStopGrace:        defaultYieldStopGrace,
 		groupImagePullTimeout: defaultGroupImagePullTimeout,
 	}
 	for _, opt := range opts {
@@ -775,6 +846,7 @@ func (m *Manager) runElection(ctx context.Context, req Request, c *capsule.Capsu
 		remaining := time.Until(tiebreakDeadline)
 		if remaining <= 0 {
 			m.report(req, OutcomeEnum.Won(), m.nodeID, decision.Score, "")
+			m.reconcileAfterWin(ctx, req, decision, claimsCh)
 			return
 		}
 		select {
@@ -793,6 +865,95 @@ func (m *Manager) runElection(ctx context.Context, req Request, c *capsule.Capsu
 			// Worse rival; ignore and keep waiting.
 		case <-time.After(remaining):
 			m.report(req, OutcomeEnum.Won(), m.nodeID, decision.Score, "")
+			m.reconcileAfterWin(ctx, req, decision, claimsCh)
+			return
+		}
+	}
+}
+
+// dropInflightForReconcile removes the in-flight dedup entry for this
+// round BEFORE the reconcile window begins (O14c). report(Won) has already
+// fired, so this round is logically finished from a dedup standpoint; the
+// reconcile phase only observes late rivals. Holding the in-flight slot
+// across the reconcile window would DEDUP a legitimately-new re-election
+// (e.g. crash recovery: the container is removed during the reconcile
+// window, onContainerCrash fires ElectionRequested, and HandleRequest
+// would drop it as "already in flight" → deadlock). Dropping the entry
+// here lets a fresh round dispatch immediately while this goroutine keeps
+// draining claimsCh. The goroutine's deferred removeInflight is idempotent,
+// so the double removal is safe.
+func (m *Manager) dropInflightForReconcile(req Request) {
+	m.removeInflight(inflightKey{CapsuleID: req.CapsuleID, ReplicaID: req.ReplicaID})
+}
+
+// reconcileAfterWin is the O14c post-hoc yield window. It runs AFTER
+// report(Won) — the container has been asked to start via EmitWon — and
+// keeps draining rival claims for reconcileWindow. If a strictly-better
+// rival claim arrives (its gossip was delayed past the tiebreak window,
+// which is why two nodes could both have reported Won), the local node is
+// the strictly-worse node and YIELDS: it emits an ElectionYielded event
+// that (node-side) stops the just-started container through the O2
+// ignore-set and re-points the replica binding to the winner. If the
+// window closes with no better rival, the local node is the durable
+// winner and the container keeps running.
+//
+// STABILITY INVARIANT (O14/O14c): the comparison uses isBetter VERBATIM
+// against the SAME published `decision` (never a second comparator, never
+// a reassigned decision — `decision` is not mutated after publish). Under
+// the O14 strict total order, for any two distinct nodes' claims EXACTLY
+// ONE satisfies isBetter(other, self): the true winner never yields (no
+// rival is strictly better than it), the true loser always yields.
+// Both-yield and nobody-yield are impossible.
+//
+// Anti-flap: yielding is TERMINAL. The function returns after emitting the
+// yield; it never re-enters reconcile and the round never re-elects off
+// the yield (the yield-stop routes through the ignore-set so it does not
+// trigger onContainerCrash → re-election).
+func (m *Manager) reconcileAfterWin(ctx context.Context, req Request, decision Decision, claimsCh <-chan *electionpb.Claim) {
+	// Drop the in-flight dedup slot so a fresh re-election (crash recovery,
+	// scale) is not deduped while this goroutine drains late rivals.
+	m.dropInflightForReconcile(req)
+	if m.reconcileWindow <= 0 {
+		return
+	}
+	deadline := time.Now().Add(m.reconcileWindow)
+	m.logger.Debug("reconcile-after-win window opened",
+		zap.String("capsule_id", string(req.CapsuleID)),
+		zap.String("replica_id", req.ReplicaID),
+		zap.Duration("window", m.reconcileWindow))
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			m.logger.Debug("reconcile-after-win window closed; durable winner",
+				zap.String("capsule_id", string(req.CapsuleID)),
+				zap.String("replica_id", req.ReplicaID))
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case rival, ok := <-claimsCh:
+			if !ok {
+				// Listener channel closed (topic stopping / listener
+				// replaced): no more rivals can arrive. Durable winner.
+				return
+			}
+			if isBetter(rival, decision, m.nodeID) {
+				// We are the strictly-worse node: un-win.
+				m.logger.Info("election yielded to strictly-better rival after win (O14c)",
+					zap.String("capsule_id", string(req.CapsuleID)),
+					zap.String("replica_id", req.ReplicaID),
+					zap.String("winner", rival.NodeId),
+					zap.Float64("rival_score", rival.GravityScore),
+					zap.Float64("our_score", decision.Score))
+				m.sink.EmitYielded(req, rival.NodeId)
+				return
+			}
+			// Worse rival: ignore and keep reconciling.
+		case <-time.After(remaining):
+			m.logger.Debug("reconcile-after-win window closed; durable winner",
+				zap.String("capsule_id", string(req.CapsuleID)),
+				zap.String("replica_id", req.ReplicaID))
 			return
 		}
 	}
