@@ -9,35 +9,41 @@ worth doing.
 
 ## Open
 
-### O14. Election split-brain — nodes disagree on the winner → "no winner observed" (rare)
+### O14b. Election tiebreak — migrate to a schedule-offset field (structural fix)
 
-**Observed (Session 21, unmasked by O13):** `TestElection_3Node_SinglePicker`
-flakes ~1/13 with `election_integration_test.go:177: no winner observed within
-deadline`. Logs show the three nodes naming TWO DIFFERENT winners and ALL THREE
-logging "election lost" — nobody claims → no winner runs the capsule.
+**Follow-up filed by the O14 fix (Session 22).** O14 was fixed by publishing
+the INTENDED `PublishAt` in `Claim.TimestampMicros` / `GroupClaim.TimestampMicros`
+so self-view and peer-view key the tiebreak on the same value (option 1). That
+removes the intended/actual asymmetry, but the tiebreak still carries an
+absolute wall-clock-derived timestamp whose only meaning is ordering. The
+structural fix (architect option 3) is to replace the timestamp field with the
+deterministic jittered delay/offset the strategy already computes
+(`delayFromScore` / the delay strategy's `PublishAt = now + offset`), i.e. carry
+the OFFSET, not an absolute time. That eliminates the whole intended/actual
+class of bug at the wire level AND preserves score-driven jitter (no
+lexicographic-nodeID placement skew, which is why the pure `score→nodeID`
+tiebreak was rejected). This is a wire-format semantic change (`TimestampMicros`
+→ a delay/offset field), so it needs its own plan and a rolling-compat story.
 
-**Why now:** pre-existing, not an O13 regression. Before O13 this test failed
-EARLIER at the phonebook-count convergence barrier, MASKING this rarer election
-race. O13 fixed convergence (the test now gets past setup), exposing the
-split-brain. So O13 is strictly an improvement; this is a distinct, older bug.
+**Status: Open.** Not urgent — O14 (option 1) makes the current field correct;
+this is the cleaner long-term shape.
 
-**Hypothesis (needs investigation):** election claim/verdict agreement race —
-two nodes each compute a different winner (tiebreak on score→timestamp→nodeID)
-and both step aside, so no node claims. Possible contributors: (a) the new
-gravity scoring (Step-2) producing near-equal scores that hit the tiebreak more
-often; (b) claim-propagation timing under the O13 burst-sync churn; (c) a
-genuine tiebreak-asymmetry where nodes don't deterministically agree. The many
-"rejected sync request from unauthenticated peer" WARNs during the burst window
-(O13 burst races peer auth) are noise here (phonebooks did converge) but worth
-reducing separately (burst should back off a peer that rejects as unauth).
+---
 
-**Next step:** trace the election claim/tiebreak agreement path; determine why
-two nodes name different winners. Likely needs architect review (election-core
-agreement). Distinct from O5/O5b (those are the group/slot axis).
+### O14c. Double-winner risk when claim propagation delay > tiebreakWindow
 
-**Status: Open.** Rare (~7%); election agreement correctness. Does NOT block
-O13 (committed, fixed the dominant convergence flake — TestCapsuleLifecycle_3Node
-10/10, NodeFailureReElection 5/5, CascadeDelete 5/5).
+**Pre-existing, surfaced while fixing O14 (Session 22).** The tiebreak window
+(`WithTiebreakWindow`, default 300ms) bounds how long a local winner waits after
+publishing before declaring itself Won. If a competing claim's gossip
+propagation delay EXCEEDS the tiebreak window, two nodes can each conclude Won
+before hearing the other, and there is no post-hoc reconciliation to demote the
+loser. This is independent of O14 (it is a window-vs-RTT sizing issue, not a
+tiebreak-asymmetry issue) and was not introduced by the O14 fix. Mitigation:
+size `tiebreakWindow` against measured gossipsub RTT for the target cluster
+size, or add a reconciliation step (later claim with a better key demotes an
+already-declared local winner). Needs its own investigation.
+
+**Status: Open.** Pre-existing; separate from O14.
 
 ---
 
@@ -688,6 +694,71 @@ Session 18 manual end-to-end pass.
 ---
 
 ## Fixed (manual testing pass)
+
+### F33. O14 — Election split-brain: tiebreak keyed self on intended time, rivals on actual time (not a strict total order)
+
+**Observed (Session 21, unmasked by O13):** `TestElection_3Node_SinglePicker`
+flaked ~7% with `no winner observed within deadline` — the three nodes named
+TWO DIFFERENT winners and ALL THREE logged "election lost", so nobody claimed.
+
+**Root cause (architect-confirmed, Session 22):** the tiebreak
+(`isBetter` / `isBetterGroup`) must be a strict TOTAL ORDER so exactly one node
+finds no rival strictly better than itself. But each node keyed it with
+**self-INTENDED** time and **rival-ACTUAL** time: the published claim carried
+`TimestampMicros = time.Now()` (actual — `manager.go:727`,
+`manager_group.go:237`) while every node compared rivals against its own
+`decision.PublishAt` / `publishAt` (intended). When actual ≠ intended
+(scheduling jitter after the pre-publish wait, worse under `-race` + O13 burst
+churn), antisymmetry broke → a 3-cycle A≻B≻C≻A became reachable → all nodes
+reported Lost. Step-2's near-equal scores tie on score, making the timestamp
+field load-bearing — which is exactly why Step-2 + O13 UNMASKED this
+pre-existing bug. The group path had a SECOND surface: the post-publish
+comparison at `manager_group.go:286` passed the ACTUAL `publishedAt` while the
+pre-publish comparison at `:162` already used the intended `publishAt`, so the
+two surfaces disagreed even within one node.
+
+**Fix (option 1 — publish the INTENDED time; architect-validated):**
+`TimestampMicros` has NO consumer other than the tiebreak, so changing what it
+carries is safe. BOTH managers now publish the intended time:
+- `election/manager.go` — publish `decision.PublishAt.UnixMicro()` (snapshotted
+  as `publishedMicros` before the claim, with a load-bearing comment that
+  `decision` is not reassigned between publish and the post-publish tiebreak
+  loop — the last `strategy.Decide` is in the CAS loop, before publish, so the
+  published field and the `ours.PublishAt` compared in the window are the same
+  value).
+- `election/manager_group.go` — publish `publishAt.UnixMicro()` (intended) AND
+  change the post-publish comparison at the former `:286` from `publishedAt`
+  (actual) to `publishAt` (intended). **BOTH group edits were required** — the
+  original candidate fix missed the `:286` comparison edit, leaving the group
+  path asymmetric.
+
+Comparison logic (`isBetter` / `isBetterGroup`) was NOT changed; the timestamp
+field was NOT dropped; the rejected `score→nodeID` tiebreak (which creates a
+lexicographic-nodeID placement bias under Step-2 near-equal scores) was NOT
+adopted.
+
+**Tests (`election/manager_o14_test.go`, deterministic, race-safe):** a
+pure-function cycle simulation renders each node's published claim exactly as
+the manager builds it and asserts EXACTLY ONE winner cluster-wide. Single-replica
+and group cycle repros each run 500 iterations of the near-equal-score /
+skewed-actual-time fixture with 0 split-brains under the fix (verified 0/25,000
+at `-count=50`); a companion test confirms the PRE-FIX (actual-timestamp)
+behaviour split-brains 500/500 on both paths, proving the fixtures stress the
+tiebreak. Plus: equal-score+equal-time → lexicographically-smallest nodeID wins
+(all agree); best-node-drops-before-publish → unique second-best winner;
+non-anchored re-election with skewed clocks → single winner; a manager-level
+stall-before-publish liveness test (resolves Failed, releases slot, no
+deadlock); a manager-level contended re-decide test exercising the CAS loop +
+re-`Decide`; and a field-level assertion that the published `TimestampMicros`
+equals `decision.PublishAt.UnixMicro()` (guards against a revert to
+`publishedAt`).
+
+**Status: Fixed (Session 22).** `go test -race -count=1 ./election/...` green;
+cycle repros green at `-count=50` (0 split-brains). Follow-ups filed: O14b
+(schedule-offset field — structural), O14c (double-winner when propagation delay
+> tiebreak window — pre-existing).
+
+---
 
 ### F32. O6 — Capsule lifecycle FSM not downgraded from `running` on crash → election/ready transitions rejected
 

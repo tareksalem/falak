@@ -229,12 +229,23 @@ func (m *Manager) runGroupElection(
 	}
 
 	publishedAt := time.Now()
+	// STABILITY INVARIANT (O14): publish the INTENDED publishAt (computed
+	// above from delayFromScore), NOT the wall-clock publishedAt. The
+	// group tiebreak keys on (score, intended-publishAt, nodeID); peers
+	// compare our claim's TimestampMicros against their intended publishAt,
+	// and isBetterGroup below compares rivals against our publishAt
+	// (intended). Publishing the actual wall-clock time made the group path
+	// asymmetric exactly like the single-replica path (O14) — pre-publish
+	// used intended (publishAt) while post-publish used actual, so the same
+	// 3-cycle split-brain was reachable. publishAt is stable across the CAS
+	// re-decide loop above (only `score` is refreshed there, never
+	// publishAt), so the published value equals the value compared below.
 	claim := &electionpb.GroupClaim{
 		GroupId:         string(req.GroupID),
 		ClusterPath:     req.ClusterPath,
 		NodeId:          m.nodeID,
 		GravityScore:    score,
-		TimestampMicros: publishedAt.UnixMicro(),
+		TimestampMicros: publishAt.UnixMicro(),
 	}
 	for _, id := range req.MemberIDs {
 		claim.MemberIds = append(claim.MemberIds, string(id))
@@ -283,7 +294,13 @@ func (m *Manager) runGroupElection(
 				claimsCh = nil
 				continue
 			}
-			if isBetterGroup(rival, score, publishedAt, m.nodeID) {
+			// O14: compare against the INTENDED publishAt (matching what we
+			// published as TimestampMicros), NOT the wall-clock publishedAt.
+			// Using publishedAt here was the group-path asymmetry the
+			// original candidate fix missed — pre-publish (:162) already used
+			// publishAt, so the two surfaces disagreed and the 3-cycle
+			// split-brain stayed reachable on the group path.
+			if isBetterGroup(rival, score, publishAt, m.nodeID) {
 				m.releaseLocalGroupClaim(req.GroupID)
 				m.recordReservation(req, rival.NodeId, rival.GravityScore)
 				m.reportGroup(req, GroupClaimOutcomeEnum.Lost(), rival.NodeId, rival.GravityScore, "")

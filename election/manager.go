@@ -718,13 +718,32 @@ func (m *Manager) runElection(ctx context.Context, req Request, c *capsule.Capsu
 	}
 
 	publishedAt := time.Now()
+	// STABILITY INVARIANT (O14): the tiebreak requires a strict TOTAL
+	// ORDER so exactly one node finds no rival better than itself. Every
+	// node keys the order as (score, intended-PublishAt, nodeID). The
+	// claim we publish MUST carry the INTENDED PublishAt (decision.PublishAt),
+	// NOT the wall-clock publishedAt: peers compare our claim's
+	// TimestampMicros against their own intended PublishAt, and isBetter
+	// compares rivals against OUR ours.PublishAt (intended). Publishing the
+	// actual wall-clock time here (as before) made self-view use intended
+	// while peer-view used actual — antisymmetry broke under scheduling
+	// jitter (worse under -race + O13 burst churn), a 3-cycle A≻B≻C≻A became
+	// reachable, and all nodes reported Lost ("no winner observed").
+	//
+	// This publish and the post-publish tiebreak loop (below) BOTH depend on
+	// decision.PublishAt being the SAME value: the field we publish here and
+	// the ours.PublishAt isBetter reads in the window must match. That holds
+	// because `decision` is NOT reassigned between here and the loop — the
+	// last strategy.Decide is in the CAS loop above, before this point.
+	// publishedMicros snapshots the value to make the invariant structural.
+	publishedMicros := decision.PublishAt.UnixMicro()
 	claim := &electionpb.Claim{
 		CapsuleId:       string(req.CapsuleID),
 		ReplicaId:       req.ReplicaID,
 		ClusterPath:     req.ClusterPath,
 		NodeId:          m.nodeID,
 		GravityScore:    decision.Score,
-		TimestampMicros: publishedAt.UnixMicro(),
+		TimestampMicros: publishedMicros,
 	}
 	pubCtx, pubCancel := context.WithTimeout(ctx, m.publishTimeout)
 	if err := topic.PublishClaim(pubCtx, claim); err != nil {
