@@ -207,15 +207,15 @@ func TestReconcileAfterWin_ContextCancelReturns(t *testing.T) {
 // B DOES yield (it is the true loser). Both-yield and nobody-yield are
 // impossible under the O14 strict total order; this test encodes that.
 func TestReconcile_ABSymmetry_ExactlyOneYields(t *testing.T) {
-	// A published earlier (smaller intended time) → A is strictly better on
-	// the timestamp tiebreak; scores equal.
+	// A has a smaller offset (higher priority) → A is strictly better on the
+	// O14b offset tiebreak; scores equal.
 	const score = 50.0
-	aDecision := Decision{Eligible: true, Score: score, PublishAt: time.UnixMicro(1000)}
-	bDecision := Decision{Eligible: true, Score: score, PublishAt: time.UnixMicro(2000)}
+	aDecision := Decision{Eligible: true, Score: score, Offset: 1000 * time.Microsecond}
+	bDecision := Decision{Eligible: true, Score: score, Offset: 2000 * time.Microsecond}
 
-	// The wire claims each node PUBLISHED (TimestampMicros == intended, O14).
-	aClaim := &electionpb.Claim{NodeId: "node-a", GravityScore: score, TimestampMicros: 1000}
-	bClaim := &electionpb.Claim{NodeId: "node-b", GravityScore: score, TimestampMicros: 2000}
+	// The wire claims each node PUBLISHED (OffsetMicros == its own offset, O14b).
+	aClaim := &electionpb.Claim{NodeId: "node-a", GravityScore: score, OffsetMicros: 1000}
+	bClaim := &electionpb.Claim{NodeId: "node-b", GravityScore: score, OffsetMicros: 2000}
 
 	reqA := Request{CapsuleID: capsule.CapsuleID("cap"), ReplicaID: "0", ClusterPath: "test/dc1/c"}
 	reqB := reqA
@@ -514,17 +514,20 @@ func TestReconcileGroupAfterWin_StrictlyBetterRivalYields(t *testing.T) {
 		t.Fatalf("precondition: reservation should be held by local node")
 	}
 
-	// Local publishAt later than the rival's → rival is strictly better.
-	publishAt := time.UnixMicro(2000)
+	// Local offset larger than the rival's → rival is strictly better on the
+	// O14b offset tiebreak (equal score). TimestampMicros is set to the
+	// OPPOSITE ordering to prove the tiebreak ignores it.
+	offset := 2000 * time.Microsecond
 	claimsCh := make(chan *electionpb.GroupClaim, 1)
 	claimsCh <- &electionpb.GroupClaim{
-		GroupId: string(groupID), NodeId: "node-rival", GravityScore: 50, TimestampMicros: 1000,
+		GroupId: string(groupID), NodeId: "node-rival", GravityScore: 50,
+		OffsetMicros: 1000, TimestampMicros: 9999, // smaller offset wins; timestamp ignored
 	}
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		mgr.reconcileGroupAfterWin(context.Background(), req, 50, publishAt, claimsCh)
+		mgr.reconcileGroupAfterWin(context.Background(), req, 50, offset, claimsCh)
 	}()
 	select {
 	case <-done:
@@ -562,12 +565,12 @@ func TestReconcileGroupAfterWin_StrictlyWorseRivalDurable(t *testing.T) {
 	}
 	mgr.recordReservation(req, mgr.nodeID, 90)
 
-	publishAt := time.UnixMicro(1000)
+	offset := 1000 * time.Microsecond
 	claimsCh := make(chan *electionpb.GroupClaim, 1)
-	// Rival is strictly worse: lower score.
-	claimsCh <- &electionpb.GroupClaim{GroupId: string(groupID), NodeId: "node-rival", GravityScore: 10, TimestampMicros: 500}
+	// Rival is strictly worse: lower score (offset/timestamp irrelevant).
+	claimsCh <- &electionpb.GroupClaim{GroupId: string(groupID), NodeId: "node-rival", GravityScore: 10, OffsetMicros: 100, TimestampMicros: 500}
 
-	mgr.reconcileGroupAfterWin(context.Background(), req, 90, publishAt, claimsCh)
+	mgr.reconcileGroupAfterWin(context.Background(), req, 90, offset, claimsCh)
 
 	if got := len(sink.yieldedEvents()); got != 0 {
 		t.Fatalf("strictly-worse rival must not cause a group yield, got %d", got)

@@ -139,17 +139,20 @@ func (m *Manager) runGroupElection(
 	score := float64(fit.Result.Score)
 	timeout := m.timeoutFor(req.ClusterPath)
 	deadline := time.Now().Add(timeout)
-	wait := delayFromScore(score, timeout)
-	publishAt := time.Now().Add(wait)
+	// offset is the clock-independent tiebreak key (O14b): the group's
+	// deterministic priority delay. publishAt (offset applied to now)
+	// schedules WHEN to publish; offset alone orders the tiebreak.
+	offset := delayFromScore(score, timeout)
+	publishAt := time.Now().Add(offset)
 
 	m.logger.Debug("group election: eligible",
 		zap.String("group", string(req.GroupID)),
 		zap.Float64("score", score),
-		zap.Duration("wait", wait),
+		zap.Duration("offset", offset),
 		zap.Time("publish_at", publishAt))
 
 	// Wait until PublishAt, preempted by a better remote claim or deadline.
-	if wait > 0 {
+	if offset > 0 {
 		select {
 		case <-ctx.Done():
 			m.reportGroup(req, GroupClaimOutcomeEnum.Failed(), "", 0, "context cancelled")
@@ -159,12 +162,12 @@ func (m *Manager) runGroupElection(
 			// !ok; treat as no rival and fall through to publish.
 			// isBetterGroup also guards against a nil rival as
 			// defense-in-depth.
-			if ok && isBetterGroup(rival, score, publishAt, m.nodeID) {
+			if ok && isBetterGroup(rival, score, offset, m.nodeID) {
 				m.recordReservation(req, rival.NodeId, rival.GravityScore)
 				m.reportGroup(req, GroupClaimOutcomeEnum.Lost(), rival.NodeId, rival.GravityScore, "")
 				return
 			}
-		case <-time.After(wait):
+		case <-time.After(offset):
 		case <-time.After(time.Until(deadline)):
 			m.reportGroup(req, GroupClaimOutcomeEnum.Failed(), "", 0, "group election timeout")
 			return
@@ -229,23 +232,30 @@ func (m *Manager) runGroupElection(
 	}
 
 	publishedAt := time.Now()
-	// STABILITY INVARIANT (O14): publish the INTENDED publishAt (computed
-	// above from delayFromScore), NOT the wall-clock publishedAt. The
-	// group tiebreak keys on (score, intended-publishAt, nodeID); peers
-	// compare our claim's TimestampMicros against their intended publishAt,
-	// and isBetterGroup below compares rivals against our publishAt
-	// (intended). Publishing the actual wall-clock time made the group path
-	// asymmetric exactly like the single-replica path (O14) — pre-publish
-	// used intended (publishAt) while post-publish used actual, so the same
-	// 3-cycle split-brain was reachable. publishAt is stable across the CAS
-	// re-decide loop above (only `score` is refreshed there, never
-	// publishAt), so the published value equals the value compared below.
+	// STABILITY INVARIANT (O14b): the group tiebreak keys on (score, OFFSET,
+	// nodeID) where offset is the group's deterministic priority delay
+	// (computed above from delayFromScore). The claim carries that offset
+	// (OffsetMicros); peers compare our claim's OffsetMicros against their
+	// own offset, and isBetterGroup below compares rivals against our offset.
+	// Because offset is a pure duration — NOT a wall-clock time — the order
+	// is identical on every node regardless of clock skew (O14b removes
+	// wall-clock from the tiebreak; O14 previously carried the intended
+	// publishAt, still a wall-clock value).
+	//
+	// TimestampMicros still carries the intended publishAt for observability
+	// only; the tiebreak (isBetterGroup) never reads it.
+	//
+	// offset is stable across the CAS re-decide loop above (only `score` is
+	// refreshed there — and offset is recomputed from that score before the
+	// loop, never mutated inside it), so the published value equals the value
+	// compared below.
 	claim := &electionpb.GroupClaim{
 		GroupId:         string(req.GroupID),
 		ClusterPath:     req.ClusterPath,
 		NodeId:          m.nodeID,
 		GravityScore:    score,
 		TimestampMicros: publishAt.UnixMicro(),
+		OffsetMicros:    offset.Microseconds(),
 	}
 	for _, id := range req.MemberIDs {
 		claim.MemberIds = append(claim.MemberIds, string(id))
@@ -278,7 +288,7 @@ func (m *Manager) runGroupElection(
 			// does NOT release — that would double-release.
 			m.releaseLocalGroupClaim(req.GroupID)
 			m.reportGroup(req, GroupClaimOutcomeEnum.Won(), m.nodeID, score, "")
-			m.reconcileGroupAfterWin(ctx, req, score, publishAt, claimsCh)
+			m.reconcileGroupAfterWin(ctx, req, score, offset, claimsCh)
 			return
 		}
 		select {
@@ -295,13 +305,11 @@ func (m *Manager) runGroupElection(
 				claimsCh = nil
 				continue
 			}
-			// O14: compare against the INTENDED publishAt (matching what we
-			// published as TimestampMicros), NOT the wall-clock publishedAt.
-			// Using publishedAt here was the group-path asymmetry the
-			// original candidate fix missed — pre-publish (:162) already used
-			// publishAt, so the two surfaces disagreed and the 3-cycle
-			// split-brain stayed reachable on the group path.
-			if isBetterGroup(rival, score, publishAt, m.nodeID) {
+			// O14b: compare against the OFFSET (matching what we published as
+			// OffsetMicros), NOT any wall-clock time. Offset is a pure
+			// duration, so this comparison is identical on every node
+			// regardless of clock skew. timestamp_micros is not consulted.
+			if isBetterGroup(rival, score, offset, m.nodeID) {
 				m.releaseLocalGroupClaim(req.GroupID)
 				m.recordReservation(req, rival.NodeId, rival.GravityScore)
 				m.reportGroup(req, GroupClaimOutcomeEnum.Lost(), rival.NodeId, rival.GravityScore, "")
@@ -313,7 +321,7 @@ func (m *Manager) runGroupElection(
 			// Won arm above for the O5 ordering rationale).
 			m.releaseLocalGroupClaim(req.GroupID)
 			m.reportGroup(req, GroupClaimOutcomeEnum.Won(), m.nodeID, score, "")
-			m.reconcileGroupAfterWin(ctx, req, score, publishAt, claimsCh)
+			m.reconcileGroupAfterWin(ctx, req, score, offset, claimsCh)
 			return
 		}
 	}
@@ -338,14 +346,14 @@ func (m *Manager) runGroupElection(
 //     slot — the winner is already known.
 //
 // isBetterGroup is reused VERBATIM against the SAME published (score,
-// publishAt): under the O14 strict total order, exactly one of two rival
+// offset): under the O14b strict total order, exactly one of two rival
 // group claims yields. Yielding is TERMINAL (one-shot); the function
 // returns and the round never re-elects off the yield.
 func (m *Manager) reconcileGroupAfterWin(
 	ctx context.Context,
 	req GroupClaimRequest,
 	score float64,
-	publishAt time.Time,
+	offset time.Duration,
 	claimsCh <-chan *electionpb.GroupClaim,
 ) {
 	// Drop the group in-flight dedup slot so a fresh group re-election
@@ -375,7 +383,7 @@ func (m *Manager) reconcileGroupAfterWin(
 			if !ok {
 				return
 			}
-			if isBetterGroup(rival, score, publishAt, m.nodeID) {
+			if isBetterGroup(rival, score, offset, m.nodeID) {
 				// Strictly-worse node: un-win. Re-point the reservation to
 				// the winner (single atomic re-record) BEFORE emitting the
 				// yield so the reservation reflects the winner the instant
@@ -447,8 +455,13 @@ func delayFromScore(score float64, maxWait time.Duration) time.Duration {
 }
 
 // isBetterGroup applies the same deterministic tiebreak as isBetter but
-// using the group-claim shape. Higher score wins, then earlier timestamp,
-// then lexicographically smaller node ID.
+// using the group-claim shape. Higher score wins, then SMALLER offset
+// (the group's deterministic priority delay), then lexicographically
+// smaller node ID.
+//
+// The middle key is the clock-independent offset (O14b), NOT the
+// wall-clock timestamp — identical to isBetter. timestamp_micros is not
+// consulted; it is observability-only.
 //
 // A nil rival is treated as "local is better" (returns false). This
 // guards the receive path: when a group claim listener channel is
@@ -457,17 +470,17 @@ func delayFromScore(score float64, maxWait time.Duration) time.Duration {
 // channel and yields the zero value (nil). Returning false here keeps
 // the round on the local-wins branch rather than dereferencing a nil
 // pointer.
-func isBetterGroup(rival *electionpb.GroupClaim, ourScore float64, ourPublishAt time.Time, ourNodeID string) bool {
+func isBetterGroup(rival *electionpb.GroupClaim, ourScore float64, ourOffset time.Duration, ourNodeID string) bool {
 	if rival == nil {
 		return false
 	}
 	if rival.GravityScore != ourScore {
 		return rival.GravityScore > ourScore
 	}
-	rivalTime := rival.TimestampMicros
-	ourTime := ourPublishAt.UnixMicro()
-	if rivalTime != ourTime {
-		return rivalTime < ourTime
+	rivalOffset := rival.OffsetMicros
+	ourOffsetMicros := ourOffset.Microseconds()
+	if rivalOffset != ourOffsetMicros {
+		return rivalOffset < ourOffsetMicros
 	}
 	return rival.NodeId < ourNodeID
 }

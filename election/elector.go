@@ -135,6 +135,25 @@ type Decision struct {
 	// claim arrives first.
 	PublishAt time.Time
 
+	// Offset is the local node's deterministic priority delay for this
+	// election round — the pure duration the delay strategy computes as
+	// baseWait + slotDelay + jitter. SMALLER means higher priority
+	// (better gravity → shorter baseWait). It is the tiebreak key the
+	// Manager carries on the wire (Claim.OffsetMicros) and compares in
+	// isBetter / isBetterGroup: score (higher wins) → offset (smaller
+	// wins) → nodeID (lower wins).
+	//
+	// Offset is fully clock-independent — unlike PublishAt, which is an
+	// absolute wall-clock time polluted by cross-node skew — so it is
+	// what makes the tiebreak a stable total order regardless of clock
+	// skew (O14b). PublishAt is retained only for SCHEDULING (when to
+	// publish); Offset is the ordering key.
+	//
+	// Meaningful only when Eligible is true. Strategies that do not
+	// compute a priority delay leave it zero, so all such nodes tie on
+	// offset and the tiebreak falls through to nodeID (deterministic).
+	Offset time.Duration
+
 	// Reason is a human-readable explanation of the decision. For
 	// ineligible decisions this is the failure reason. For eligible
 	// decisions it can carry diagnostic info. Included in structured

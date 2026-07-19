@@ -9,27 +9,6 @@ worth doing.
 
 ## Open
 
-### O14b. Election tiebreak — migrate to a schedule-offset field (structural fix)
-
-**Follow-up filed by the O14 fix (Session 22).** O14 was fixed by publishing
-the INTENDED `PublishAt` in `Claim.TimestampMicros` / `GroupClaim.TimestampMicros`
-so self-view and peer-view key the tiebreak on the same value (option 1). That
-removes the intended/actual asymmetry, but the tiebreak still carries an
-absolute wall-clock-derived timestamp whose only meaning is ordering. The
-structural fix (architect option 3) is to replace the timestamp field with the
-deterministic jittered delay/offset the strategy already computes
-(`delayFromScore` / the delay strategy's `PublishAt = now + offset`), i.e. carry
-the OFFSET, not an absolute time. That eliminates the whole intended/actual
-class of bug at the wire level AND preserves score-driven jitter (no
-lexicographic-nodeID placement skew, which is why the pure `score→nodeID`
-tiebreak was rejected). This is a wire-format semantic change (`TimestampMicros`
-→ a delay/offset field), so it needs its own plan and a rolling-compat story.
-
-**Status: Open.** Not urgent — O14 (option 1) makes the current field correct;
-this is the cleaner long-term shape.
-
----
-
 ### Gravity + Snapshot cluster (O9/O10/O11) — architect-reviewed design + sequencing
 
 > Reviewed by falak-architect Session 19. Supersedes the per-entry
@@ -682,6 +661,78 @@ Session 18 manual end-to-end pass.
 ---
 
 ## Fixed (manual testing pass)
+
+### F35. O14b — Election tiebreak keys on clock-independent schedule-offset (structural hardening)
+
+**Hardening, not a bug (Session 22 follow-up to O14/F33).** O14 made the
+tiebreak a correct strict total order by publishing the INTENDED `PublishAt` in
+`TimestampMicros`, but that field is still an absolute wall-clock value: it is
+polluted by cross-node clock skew on the non-anchored re-election path
+(`Reason=NodeFailure`), and it is one `time.Now()` slip away from reintroducing
+the O14 intended/actual asymmetry. O14b removes wall-clock from the tiebreak
+STRUCTURALLY.
+
+**Fix.** The delay strategy already computes `wait = baseWait + slotDelay +
+jitter` (`election/delay/strategy.go`) — a pure duration = the node's
+deterministic priority (smaller = better fit; jitter breaks exact ties). Carry
+THAT as the tiebreak key instead of the absolute intended timestamp:
+- **Proto path taken: NEW FIELD.** Added `int64 offset_micros = 7` to both
+  `Claim` and `GroupClaim` in `election/proto/election.proto`; kept
+  `timestamp_micros` (field 6 / field 5) for observability only. Regenerated
+  `electionpb/election.pb.go` with protoc-gen-go **v1.36.7** / protoc
+  **v3.21.12** (both matching the existing generated-file header). Regen diff
+  was CLEAN — only the two new fields, their getters, the comment changes, and
+  the corresponding rawDesc bytes; zero unrelated churn / version drift.
+- `election/elector.go`: `Decision` gains `Offset time.Duration` (deterministic
+  priority delay; smaller = higher priority; meaningful only when Eligible).
+- `election/delay/strategy.go`: sets `decision.Offset = wait`. `PublishAt` is
+  unchanged — it still SCHEDULES when to publish; only the tiebreak KEY moved.
+- `election/manager.go` + `manager_group.go`: publish
+  `OffsetMicros = decision.Offset.Microseconds()` (group:
+  `offset.Microseconds()`); `isBetter` / `isBetterGroup` middle key changed from
+  timestamp to offset — **score (higher wins) → offset (SMALLER wins) → nodeID
+  (lower wins)**. `timestamp_micros` is NEVER consulted in the tiebreak anymore.
+- The O14 STABILITY INVARIANT still holds: `decision` (hence `decision.Offset`)
+  is not reassigned between publish and the tiebreak/reconcile loops; the group
+  `offset` is computed once before the CAS re-decide loop and never mutated
+  inside it (only `score` is refreshed), so the published `OffsetMicros` equals
+  the value `isBetter`/`isBetterGroup` compares. O14c's `reconcileAfterWin` /
+  `reconcileGroupAfterWin` reuse `isBetter`/`isBetterGroup` VERBATIM, so the
+  post-hoc yield auto-migrated to the offset key.
+
+**Why offset, not `score→nodeID` (rejected):** jitter is preserved inside the
+offset, so exact-score ties still break on a uniform random micro-delay rather
+than lexicographic nodeID — no placement load-skew toward low-nodeID nodes.
+
+**Result:** the tiebreak is now a strict total order over a PURE DURATION —
+fully clock-independent. Cross-node clock skew (any magnitude) cannot reorder
+claims; the same winner is chosen regardless of skew.
+
+**Tests (`election/*_test.go`, deterministic, `-race`):**
+- O14 cycle repros (single + group, `TestO14_*Cycle_ExactlyOneWinner`) rebuilt
+  to key on offset — 0 split-brains at `-count=50`. Companion guard
+  `TestO14_TimestampTiebreakReintroducesCycle` proves the pre-O14
+  intended-vs-actual timestamp path still split-brains, so the offset-path tests
+  are not vacuous.
+- `TestIsBetter_SmallerOffsetWinsOnScoreTie` +
+  `TestIsBetterGroup_SmallerOffsetWinsOnScoreTie` — smaller-offset-wins asserted
+  directly on both comparators.
+- `TestO14b_ClockSkewIndependence_SameWinner` — the O14b value: a non-anchored
+  (`NodeFailure`) re-election swept across large, unequal clock skews yields the
+  IDENTICAL winner every time (single + group).
+- `TestO14b_TiebreakKeysOffsetNotTimestamp` — the reintroduces-timestamp guard:
+  equal offset + wildly different timestamps → tiebreak falls to nodeID, NOT
+  timestamp (single + group).
+- `TestO14b_PublishedOffsetIsDecisionOffset` — field-level: published
+  `OffsetMicros == decision.Offset.Microseconds()`, and `timestamp_micros`
+  carries the intended `PublishAt` for observability only.
+- O14c inject-delay double-winner repro
+  (`TestO14c_InjectDelay_DoubleWinner_ExactlyOneYields`) + A/B symmetry + group
+  reconcile twins stayed GREEN on the offset key (exactly one yields).
+
+**Gates:** `go vet` clean (election, node); `go test -race -count=1
+./election/...` green (full suite green at `-count=3`); O14 cycle repros +
+skew-independence + offset guards green at `-count=50`. Not committed.
 
 ### F34. O14c — Double-winner safety via post-hoc yield (bounded reconcile window)
 

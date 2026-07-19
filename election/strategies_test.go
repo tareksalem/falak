@@ -90,6 +90,11 @@ func TestDelayStrategy_EligibleProducesPublishAt(t *testing.T) {
 	if !dec.PublishAt.After(time.Now().Add(-1 * time.Second)) {
 		t.Errorf("PublishAt should be near now, got %v", dec.PublishAt)
 	}
+	// O14b: the delay strategy must carry the deterministic priority Offset
+	// (baseWait + slotDelay + jitter) — the tiebreak key the manager publishes.
+	if dec.Offset <= 0 {
+		t.Errorf("eligible decision must carry a positive Offset (the O14b tiebreak key), got %v", dec.Offset)
+	}
 }
 
 func TestDelayStrategy_HigherScoreShorterWait(t *testing.T) {
@@ -117,6 +122,13 @@ func TestDelayStrategy_HigherScoreShorterWait(t *testing.T) {
 	if !bigDec.PublishAt.Before(smallDec.PublishAt) {
 		t.Errorf("higher gravity should publish earlier: big=%v small=%v",
 			bigDec.PublishAt, smallDec.PublishAt)
+	}
+	// O14b: the Offset (the clock-independent tiebreak key) must order the
+	// same way — better fit → smaller offset → wins the tiebreak. Jitter is
+	// disabled here (WithMaxJitter(0)) so the comparison is exact.
+	if !(bigDec.Offset < smallDec.Offset) {
+		t.Errorf("higher gravity should yield a smaller Offset: big=%v small=%v",
+			bigDec.Offset, smallDec.Offset)
 	}
 }
 

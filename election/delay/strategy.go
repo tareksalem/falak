@@ -229,10 +229,16 @@ func (s *Strategy) Decide(
 		zap.Any("factors", result.Factors))
 
 	return election.Decision{
-		Eligible:  true,
-		Score:     score,
+		Eligible: true,
+		Score:    score,
+		// PublishAt schedules WHEN to publish (anchored, clock-based).
 		PublishAt: publishAt,
-		Reason:    "delay strategy: eligible",
+		// Offset is the clock-independent tiebreak key (O14b): the pure
+		// priority delay (baseWait + slotDelay + jitter), smaller = higher
+		// priority. The Manager carries this on the wire and orders claims
+		// by it, so cross-node clock skew cannot reorder the tiebreak.
+		Offset: wait,
+		Reason: "delay strategy: eligible",
 	}
 }
 

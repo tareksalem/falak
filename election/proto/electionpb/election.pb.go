@@ -109,11 +109,14 @@ func (x *ElectionMessage) GetSignature() []byte {
 // Tiebreak order when two Claim messages arrive for the same
 // (capsule_id, replica_id):
 //  1. Higher gravity_score wins.
-//  2. Earlier timestamp wins.
+//  2. Smaller offset_micros wins (deterministic priority delay; O14b).
 //  3. Lexicographically smaller node_id wins.
 //
 // Both sides apply the same rule independently and converge on the
-// same winner even when messages arrive in different orders.
+// same winner even when messages arrive in different orders. The
+// tiebreak is fully clock-independent: offset_micros is the node's
+// own computed publish delay (baseWait + slotDelay + jitter), not a
+// wall-clock timestamp, so cross-node clock skew cannot reorder claims.
 type Claim struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	CapsuleId       string                 `protobuf:"bytes,1,opt,name=capsule_id,json=capsuleId,proto3" json:"capsule_id,omitempty"`
@@ -121,7 +124,8 @@ type Claim struct {
 	ClusterPath     string                 `protobuf:"bytes,3,opt,name=cluster_path,json=clusterPath,proto3" json:"cluster_path,omitempty"`
 	NodeId          string                 `protobuf:"bytes,4,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`                             // Node claiming the replica
 	GravityScore    float64                `protobuf:"fixed64,5,opt,name=gravity_score,json=gravityScore,proto3" json:"gravity_score,omitempty"`         // 0–100 percentage score
-	TimestampMicros int64                  `protobuf:"varint,6,opt,name=timestamp_micros,json=timestampMicros,proto3" json:"timestamp_micros,omitempty"` // Claim creation time, microseconds since epoch
+	TimestampMicros int64                  `protobuf:"varint,6,opt,name=timestamp_micros,json=timestampMicros,proto3" json:"timestamp_micros,omitempty"` // Claim creation time, microseconds since epoch (observability only; NOT the tiebreak)
+	OffsetMicros    int64                  `protobuf:"varint,7,opt,name=offset_micros,json=offsetMicros,proto3" json:"offset_micros,omitempty"`          // Deterministic priority delay in microseconds; SMALLER wins the tiebreak (O14b)
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -194,6 +198,13 @@ func (x *Claim) GetGravityScore() float64 {
 func (x *Claim) GetTimestampMicros() int64 {
 	if x != nil {
 		return x.TimestampMicros
+	}
+	return 0
+}
+
+func (x *Claim) GetOffsetMicros() int64 {
+	if x != nil {
+		return x.OffsetMicros
 	}
 	return 0
 }
@@ -294,7 +305,7 @@ func (x *ElectionFailed) GetTimestampMicros() int64 {
 //
 // Tiebreak rules are identical to per-replica Claim:
 //  1. Higher gravity_score wins.
-//  2. Earlier timestamp wins.
+//  2. Smaller offset_micros wins (deterministic priority delay; O14b).
 //  3. Lexicographically smaller node_id wins.
 type GroupClaim struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
@@ -302,8 +313,9 @@ type GroupClaim struct {
 	ClusterPath     string                 `protobuf:"bytes,2,opt,name=cluster_path,json=clusterPath,proto3" json:"cluster_path,omitempty"`
 	NodeId          string                 `protobuf:"bytes,3,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`                             // Node claiming the group
 	GravityScore    float64                `protobuf:"fixed64,4,opt,name=gravity_score,json=gravityScore,proto3" json:"gravity_score,omitempty"`         // Combined-fit score, 0–100
-	TimestampMicros int64                  `protobuf:"varint,5,opt,name=timestamp_micros,json=timestampMicros,proto3" json:"timestamp_micros,omitempty"` // Claim creation time, microseconds since epoch
+	TimestampMicros int64                  `protobuf:"varint,5,opt,name=timestamp_micros,json=timestampMicros,proto3" json:"timestamp_micros,omitempty"` // Claim creation time, microseconds since epoch (observability only; NOT the tiebreak)
 	MemberIds       []string               `protobuf:"bytes,6,rep,name=member_ids,json=memberIds,proto3" json:"member_ids,omitempty"`                    // Group members in topological order
+	OffsetMicros    int64                  `protobuf:"varint,7,opt,name=offset_micros,json=offsetMicros,proto3" json:"offset_micros,omitempty"`          // Deterministic priority delay in microseconds; SMALLER wins the tiebreak (O14b)
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -380,6 +392,13 @@ func (x *GroupClaim) GetMemberIds() []string {
 	return nil
 }
 
+func (x *GroupClaim) GetOffsetMicros() int64 {
+	if x != nil {
+		return x.OffsetMicros
+	}
+	return 0
+}
+
 var File_election_proto protoreflect.FileDescriptor
 
 const file_election_proto_rawDesc = "" +
@@ -390,7 +409,7 @@ const file_election_proto_rawDesc = "" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x12\x1b\n" +
 	"\tsender_id\x18\x03 \x01(\tR\bsenderId\x128\n" +
 	"\ttimestamp\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x1c\n" +
-	"\tsignature\x18\x05 \x01(\fR\tsignature\"\xd1\x01\n" +
+	"\tsignature\x18\x05 \x01(\fR\tsignature\"\xf6\x01\n" +
 	"\x05Claim\x12\x1d\n" +
 	"\n" +
 	"capsule_id\x18\x01 \x01(\tR\tcapsuleId\x12\x1d\n" +
@@ -399,7 +418,8 @@ const file_election_proto_rawDesc = "" +
 	"\fcluster_path\x18\x03 \x01(\tR\vclusterPath\x12\x17\n" +
 	"\anode_id\x18\x04 \x01(\tR\x06nodeId\x12#\n" +
 	"\rgravity_score\x18\x05 \x01(\x01R\fgravityScore\x12)\n" +
-	"\x10timestamp_micros\x18\x06 \x01(\x03R\x0ftimestampMicros\"\xd1\x01\n" +
+	"\x10timestamp_micros\x18\x06 \x01(\x03R\x0ftimestampMicros\x12#\n" +
+	"\roffset_micros\x18\a \x01(\x03R\foffsetMicros\"\xd1\x01\n" +
 	"\x0eElectionFailed\x12\x1d\n" +
 	"\n" +
 	"capsule_id\x18\x01 \x01(\tR\tcapsuleId\x12\x1d\n" +
@@ -408,7 +428,7 @@ const file_election_proto_rawDesc = "" +
 	"\fcluster_path\x18\x03 \x01(\tR\vclusterPath\x12\x1b\n" +
 	"\tsender_id\x18\x04 \x01(\tR\bsenderId\x12\x16\n" +
 	"\x06reason\x18\x05 \x01(\tR\x06reason\x12)\n" +
-	"\x10timestamp_micros\x18\x06 \x01(\x03R\x0ftimestampMicros\"\xd2\x01\n" +
+	"\x10timestamp_micros\x18\x06 \x01(\x03R\x0ftimestampMicros\"\xf7\x01\n" +
 	"\n" +
 	"GroupClaim\x12\x19\n" +
 	"\bgroup_id\x18\x01 \x01(\tR\agroupId\x12!\n" +
@@ -417,7 +437,8 @@ const file_election_proto_rawDesc = "" +
 	"\rgravity_score\x18\x04 \x01(\x01R\fgravityScore\x12)\n" +
 	"\x10timestamp_micros\x18\x05 \x01(\x03R\x0ftimestampMicros\x12\x1d\n" +
 	"\n" +
-	"member_ids\x18\x06 \x03(\tR\tmemberIdsB7Z5github.com/tareksalem/falak/election/proto/electionpbb\x06proto3"
+	"member_ids\x18\x06 \x03(\tR\tmemberIds\x12#\n" +
+	"\roffset_micros\x18\a \x01(\x03R\foffsetMicrosB7Z5github.com/tareksalem/falak/election/proto/electionpbb\x06proto3"
 
 var (
 	file_election_proto_rawDescOnce sync.Once

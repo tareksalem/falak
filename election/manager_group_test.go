@@ -13,6 +13,7 @@ import (
 
 	"github.com/tareksalem/falak/capsule"
 	"github.com/tareksalem/falak/election/gravity"
+	electionpb "github.com/tareksalem/falak/election/proto/electionpb"
 )
 
 // --- Test helpers ----------------------------------------------------------
@@ -452,9 +453,34 @@ func TestGroupElection_ReservationTimeout(t *testing.T) {
 // dereferencing the rival. The expected behaviour is "local is at least
 // as good" — return false so the round stays on the local-wins path.
 func TestIsBetterGroup_NilRival(t *testing.T) {
-	now := time.Now()
-	if isBetterGroup(nil, 50.0, now, "node-a") {
+	if isBetterGroup(nil, 50.0, 100*time.Microsecond, "node-a") {
 		t.Fatalf("isBetterGroup(nil, ...) returned true; want false")
+	}
+}
+
+// TestIsBetterGroup_SmallerOffsetWinsOnScoreTie asserts the O14b group
+// tiebreak directly: equal score, different offset → the SMALLER-offset rival
+// wins, and timestamp_micros is ignored (the rival carries a LATER timestamp
+// to prove it is not consulted).
+func TestIsBetterGroup_SmallerOffsetWinsOnScoreTie(t *testing.T) {
+	const score = 50.0
+	ourOffset := 200 * time.Microsecond
+	rival := &electionpb.GroupClaim{
+		NodeId:          "node-z", // larger nodeID — must NOT matter, offset decides
+		GravityScore:    score,
+		OffsetMicros:    100,  // smaller offset → rival wins on score tie
+		TimestampMicros: 9999, // later timestamp → proves timestamp ignored
+	}
+	if !isBetterGroup(rival, score, ourOffset, "node-a") {
+		t.Fatal("group: rival with smaller offset must win on score tie (offset is the O14b key)")
+	}
+
+	// Reverse: larger-offset rival must LOSE on score tie.
+	worse := &electionpb.GroupClaim{
+		NodeId: "node-a", GravityScore: score, OffsetMicros: 300, TimestampMicros: 1,
+	}
+	if isBetterGroup(worse, score, 100*time.Microsecond, "node-z") {
+		t.Fatal("group: rival with larger offset must lose on score tie even with an earlier timestamp")
 	}
 }
 
@@ -493,7 +519,7 @@ func TestGroupListener_ReplaceConcurrentReceive_NoPanic(t *testing.T) {
 			}
 			// Defense-in-depth: pass the (possibly nil) claim through
 			// isBetterGroup the same way runGroupElection does.
-			_ = isBetterGroup(rival, 50.0, time.Now(), nodeID)
+			_ = isBetterGroup(rival, 50.0, 100*time.Microsecond, nodeID)
 		}
 	}()
 

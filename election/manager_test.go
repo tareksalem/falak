@@ -24,15 +24,22 @@ func (s *stubStrategy) Decide(context.Context, Request, *capsule.Capsule, *gravi
 func testCtx() context.Context { return context.Background() }
 
 // --- isBetter tiebreak tests --------------------------------------------
+//
+// The middle tiebreak key is the deterministic priority OFFSET (O14b), not
+// a wall-clock timestamp: SMALLER offset wins. timestamp_micros is set on
+// the rivals below only to prove it is IGNORED — these fixtures use a
+// wildly different (and adversarial) timestamp than the offset would imply,
+// so a tiebreak that mistakenly consulted timestamp_micros would flip.
 
 func TestIsBetter_HigherScoreWins(t *testing.T) {
 	ours := Decision{
-		Score:     50,
-		PublishAt: time.UnixMicro(100),
+		Score:  50,
+		Offset: 100 * time.Microsecond,
 	}
 	rival := &electionpb.Claim{
 		GravityScore:    60,
-		TimestampMicros: 200,
+		OffsetMicros:    200, // larger offset, but higher score wins outright
+		TimestampMicros: 999, // ignored
 		NodeId:          "z-later-id",
 	}
 	if !isBetter(rival, ours, "a-local") {
@@ -42,41 +49,44 @@ func TestIsBetter_HigherScoreWins(t *testing.T) {
 
 func TestIsBetter_LowerScoreLoses(t *testing.T) {
 	ours := Decision{
-		Score:     60,
-		PublishAt: time.UnixMicro(200),
+		Score:  60,
+		Offset: 200 * time.Microsecond,
 	}
 	rival := &electionpb.Claim{
 		GravityScore:    50,
-		TimestampMicros: 100,
+		OffsetMicros:    100, // smaller offset, but lower score loses outright
+		TimestampMicros: 1,   // ignored
 		NodeId:          "a-earlier-id",
 	}
 	if isBetter(rival, ours, "z-local") {
-		t.Error("rival with lower score should lose even with earlier timestamp")
+		t.Error("rival with lower score should lose even with smaller offset")
 	}
 }
 
-func TestIsBetter_EarlierTimestampWinsOnScoreTie(t *testing.T) {
+func TestIsBetter_SmallerOffsetWinsOnScoreTie(t *testing.T) {
 	ours := Decision{
-		Score:     50,
-		PublishAt: time.UnixMicro(200),
+		Score:  50,
+		Offset: 200 * time.Microsecond,
 	}
 	rival := &electionpb.Claim{
 		GravityScore:    50,
-		TimestampMicros: 100,
+		OffsetMicros:    100, // smaller offset wins on score tie
+		TimestampMicros: 999, // LATER timestamp: proves timestamp is ignored
 		NodeId:          "z-later-id",
 	}
 	if !isBetter(rival, ours, "a-local") {
-		t.Error("rival with earlier timestamp should win on score tie")
+		t.Error("rival with smaller offset should win on score tie")
 	}
 }
 
 func TestIsBetter_SmallerNodeIDWinsOnFullTie(t *testing.T) {
 	ours := Decision{
-		Score:     50,
-		PublishAt: time.UnixMicro(100),
+		Score:  50,
+		Offset: 100 * time.Microsecond,
 	}
 	rival := &electionpb.Claim{
 		GravityScore:    50,
+		OffsetMicros:    100,
 		TimestampMicros: 100,
 		NodeId:          "a-rival",
 	}
@@ -87,11 +97,12 @@ func TestIsBetter_SmallerNodeIDWinsOnFullTie(t *testing.T) {
 
 func TestIsBetter_LargerNodeIDLosesOnFullTie(t *testing.T) {
 	ours := Decision{
-		Score:     50,
-		PublishAt: time.UnixMicro(100),
+		Score:  50,
+		Offset: 100 * time.Microsecond,
 	}
 	rival := &electionpb.Claim{
 		GravityScore:    50,
+		OffsetMicros:    100,
 		TimestampMicros: 100,
 		NodeId:          "z-rival",
 	}

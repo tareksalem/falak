@@ -29,18 +29,22 @@ message ElectionMessage {
 // Tiebreak order when two Claim messages arrive for the same
 // (capsule_id, replica_id):
 //   1. Higher gravity_score wins.
-//   2. Earlier timestamp wins.
+//   2. Smaller offset_micros wins (deterministic priority delay; O14b).
 //   3. Lexicographically smaller node_id wins.
 //
 // Both sides apply the same rule independently and converge on the
-// same winner even when messages arrive in different orders.
+// same winner even when messages arrive in different orders. The
+// tiebreak is fully clock-independent: offset_micros is the node's
+// own computed publish delay (baseWait + slotDelay + jitter), not a
+// wall-clock timestamp, so cross-node clock skew cannot reorder claims.
 message Claim {
     string capsule_id = 1;
     string replica_id = 2;
     string cluster_path = 3;
     string node_id = 4;                    // Node claiming the replica
     double gravity_score = 5;              // 0–100 percentage score
-    int64 timestamp_micros = 6;            // Claim creation time, microseconds since epoch
+    int64 timestamp_micros = 6;            // Claim creation time, microseconds since epoch (observability only; NOT the tiebreak)
+    int64 offset_micros = 7;               // Deterministic priority delay in microseconds; SMALLER wins the tiebreak (O14b)
 }
 
 // ElectionFailed is broadcast when any node concludes that no winner
@@ -64,13 +68,14 @@ message ElectionFailed {
 //
 // Tiebreak rules are identical to per-replica Claim:
 //   1. Higher gravity_score wins.
-//   2. Earlier timestamp wins.
+//   2. Smaller offset_micros wins (deterministic priority delay; O14b).
 //   3. Lexicographically smaller node_id wins.
 message GroupClaim {
     string group_id = 1;
     string cluster_path = 2;
     string node_id = 3;                    // Node claiming the group
     double gravity_score = 4;              // Combined-fit score, 0–100
-    int64 timestamp_micros = 5;            // Claim creation time, microseconds since epoch
+    int64 timestamp_micros = 5;            // Claim creation time, microseconds since epoch (observability only; NOT the tiebreak)
     repeated string member_ids = 6;        // Group members in topological order
+    int64 offset_micros = 7;               // Deterministic priority delay in microseconds; SMALLER wins the tiebreak (O14b)
 }

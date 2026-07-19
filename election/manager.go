@@ -789,25 +789,31 @@ func (m *Manager) runElection(ctx context.Context, req Request, c *capsule.Capsu
 	}
 
 	publishedAt := time.Now()
-	// STABILITY INVARIANT (O14): the tiebreak requires a strict TOTAL
+	// STABILITY INVARIANT (O14b): the tiebreak requires a strict TOTAL
 	// ORDER so exactly one node finds no rival better than itself. Every
-	// node keys the order as (score, intended-PublishAt, nodeID). The
-	// claim we publish MUST carry the INTENDED PublishAt (decision.PublishAt),
-	// NOT the wall-clock publishedAt: peers compare our claim's
-	// TimestampMicros against their own intended PublishAt, and isBetter
-	// compares rivals against OUR ours.PublishAt (intended). Publishing the
-	// actual wall-clock time here (as before) made self-view use intended
-	// while peer-view used actual — antisymmetry broke under scheduling
-	// jitter (worse under -race + O13 burst churn), a 3-cycle A≻B≻C≻A became
-	// reachable, and all nodes reported Lost ("no winner observed").
+	// node keys the order as (score, OFFSET, nodeID) where offset is the
+	// node's own deterministic priority delay (decision.Offset). The claim
+	// we publish carries that offset (OffsetMicros); peers compare our
+	// claim's OffsetMicros against their own decision.Offset, and isBetter
+	// compares rivals against OUR ours.Offset. Because offset is a pure
+	// duration — NOT a wall-clock time — the ordering is identical on every
+	// node regardless of clock skew (O14b removes wall-clock from the
+	// tiebreak entirely; O14 previously carried the intended PublishAt,
+	// which was correct but still a wall-clock value polluted by skew on the
+	// non-anchored re-election path).
+	//
+	// TimestampMicros still carries the intended PublishAt for observability
+	// (logs/diagnostics) but is NEVER read by the tiebreak — see isBetter.
 	//
 	// This publish and the post-publish tiebreak loop (below) BOTH depend on
-	// decision.PublishAt being the SAME value: the field we publish here and
-	// the ours.PublishAt isBetter reads in the window must match. That holds
+	// decision.Offset being the SAME value: the field we publish here and
+	// the ours.Offset isBetter reads in the window must match. That holds
 	// because `decision` is NOT reassigned between here and the loop — the
 	// last strategy.Decide is in the CAS loop above, before this point.
-	// publishedMicros snapshots the value to make the invariant structural.
+	// publishedOffsetMicros snapshots the value to make the invariant
+	// structural.
 	publishedMicros := decision.PublishAt.UnixMicro()
+	publishedOffsetMicros := decision.Offset.Microseconds()
 	claim := &electionpb.Claim{
 		CapsuleId:       string(req.CapsuleID),
 		ReplicaId:       req.ReplicaID,
@@ -815,6 +821,7 @@ func (m *Manager) runElection(ctx context.Context, req Request, c *capsule.Capsu
 		NodeId:          m.nodeID,
 		GravityScore:    decision.Score,
 		TimestampMicros: publishedMicros,
+		OffsetMicros:    publishedOffsetMicros,
 	}
 	pubCtx, pubCancel := context.WithTimeout(ctx, m.publishTimeout)
 	if err := topic.PublishClaim(pubCtx, claim); err != nil {
@@ -1002,15 +1009,25 @@ func (m *Manager) waitForRemoteVerdict(
 
 // isBetter returns true when rival's claim should beat the local
 // decision under the deterministic tiebreak: higher score wins, then
-// earlier timestamp, then lexicographically smaller node ID.
+// SMALLER offset (the node's deterministic priority delay), then
+// lexicographically smaller node ID.
+//
+// The middle key is the clock-independent offset (O14b), NOT the
+// wall-clock timestamp. offset = baseWait + slotDelay + jitter is a pure
+// duration the strategy computes; a better gravity fit yields a smaller
+// baseWait, so smaller offset = higher priority. Keying on offset rather
+// than an absolute timestamp makes the total order immune to cross-node
+// clock skew (the O14 field, intended PublishAt, was still a wall-clock
+// value). timestamp_micros is deliberately NOT consulted here — it is
+// observability-only.
 func isBetter(rival *electionpb.Claim, ours Decision, ourNodeID string) bool {
 	if rival.GravityScore != ours.Score {
 		return rival.GravityScore > ours.Score
 	}
-	rivalTime := rival.TimestampMicros
-	ourTime := ours.PublishAt.UnixMicro()
-	if rivalTime != ourTime {
-		return rivalTime < ourTime
+	rivalOffset := rival.OffsetMicros
+	ourOffset := ours.Offset.Microseconds()
+	if rivalOffset != ourOffset {
+		return rivalOffset < ourOffset
 	}
 	return rival.NodeId < ourNodeID
 }
