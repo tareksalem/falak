@@ -317,6 +317,16 @@ func (m *Manager) Get(id CapsuleID) *Capsule {
 	if c == nil {
 		return nil
 	}
+	return m.snapshotUnderLock(c)
+}
+
+// snapshotUnderLock returns a race-safe deep copy of c — the struct plus the
+// Replicas slice (the only field mutated after creation, by AssignReplica /
+// UnassignReplica / SyncStatus under m.mu) — taken under m.mu.RLock. It lets
+// callers (Get, and the event emitters) hand out a capsule whose fields,
+// notably Replicas, can be read without coordinating with the manager mutex.
+// Callers MUST NOT already hold m.mu; c must be non-nil.
+func (m *Manager) snapshotUnderLock(c *Capsule) *Capsule {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	snapshot := *c
@@ -817,10 +827,13 @@ func (m *Manager) emit(eventType string, c *Capsule) {
 	m.handlerMu.RLock()
 	h := m.handler
 	m.handlerMu.RUnlock()
+	// Carry a race-safe snapshot, not the live store pointer: subscribers
+	// read fields (notably Replicas) off the event without holding m.mu,
+	// while AssignReplica / SyncStatus mutate the live capsule under it.
 	h(ManagerEvent{
 		Type:      eventType,
 		CapsuleID: c.ID,
-		Capsule:   c,
+		Capsule:   m.snapshotUnderLock(c),
 		Timestamp: time.Now(),
 	})
 }
@@ -832,10 +845,11 @@ func (m *Manager) emitWithMeta(eventType string, c *Capsule, meta map[string]str
 	m.handlerMu.RLock()
 	h := m.handler
 	m.handlerMu.RUnlock()
+	// Snapshot, not the live pointer — see emit.
 	h(ManagerEvent{
 		Type:      eventType,
 		CapsuleID: c.ID,
-		Capsule:   c,
+		Capsule:   m.snapshotUnderLock(c),
 		Timestamp: time.Now(),
 		Meta:      meta,
 	})

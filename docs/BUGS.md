@@ -594,12 +594,18 @@ hit in CI. **Fix:** `announceCapsule` now serializes from a race-safe
 sanctioned accessor) instead of the live pointer. Verified with
 `TestCapsuleGroup_NonCascadeDelete_3Node -race -count=20`.
 
-**Follow-up smell (separate ticket):** the capsule event bus emits LIVE
-mutable `*Capsule` pointers (`Manager.emit`), so every event consumer is one
-lockless mutable-field read away from this class of race. The correct
-long-term fix is for `emit` to carry immutable snapshots; deferred here to
-avoid perturbing the event-bus contract other consumers rely on under an O13
-ticket.
+**Follow-up smell — FIXED (Session 22).** The capsule event bus used to emit
+LIVE mutable `*Capsule` pointers (`Manager.emit`/`emitWithMeta`), so every
+event consumer was one lockless mutable-field read (notably `Replicas`) away
+from this class of race. Fixed: `emit`/`emitWithMeta` now carry a race-safe
+snapshot via a shared `Manager.snapshotUnderLock` helper (deep-copies the
+struct + `Replicas` under `m.mu.RLock`, mirroring `Get`; `Get` was refactored
+to use the same helper). All emit sites already call outside `m.mu`, so the
+RLock is reentrancy-safe. Event shape unchanged (consumers still receive
+`*Capsule`) — now a private immutable copy. Guarded by
+`capsule/manager_emit_race_test.go` `TestManager_EmitCarriesRaceSafeSnapshot`
+(a concurrent AssignReplica vs. event-handler Replicas read; verified it
+fires `DATA RACE` under `-race` before the fix, clean after).
 
 ---
 
