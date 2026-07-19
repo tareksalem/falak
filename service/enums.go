@@ -3,7 +3,7 @@ package service
 // Visibility scopes who may resolve and connect to a Service.
 // `group` admits only callers in the same group as the backends;
 // `cluster` admits any caller in the cluster; `external` is reserved
-// (Decision #17, out of v1 scope) and rejected at validation.
+// (out of v1 scope) and rejected at validation.
 type Visibility string
 
 const (

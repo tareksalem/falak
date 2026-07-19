@@ -7,11 +7,11 @@
 // deployment strategy (static / blue-green / canary). Deleting a
 // Service stops routing only; capsules themselves are never touched.
 //
-// Per locked decisions in `.claude/plans/service-networking.md`:
-//   - #14 backends bind by capsule name and capture the resolved capsule
-//     ID at first resolve. Identity changes require explicit rebind.
-//   - #15 backend resolution is lenient (admit unresolved, route later).
-//   - #29 default per-Service timeouts are idle 5min, connect 5s.
+// Backends bind by capsule name and capture the resolved capsule ID at
+// first resolve; an identity change then requires an explicit rebind.
+// Backend resolution is lenient: an unresolved backend is admitted and
+// routed to once its capsule appears. Default per-Service timeouts are
+// idle 5min, connect 5s.
 //
 // Enums live alongside in enums.go; spec validation in spec.go; store
 // in store.go; lifecycle FSM in lifecycle.go.
@@ -42,7 +42,7 @@ func NewServiceID() ServiceID {
 // String returns the string form of the ServiceID.
 func (id ServiceID) String() string { return string(id) }
 
-// Default timeouts and weights (Decision #29 plus CUE shorthand).
+// Default timeouts and weights.
 const (
 	DefaultIdleTimeout    = 5 * time.Minute
 	DefaultConnectTimeout = 5 * time.Second
@@ -59,7 +59,7 @@ type ServicePort struct {
 
 // ServiceBackend references a capsule by name with a weight and an
 // optional port-name remap. CapturedCapsuleID is empty until the
-// manager resolves the backend for the first time (Decision #14).
+// manager resolves the backend for the first time.
 type ServiceBackend struct {
 	Capsule           string            // bare capsule name written by the operator.
 	CapturedCapsuleID string            // resolved capsule ID, manager-owned post-resolve.
@@ -92,7 +92,7 @@ type Strategy struct {
 	BlueGreen *BlueGreenStrategy // populated when Type == BlueGreen.
 }
 
-// ServiceTimeouts holds per-Service connection timeouts (Decision #29).
+// ServiceTimeouts holds per-Service connection timeouts.
 type ServiceTimeouts struct {
 	Idle    time.Duration // close after this period of inactivity.
 	Connect time.Duration // bound proxy→backend dial time.

@@ -11,7 +11,7 @@ import (
 )
 
 // ErrServiceNameExists is returned by Create when a Service with the
-// requested name already exists in the cluster (Decision #16).
+// requested name already exists in the cluster.
 var ErrServiceNameExists = errors.New("service: name already exists in cluster")
 
 // publisher is the subset of the gossip Publisher consumed by the
@@ -127,7 +127,7 @@ func (m *Manager) ActiveServices() []*Service {
 }
 
 // Create admits a new Service. Backends are resolved leniently against
-// the capsule store; unresolved backends are accepted (Decision #15).
+// the capsule store; unresolved backends are accepted.
 // Returns ErrServiceNameExists on cluster-wide name conflict.
 func (m *Manager) Create(ctx context.Context, clusterID string, spec ServiceSpec) (*Service, error) {
 	if clusterID == "" {

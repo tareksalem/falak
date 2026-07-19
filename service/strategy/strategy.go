@@ -72,7 +72,7 @@ type EventEmitter interface {
 // MetricEvaluator resolves a single canary condition expression
 // (success_criteria element or abort_on element) to a boolean. v1
 // keeps the contract narrow; the capsule-metrics-backed
-// implementation lands in 11B.21.
+// implementation lands separately.
 type MetricEvaluator interface {
 	// Evaluate returns (matched, err). A nil error with matched=false
 	// means the condition is well-formed but not currently true.

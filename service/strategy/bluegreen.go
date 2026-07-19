@@ -13,7 +13,7 @@ import (
 const blueGreenFullWeight = int32(100)
 
 // BlueGreen is the atomic-flip strategy with a configurable drain
-// window (Decision #13, default 30s). The proxy never force-closes;
+// window (default 30s). The proxy never force-closes;
 // the engine moves all new traffic to the new active immediately on
 // flip and uses the drain timer as a bookkeeping signal — when it
 // fires, the engine transitions back to Active phase.

@@ -8,11 +8,11 @@ import (
 
 // DefaultSpec applies project-default values to a ServiceSpec in
 // place. Safe to call repeatedly and on a partially-filled spec.
-// Defaults match `.claude/plans/service-networking.md`:
-//   - Visibility defaults to Cluster (Decision #2).
+// Defaults:
+//   - Visibility defaults to Cluster.
 //   - Strategy defaults to {Type: Static} when nil.
-//   - Timeouts default to 5min idle and 5s connect (Decision #29).
-//   - BlueGreen.Drain defaults to 30s (Decision #13).
+//   - Timeouts default to 5min idle and 5s connect.
+//   - BlueGreen.Drain defaults to 30s.
 //   - Backend.Weight defaults to 100 when zero.
 //   - ServicePort.Protocol defaults to TCP when empty.
 //
@@ -57,10 +57,10 @@ func DefaultSpec(spec *ServiceSpec) {
 // errors.Is. ValidateSpec does NOT mutate the spec — call DefaultSpec
 // first if defaults should apply.
 //
-// Decision #14/#17: external visibility is rejected here as the
-// "reserved-but-not-yet-supported" boundary.
-// Decision #27: port_map shorthand is trusted at this layer; the
-// manager performs the capsule-side check at admission.
+// External visibility is rejected here as the
+// "reserved-but-not-yet-supported" boundary. The port_map shorthand is
+// trusted at this layer; the manager performs the capsule-side check at
+// admission.
 func ValidateSpec(spec *ServiceSpec) error {
 	if spec == nil {
 		return ErrNameRequired

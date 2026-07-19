@@ -41,10 +41,10 @@ func (m canaryMode) String() string {
 // continuously-evaluated abort guard. Weights move from `from` to
 // `target` in `step`-sized increments.
 //
-// Mode (Decision #18): interval == 0 → manual (Advance only);
+// Mode: interval == 0 → manual (Advance only);
 // interval > 0, no criteria → auto; interval > 0, criteria set → gated.
 //
-// Abort (Decision #19): any abort_on match → full revert + emit
+// Abort: any abort_on match → full revert + emit
 // CanaryAborted. The Manager owns the FSM transition to the
 // CanaryAborted Service status.
 type Canary struct {
@@ -404,7 +404,7 @@ func (c *Canary) tickAbort() bool {
 	return done
 }
 
-// pickCanaryMode applies Decision #18.
+// pickCanaryMode selects manual/auto/gated from the interval and criteria.
 func pickCanaryMode(interval time.Duration, criteria []string) canaryMode {
 	switch {
 	case interval <= 0:

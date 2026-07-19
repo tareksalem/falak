@@ -10,8 +10,7 @@ import (
 
 // Rebind clears the captured ID on the named backend of service id and
 // re-resolves it against the current capsule store. Used by the
-// operator after an intentional delete+recreate to resume routing
-// (Decision #14).
+// operator after an intentional delete+recreate to resume routing.
 func (m *Manager) Rebind(_ context.Context, id ServiceID, backendName string) error {
 	svc := m.store.Get(id)
 	if svc == nil {
@@ -127,9 +126,8 @@ func (m *Manager) reconcileBackendIdentity(svc *Service, name, id string, now ti
 			}
 			// Zero the spec weight for this backend so downstream
 			// strategy engines (canary auto-abort, static drop) see the
-			// inadmissible backend on the next Update. Decision #14:
-			// identity-changed backends are not routable until an
-			// explicit Rebind.
+			// inadmissible backend on the next Update: identity-changed
+			// backends are not routable until an explicit Rebind.
 			b.Weight = 0
 			changed = true
 			m.metrics.IncBackendUnresolved(svc.ClusterID, "identity_changed")
@@ -196,7 +194,7 @@ func (m *Manager) OnCapsuleDeleted(capsuleName string) {
 
 // resolveAllBackends runs first-resolve against every backend on a
 // freshly-created Service. Resolves are best-effort: missing capsules
-// leave the backend in Unresolved state (lenient mode, Decision #15).
+// leave the backend in Unresolved state (lenient mode).
 func (m *Manager) resolveAllBackends(svc *Service, now time.Time) {
 	if svc == nil || len(svc.Spec.Backends) == 0 {
 		return

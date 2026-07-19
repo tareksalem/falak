@@ -13,7 +13,7 @@ import (
 //
 // Resolution filtering is the Manager's responsibility — it zeroes
 // the weight of any backend that has transitioned to
-// UnresolvedIdentityChanged (Decision #14) or is otherwise
+// UnresolvedIdentityChanged or is otherwise
 // inadmissible before handing the spec to Update. The engine
 // therefore implements a single rule: keep backends with strictly
 // positive weight.
