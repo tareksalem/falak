@@ -732,7 +732,13 @@ claims; the same winner is chosen regardless of skew.
 
 **Gates:** `go vet` clean (election, node); `go test -race -count=1
 ./election/...` green (full suite green at `-count=3`); O14 cycle repros +
-skew-independence + offset guards green at `-count=50`. Not committed.
+skew-independence + offset guards green at `-count=50`. `go test -race -count=1
+./node/...`: only the pre-existing SWIM/membership convergence flakes under
+parallel `-race` contention (`TestThreeNodeCluster_DropOne`,
+`TestFourNodePubSubDelivery` — both "expected node ... to be removed from
+phonebook" timeouts on the node-kill path, unrelated to election); both PASS
+when re-run isolated (`-p 1`), confirming contention not regression. No NEW
+deterministic failures.
 
 ### F34. O14c — Double-winner safety via post-hoc yield (bounded reconcile window)
 
