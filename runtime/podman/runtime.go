@@ -493,13 +493,21 @@ func (r *Runtime) Checkpoint(ctx context.Context, id string, snapshotPath string
 // from the REQUEST BODY (Content-Type application/x-tar). We therefore
 // stream the archive at snapshotPath in the body and set import=true —
 // the symmetric counterpart of Checkpoint, which uses export=true and
-// reads the archive from the RESPONSE body. The restored container
-// inherits the network/ports/env captured in the checkpoint; the
-// RestoreOption plumbing is kept for callers but not forwarded as query
-// params (the import-from-archive endpoint rejects unknown keys).
+// reads the archive from the RESPONSE body.
+//
+// The restored container's HOST-PORT publishing is NOT captured in the CRIU
+// checkpoint: an auto-assigned host port is a runtime allocation, and even a
+// fixed mapping must be re-declared on the import path. We therefore forward
+// cfg.Ports as repeated `publishPorts` query values so the restored container
+// re-publishes them (verified live: import=true DOES accept publishPorts →
+// HTTP 200 + a fresh host port in Inspect). Without this, a snapshot-restored
+// replica comes up with no published host port (O15).
 func (r *Runtime) Restore(ctx context.Context, id string, snapshotPath string, opts ...runtime.RestoreOption) error {
+	cfg := runtime.ApplyRestoreOptions(opts...)
+
 	r.logger.Info("podman: restoring container",
-		zap.String("id", id), zap.String("path", snapshotPath))
+		zap.String("id", id), zap.String("path", snapshotPath),
+		zap.Int("published_ports", len(cfg.Ports)))
 
 	f, err := os.Open(snapshotPath)
 	if err != nil {
@@ -510,6 +518,12 @@ func (r *Runtime) Restore(ctx context.Context, id string, snapshotPath string, o
 	q := url.Values{
 		"import": {"true"},
 		"name":   {id},
+	}
+	// Re-declare published ports on the import path. url.Values supports
+	// repeats, so each mapping is one publishPorts value in Podman's
+	// "[hostPort:]containerPort[/proto]" form.
+	for _, p := range cfg.Ports {
+		q.Add("publishPorts", formatPublishPort(p))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -543,6 +557,28 @@ func (r *Runtime) Restore(ctx context.Context, id string, snapshotPath string, o
 	r.mu.Unlock()
 
 	return nil
+}
+
+// formatPublishPort renders a PortMapping as a Podman publishPorts value in
+// "[hostPort:]containerPort[/proto]" form:
+//   - HostPort > 0  → "<hostPort>:<containerPort>" (user-specified, honored verbatim)
+//   - HostPort == 0 → "<containerPort>"            (auto — Podman picks a free host port)
+//
+// The protocol suffix is appended only when the protocol is non-empty and not
+// the implicit "tcp", matching Podman's own defaulting so the common case
+// stays terse.
+func formatPublishPort(p runtime.PortMapping) string {
+	var b strings.Builder
+	if p.HostPort > 0 {
+		fmt.Fprintf(&b, "%d:%d", p.HostPort, p.ContainerPort)
+	} else {
+		fmt.Fprintf(&b, "%d", p.ContainerPort)
+	}
+	if p.Protocol != "" && p.Protocol != "tcp" {
+		b.WriteByte('/')
+		b.WriteString(p.Protocol)
+	}
+	return b.String()
 }
 
 // Stats returns a channel of periodic resource usage snapshots.

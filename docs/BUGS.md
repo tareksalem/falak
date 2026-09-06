@@ -662,6 +662,99 @@ Session 18 manual end-to-end pass.
 
 ## Fixed (manual testing pass)
 
+### F37. O16 — Gossip dropped the entire runtime config except env vars (ports never reached non-origin nodes)
+
+**Observed (live, Session 22).** For a 3-replica capsule with an auto-assigned
+host port, `podman ps` showed **only one** of the three replica containers with
+a published port. Stable — not a capture/restore timing artifact. Single-replica
+"worked" only because that replica happened to run on the origin node.
+
+**Root cause.** A capsule's CUE is parsed on a single **origin** node (where
+`capsule create` runs) and then **gossiped** to the rest over orbit. The gossip
+serializer `capsule/orbit/announcement.go` `specToProto` built
+`RuntimeConfig{Env: …}` and **nothing else** — silently dropping
+`Network` (mode + **ports**), `HealthCheck`, `FailurePolicy`, `LogRetention`,
+`StatsInterval`, `Registry`, and `SnapshotConfig`. The decoder
+`node/capsule_handler.go` `protoToCapsule` mirrored the gap (`Env` only). So
+every **non-origin** node received a capsule with an empty port list, and the
+replicas placed there cold-started with no published host port. The one replica
+on the origin node (which still had the locally-parsed full spec) got its port —
+hence "only 1 of N." The proto already carried all the fields (`RuntimeConfig`
+`network=5`, `health_check=6`, `failure_policy=7`, `log_retention=8`,
+`stats_interval_seconds=9`, `registry=10`, `snapshot=11`); only the Go
+encode/decode were incomplete.
+
+Note: this — not the snapshot restore path (O15/F36) — was the real cause of the
+"only one container has a port" symptom seen during the O15 retest. O15 is a
+genuine, separate gap (restore did drop `publishPorts`), but the multi-replica
+port asymmetry was O16.
+
+**Fix (Session 22).** `specToProto` now serializes the **full** `RuntimeConfig`
+via a `runtimeConfigToProto` helper (network mode + all port mappings, health
+check, failure policy, log retention, stats interval, registry, snapshot
+config); `protoToCapsule` decodes the same set back. No proto change needed
+(fields already existed). Regression guard:
+`capsule/orbit/runtime_config_test.go` `TestSpecToProto_CarriesFullRuntimeConfig`
+asserts every field survives the encode.
+
+**Status: Fixed (Session 22), LIVE-VERIFIED end-to-end.** After a clean 3-node
+restart + redeploy, all three replicas (`-0/-1/-2`, one per node) came up with
+distinct auto-assigned host ports (`37179`, `40425`, `37445`). Build + vet +
+`capsule`/`runtime` `-race` tests green.
+
+### F36. O15 — Host-port publishing lost across snapshot restore (external-access + observability gap)
+
+**Observed (live, Session 22).** For a multi-replica capsule with
+auto-assigned host ports, replicas that **restore from a snapshot** come up
+with **no published host port**, while replicas that **cold-start** keep
+theirs. `podman ps` shows the restored replica with an empty PORTS column and
+`capsule get` shows host `0`.
+
+**Scope (architect correction — do NOT overstate severity).** This is an
+**external-access + observability** gap, **NOT** a mesh-routing outage. The
+service mesh dials **BridgeIP:ContainerPort**
+(`network/endpoints/registry.go:228`, `service/proxy/tcp.go:432`,
+`network/dns/server.go:494`) and **never** uses the host port, so a restored
+replica remains fully mesh-reachable. The bug only breaks (1) external/direct
+`nodeIP:hostPort` (NodePort-style) access and (2) the `capsule get` display,
+which showed `spec.HostPort` (= 0 for auto).
+
+**Root cause.** `runtime/podman/runtime.go` `Restore` sent only `import=true` +
+`name` and dropped `RestoreConfig.Ports`. An auto host port is a runtime
+allocation, not part of the CRIU checkpoint's static config, so `restore
+--import` re-published nothing. (A stale comment claimed the import endpoint
+"rejects unknown keys" — false; the empirical gate proved `publishPorts` IS
+accepted on `import=true` → HTTP 200 + a fresh host port in Inspect.)
+
+**Fix (Session 22, architect-approved plan `port-publish-restore.md`).**
+- `Restore` forwards `cfg.Ports` as repeated `publishPorts` query values:
+  fixed (`HostPort>0`) → `"<host>:<container>[/proto]"`, auto → `"<container>[/proto]"`
+  (proto suffix only when non-tcp). `import=true`/`name`/tar body/ContentLength
+  unchanged.
+- `runtime/handler.go` centralizes a post-start port/IP readback in
+  `onContainerRunning` (both cold-start and restore funnel through it): polls
+  Inspect until the IP is present AND every published spec port has a non-empty
+  host port, on a bounded, configurable budget (default 2s = 20×100ms,
+  injectable ticker for deterministic tests). Keys on HostPort specifically
+  (the IP populates before the host-port DNAT). Resolution: all bound → record
+  IP+ports on the replica state THEN announce Running; a **fixed** port unbound
+  after budget → tear down + `MarkFailed(NodeAttributable)` → re-election
+  (covers a cross-node fixed collision); an **auto** port unbound → WARN,
+  record 0, continue (observability only — the container is mesh-reachable).
+- Resolved bindings live on `capsule.ReplicaState.Ports` (+ IP), gossip over
+  orbit (new `PortBinding` proto message), and surface per-replica in
+  `capsule get` (`node/api_facade.go` → `core.ReplicaView.Ports`, gRPC
+  `ReplicaStatus.ports`). Snapshot `store.go` `Record` stays **port-free**
+  (content-addressed, shared across K nodes — a per-node port would be wrong on
+  K-1 nodes).
+
+**Status: Fixed (Session 22), unit-tested + build/vet green; not yet
+live-retested end-to-end, NOT committed.** Tests: `runtime/podman` Restore
+forwards correct `publishPorts` for fixed + auto; `runtime` readback records
+the host port only after it populates (no premature announce),
+fixed-unbound→start-failure, auto-unbound→warn+continue; `capsule`
+`RecordReplicaNetwork`. Live retest: see `docs/RETEST.md` Step 2/6.
+
 ### F35. O14b — Election tiebreak keys on clock-independent schedule-offset (structural hardening)
 
 **Hardening, not a bug (Session 22 follow-up to O14/F33).** O14 made the

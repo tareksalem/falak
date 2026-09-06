@@ -109,6 +109,16 @@ runtime: container running
 ```
 - **No** `WinElectionWithBinding failed` / `MarkRunning failed`  (O6 — clean FSM).
 - **No** `restore failed, falling back to cold start`  (O7 — restore works).
+- **No** `fixed host port never bound within readback budget`  (O15 — port re-published).
+
+**✅ O15 — restored replica keeps its host port:**
+```bash
+sudo podman ps | grep falak-<id>-0     # PORTS column NON-empty (a fresh host port)
+sudo /tmp/falak --insecure --node node1 capsule get <id> -o json | \
+  grep -A3 '"replicas"'                 # replica shows a resolved host port (not 0)
+```
+Before O15 the restored replica came up with an EMPTY host port (auto ports
+were dropped on the `restore --import` path).
 
 ```bash
 sudo /tmp/falak --insecure --node node1 capsule list      # back to running, fresh container
@@ -174,6 +184,12 @@ sudo ls /root/.local/share/falak/node3/snapshots/*/ 2>/dev/null   # replicated c
 logs `restoring from snapshot` from its **local** replica — no cold start,
 even though the original holder is dead.
 
+**✅ O15 — the survivor's restored replica publishes a host port:**
+```bash
+sudo podman ps | grep falak-        # the re-placed replica has a NON-empty PORTS column
+```
+Cross-node restore re-publishes the port just like the same-node Step 2 case.
+
 ---
 
 ## Step 7 (optional) — Same-node group crash recovery  (O5b)
@@ -221,6 +237,7 @@ Those two cover the bulk of the recent work.
 | O11 snapshot replication HA | Step 6 |
 | O14 no split-brain (single winner) | Step 5 |
 | O14c no double-winner | Step 5 |
+| O15 host-port re-published on restore | Step 2, 6 |
 
 Notes: snapshotting needs CRIU (v4.2 built from source on kernel 6.17) + the
 **rootful** Podman socket (`--runtime-socket=/run/podman/podman.sock`) and the

@@ -27,6 +27,18 @@ type container struct {
 	startedAt   time.Time
 	exitCode    int
 	checkpoints map[string]bool // snapshotPath -> exists
+
+	// ip and ports are what Inspect reports for the container's networking.
+	// Tests script these (optionally as a sequence via inspectNetSeq) to
+	// exercise the handler's post-start port/IP readback.
+	ip    string
+	ports []runtime.PortMapping
+}
+
+// inspectNet is one scripted networking snapshot returned by Inspect.
+type inspectNet struct {
+	ip    string
+	ports []runtime.PortMapping
 }
 
 // Runtime implements runtime.Runtime with in-memory state. Safe for
@@ -47,6 +59,13 @@ type Runtime struct {
 	restoreErr     error
 	removeErr      error
 	inspectErrByID map[string]error
+
+	// inspectNetSeq scripts a per-id sequence of networking snapshots
+	// consumed one per Inspect call (the last entry repeats). Lets tests
+	// drive the handler's readback with an empty-then-populated host-port
+	// sequence. When absent, Inspect reports the container's static ip/ports.
+	inspectNetSeq map[string][]inspectNet
+	inspectNetPos map[string]int
 
 	// Calls records every method call for assertion in tests.
 	Calls []Call
@@ -359,6 +378,16 @@ func (r *Runtime) Inspect(_ context.Context, id string) (runtime.ContainerInfo, 
 	if !ok {
 		return runtime.ContainerInfo{}, fmt.Errorf("mock: inspect %s: %w", id, runtime.ErrContainerNotFound)
 	}
+	ip, ports := c.ip, c.ports
+	if seq, has := r.inspectNetSeq[id]; has && len(seq) > 0 {
+		pos := r.inspectNetPos[id]
+		if pos >= len(seq) {
+			pos = len(seq) - 1
+		}
+		ip = seq[pos].ip
+		ports = seq[pos].ports
+		r.inspectNetPos[id] = pos + 1
+	}
 	return runtime.ContainerInfo{
 		ID:        c.id,
 		Image:     c.image,
@@ -366,6 +395,8 @@ func (r *Runtime) Inspect(_ context.Context, id string) (runtime.ContainerInfo, 
 		CreatedAt: c.createdAt,
 		StartedAt: c.startedAt,
 		ExitCode:  c.exitCode,
+		IP:        ip,
+		Ports:     ports,
 	}, nil
 }
 
@@ -441,6 +472,42 @@ func (r *Runtime) SetInspectError(id string, err error) {
 		return
 	}
 	r.inspectErrByID[id] = err
+}
+
+// SetInspectNetwork sets the static IP and port mappings Inspect reports for
+// a container. Used by tests that need the handler's port/IP readback to see a
+// bound host port immediately.
+func (r *Runtime) SetInspectNetwork(id, ip string, ports []runtime.PortMapping) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if c, ok := r.containers[id]; ok {
+		c.ip = ip
+		c.ports = ports
+	}
+}
+
+// SetInspectNetworkSequence scripts a per-Inspect sequence of networking
+// snapshots for a container (the last entry repeats). Tests use it to model
+// the real backend, where the container IP populates before the host-port DNAT
+// lands, so an early Inspect sees an empty host port and a later one sees it
+// bound. Consumed one entry per Inspect call.
+func (r *Runtime) SetInspectNetworkSequence(id string, ips []string, ports [][]runtime.PortMapping) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inspectNetSeq == nil {
+		r.inspectNetSeq = make(map[string][]inspectNet)
+		r.inspectNetPos = make(map[string]int)
+	}
+	seq := make([]inspectNet, 0, len(ips))
+	for i := range ips {
+		var p []runtime.PortMapping
+		if i < len(ports) {
+			p = ports[i]
+		}
+		seq = append(seq, inspectNet{ip: ips[i], ports: p})
+	}
+	r.inspectNetSeq[id] = seq
+	r.inspectNetPos[id] = 0
 }
 
 // ContainerCount returns the number of tracked containers.

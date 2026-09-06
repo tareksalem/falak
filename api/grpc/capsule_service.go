@@ -214,6 +214,8 @@ func capsuleToProto(c *core.CapsuleResource) *pb.CapsuleResource {
 			NodeId:    rep.NodeID,
 			Status:    rep.Status,
 			StartedAt: timestamppb.New(rep.StartedAt),
+			Ip:        rep.IP,
+			Ports:     portsToProto(rep.Ports),
 		})
 	}
 	return r

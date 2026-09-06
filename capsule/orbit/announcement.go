@@ -331,9 +331,7 @@ func specToProto(s *capsule.CapsuleSpec) *capsulePb.CapsuleSpec {
 			Max:   s.Replicas.Max,
 			Exact: s.Replicas.Exact,
 		},
-		Runtime: &capsulePb.RuntimeConfig{
-			Env: s.Runtime.Env,
-		},
+		Runtime: runtimeConfigToProto(&s.Runtime),
 		MomentumConfig: &capsulePb.MomentumConfig{
 			Base:               s.MomentumConfig.Base,
 			BoostOnTraffic:     s.MomentumConfig.BoostOnTraffic,
@@ -372,6 +370,62 @@ func specToProto(s *capsule.CapsuleSpec) *capsulePb.CapsuleSpec {
 		pb.Group = groupSpecToProto(s.Group)
 	}
 
+	return pb
+}
+
+// runtimeConfigToProto serializes the FULL runtime config for gossip. Every
+// field must be carried: a capsule is created (and its CUE parsed) on a single
+// origin node, then gossiped to the rest — so any field omitted here is
+// silently lost on every non-origin node. Dropping Network.Ports, for example,
+// left gossiped replicas cold-starting with no published host port while the
+// origin node's replica had one (the "only 1 of N replicas has a port" bug).
+func runtimeConfigToProto(r *capsule.RuntimeConfig) *capsulePb.RuntimeConfig {
+	pb := &capsulePb.RuntimeConfig{
+		Env:                  r.Env,
+		StatsIntervalSeconds: int32(r.StatsInterval.Seconds()),
+		Network: &capsulePb.NetworkConfig{
+			Mode: string(r.Network.Mode),
+		},
+		FailurePolicy: &capsulePb.FailurePolicy{
+			RestartLimit:           int32(r.FailurePolicy.RestartLimit),
+			MaxNodeAttempts:        int32(r.FailurePolicy.MaxNodeAttempts),
+			GracefulTimeoutSeconds: int32(r.FailurePolicy.GracefulTimeout.Seconds()),
+		},
+		LogRetention: &capsulePb.LogRetention{
+			MaxFileSizeMb: int32(r.LogRetention.MaxFileSizeMB),
+			MaxFiles:      int32(r.LogRetention.MaxFiles),
+		},
+		Snapshot: &capsulePb.SnapshotConfig{
+			MaxPerCapsule: int32(r.SnapshotConfig.MaxPerCapsule),
+			TtlSeconds:    int32(r.SnapshotConfig.TTL.Seconds()),
+		},
+	}
+	for _, p := range r.Network.Ports {
+		pb.Network.Ports = append(pb.Network.Ports, &capsulePb.PortMapping{
+			Name:          p.Name,
+			ContainerPort: uint32(p.ContainerPort),
+			HostPort:      uint32(p.HostPort),
+			Protocol:      p.Protocol,
+		})
+	}
+	if r.HealthCheck != nil {
+		pb.HealthCheck = &capsulePb.HealthCheck{
+			Type:                string(r.HealthCheck.Type),
+			Path:                r.HealthCheck.Path,
+			Port:                uint32(r.HealthCheck.Port),
+			IntervalSeconds:     int32(r.HealthCheck.Interval.Seconds()),
+			TimeoutSeconds:      int32(r.HealthCheck.Timeout.Seconds()),
+			Retries:             int32(r.HealthCheck.Retries),
+			InitialDelaySeconds: int32(r.HealthCheck.InitialDelay.Seconds()),
+		}
+	}
+	if r.Registry != nil {
+		pb.Registry = &capsulePb.RegistryAuth{
+			Url:               r.Registry.URL,
+			UsernameEncrypted: r.Registry.UsernameEncrypted,
+			PasswordEncrypted: r.Registry.PasswordEncrypted,
+		}
+	}
 	return pb
 }
 
@@ -443,7 +497,27 @@ func replicaStatesToProto(replicas []capsule.ReplicaState) []*capsulePb.ReplicaS
 			NodeId:    r.NodeID,
 			Status:    string(r.Status),
 			StartedAt: timestamppb.New(r.StartedAt),
+			Ip:        r.IP,
+			Ports:     portBindingsToProto(r.Ports),
 		})
 	}
 	return result
+}
+
+// portBindingsToProto lifts resolved per-replica host-port bindings onto the
+// gossip wire so peers observe the ACTUAL host ports of a running replica
+// (auto ports are runtime allocations absent from the spec).
+func portBindingsToProto(bindings []capsule.PortBinding) []*capsulePb.PortBinding {
+	if len(bindings) == 0 {
+		return nil
+	}
+	out := make([]*capsulePb.PortBinding, 0, len(bindings))
+	for _, b := range bindings {
+		out = append(out, &capsulePb.PortBinding{
+			Name:          b.Name,
+			ContainerPort: uint32(b.ContainerPort),
+			HostPort:      uint32(b.HostPort),
+		})
+	}
+	return out
 }

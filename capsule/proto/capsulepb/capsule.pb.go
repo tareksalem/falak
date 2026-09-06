@@ -1501,6 +1501,8 @@ type ReplicaState struct {
 	NodeId        string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
 	Status        string                 `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"` // "electing", "assigned", "running", "stopping"
 	StartedAt     *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
+	Ip            string                 `protobuf:"bytes,5,opt,name=ip,proto3" json:"ip,omitempty"`       // resolved container IP (bridge mode); empty for host
+	Ports         []*PortBinding         `protobuf:"bytes,6,rep,name=ports,proto3" json:"ports,omitempty"` // resolved host-port bindings (auto ports are runtime allocations)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1563,6 +1565,86 @@ func (x *ReplicaState) GetStartedAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *ReplicaState) GetIp() string {
+	if x != nil {
+		return x.Ip
+	}
+	return ""
+}
+
+func (x *ReplicaState) GetPorts() []*PortBinding {
+	if x != nil {
+		return x.Ports
+	}
+	return nil
+}
+
+// PortBinding is a resolved container->host port mapping observed after the
+// container is running. Distinct from the SPEC PortMapping: an auto-assigned
+// host port (spec host_port = 0) becomes a concrete allocation here, and a
+// restored replica re-publishes a fresh host port. Recorded per-replica for
+// observability (external/NodePort access + `capsule get`); the service mesh
+// dials the bridge IP + container port and never uses the host port.
+type PortBinding struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"` // human-readable label (e.g. "http")
+	ContainerPort uint32                 `protobuf:"varint,2,opt,name=container_port,json=containerPort,proto3" json:"container_port,omitempty"`
+	HostPort      uint32                 `protobuf:"varint,3,opt,name=host_port,json=hostPort,proto3" json:"host_port,omitempty"` // 0 = unresolved (auto port not yet bound)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PortBinding) Reset() {
+	*x = PortBinding{}
+	mi := &file_capsule_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PortBinding) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PortBinding) ProtoMessage() {}
+
+func (x *PortBinding) ProtoReflect() protoreflect.Message {
+	mi := &file_capsule_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PortBinding.ProtoReflect.Descriptor instead.
+func (*PortBinding) Descriptor() ([]byte, []int) {
+	return file_capsule_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *PortBinding) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *PortBinding) GetContainerPort() uint32 {
+	if x != nil {
+		return x.ContainerPort
+	}
+	return 0
+}
+
+func (x *PortBinding) GetHostPort() uint32 {
+	if x != nil {
+		return x.HostPort
+	}
+	return 0
+}
+
 type MomentumState struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Current       int32                  `protobuf:"varint,1,opt,name=current,proto3" json:"current,omitempty"`
@@ -1574,7 +1656,7 @@ type MomentumState struct {
 
 func (x *MomentumState) Reset() {
 	*x = MomentumState{}
-	mi := &file_capsule_proto_msgTypes[19]
+	mi := &file_capsule_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1586,7 +1668,7 @@ func (x *MomentumState) String() string {
 func (*MomentumState) ProtoMessage() {}
 
 func (x *MomentumState) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_msgTypes[19]
+	mi := &file_capsule_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1599,7 +1681,7 @@ func (x *MomentumState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MomentumState.ProtoReflect.Descriptor instead.
 func (*MomentumState) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_rawDescGZIP(), []int{19}
+	return file_capsule_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *MomentumState) GetCurrent() int32 {
@@ -1637,7 +1719,7 @@ type OrbitMessage struct {
 
 func (x *OrbitMessage) Reset() {
 	*x = OrbitMessage{}
-	mi := &file_capsule_proto_msgTypes[20]
+	mi := &file_capsule_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1649,7 +1731,7 @@ func (x *OrbitMessage) String() string {
 func (*OrbitMessage) ProtoMessage() {}
 
 func (x *OrbitMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_msgTypes[20]
+	mi := &file_capsule_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1662,7 +1744,7 @@ func (x *OrbitMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OrbitMessage.ProtoReflect.Descriptor instead.
 func (*OrbitMessage) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_rawDescGZIP(), []int{20}
+	return file_capsule_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *OrbitMessage) GetType() string {
@@ -1711,7 +1793,7 @@ type CapsuleAnnouncement struct {
 
 func (x *CapsuleAnnouncement) Reset() {
 	*x = CapsuleAnnouncement{}
-	mi := &file_capsule_proto_msgTypes[21]
+	mi := &file_capsule_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1723,7 +1805,7 @@ func (x *CapsuleAnnouncement) String() string {
 func (*CapsuleAnnouncement) ProtoMessage() {}
 
 func (x *CapsuleAnnouncement) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_msgTypes[21]
+	mi := &file_capsule_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1736,7 +1818,7 @@ func (x *CapsuleAnnouncement) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CapsuleAnnouncement.ProtoReflect.Descriptor instead.
 func (*CapsuleAnnouncement) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_rawDescGZIP(), []int{21}
+	return file_capsule_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *CapsuleAnnouncement) GetCapsule() *Capsule {
@@ -1767,7 +1849,7 @@ type CapsuleStatusUpdate struct {
 
 func (x *CapsuleStatusUpdate) Reset() {
 	*x = CapsuleStatusUpdate{}
-	mi := &file_capsule_proto_msgTypes[22]
+	mi := &file_capsule_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1779,7 +1861,7 @@ func (x *CapsuleStatusUpdate) String() string {
 func (*CapsuleStatusUpdate) ProtoMessage() {}
 
 func (x *CapsuleStatusUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_msgTypes[22]
+	mi := &file_capsule_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1792,7 +1874,7 @@ func (x *CapsuleStatusUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CapsuleStatusUpdate.ProtoReflect.Descriptor instead.
 func (*CapsuleStatusUpdate) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_rawDescGZIP(), []int{22}
+	return file_capsule_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *CapsuleStatusUpdate) GetCapsuleId() string {
@@ -1841,7 +1923,7 @@ type CapsuleWithdrawal struct {
 
 func (x *CapsuleWithdrawal) Reset() {
 	*x = CapsuleWithdrawal{}
-	mi := &file_capsule_proto_msgTypes[23]
+	mi := &file_capsule_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1853,7 +1935,7 @@ func (x *CapsuleWithdrawal) String() string {
 func (*CapsuleWithdrawal) ProtoMessage() {}
 
 func (x *CapsuleWithdrawal) ProtoReflect() protoreflect.Message {
-	mi := &file_capsule_proto_msgTypes[23]
+	mi := &file_capsule_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1866,7 +1948,7 @@ func (x *CapsuleWithdrawal) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CapsuleWithdrawal.ProtoReflect.Descriptor instead.
 func (*CapsuleWithdrawal) Descriptor() ([]byte, []int) {
-	return file_capsule_proto_rawDescGZIP(), []int{23}
+	return file_capsule_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *CapsuleWithdrawal) GetCapsuleId() string {
@@ -2021,14 +2103,20 @@ const file_capsule_proto_rawDesc = "" +
 	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x129\n" +
 	"\n" +
 	"updated_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x128\n" +
-	"\bmomentum\x18\t \x01(\v2\x1c.falak.capsule.MomentumStateR\bmomentum\"\x99\x01\n" +
+	"\bmomentum\x18\t \x01(\v2\x1c.falak.capsule.MomentumStateR\bmomentum\"\xdb\x01\n" +
 	"\fReplicaState\x12\x1d\n" +
 	"\n" +
 	"replica_id\x18\x01 \x01(\tR\treplicaId\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x16\n" +
 	"\x06status\x18\x03 \x01(\tR\x06status\x129\n" +
 	"\n" +
-	"started_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\"~\n" +
+	"started_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\x12\x0e\n" +
+	"\x02ip\x18\x05 \x01(\tR\x02ip\x120\n" +
+	"\x05ports\x18\x06 \x03(\v2\x1a.falak.capsule.PortBindingR\x05ports\"e\n" +
+	"\vPortBinding\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12%\n" +
+	"\x0econtainer_port\x18\x02 \x01(\rR\rcontainerPort\x12\x1b\n" +
+	"\thost_port\x18\x03 \x01(\rR\bhostPort\"~\n" +
 	"\rMomentumState\x12\x18\n" +
 	"\acurrent\x18\x01 \x01(\x05R\acurrent\x12\x12\n" +
 	"\x04base\x18\x02 \x01(\x05R\x04base\x12?\n" +
@@ -2075,7 +2163,7 @@ func file_capsule_proto_rawDescGZIP() []byte {
 }
 
 var file_capsule_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_capsule_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
+var file_capsule_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
 var file_capsule_proto_goTypes = []any{
 	(CapsuleKind)(0),              // 0: falak.capsule.CapsuleKind
 	(ColocationMode)(0),           // 1: falak.capsule.ColocationMode
@@ -2098,19 +2186,20 @@ var file_capsule_proto_goTypes = []any{
 	(*MomentumConfig)(nil),        // 18: falak.capsule.MomentumConfig
 	(*Capsule)(nil),               // 19: falak.capsule.Capsule
 	(*ReplicaState)(nil),          // 20: falak.capsule.ReplicaState
-	(*MomentumState)(nil),         // 21: falak.capsule.MomentumState
-	(*OrbitMessage)(nil),          // 22: falak.capsule.OrbitMessage
-	(*CapsuleAnnouncement)(nil),   // 23: falak.capsule.CapsuleAnnouncement
-	(*CapsuleStatusUpdate)(nil),   // 24: falak.capsule.CapsuleStatusUpdate
-	(*CapsuleWithdrawal)(nil),     // 25: falak.capsule.CapsuleWithdrawal
-	nil,                           // 26: falak.capsule.CapsuleSpec.LabelsEntry
-	nil,                           // 27: falak.capsule.GroupSpec.DepsEntry
-	nil,                           // 28: falak.capsule.PlacementRule.LabelsEntry
-	nil,                           // 29: falak.capsule.RuntimeConfig.EnvEntry
-	(*timestamppb.Timestamp)(nil), // 30: google.protobuf.Timestamp
+	(*PortBinding)(nil),           // 21: falak.capsule.PortBinding
+	(*MomentumState)(nil),         // 22: falak.capsule.MomentumState
+	(*OrbitMessage)(nil),          // 23: falak.capsule.OrbitMessage
+	(*CapsuleAnnouncement)(nil),   // 24: falak.capsule.CapsuleAnnouncement
+	(*CapsuleStatusUpdate)(nil),   // 25: falak.capsule.CapsuleStatusUpdate
+	(*CapsuleWithdrawal)(nil),     // 26: falak.capsule.CapsuleWithdrawal
+	nil,                           // 27: falak.capsule.CapsuleSpec.LabelsEntry
+	nil,                           // 28: falak.capsule.GroupSpec.DepsEntry
+	nil,                           // 29: falak.capsule.PlacementRule.LabelsEntry
+	nil,                           // 30: falak.capsule.RuntimeConfig.EnvEntry
+	(*timestamppb.Timestamp)(nil), // 31: google.protobuf.Timestamp
 }
 var file_capsule_proto_depIdxs = []int32{
-	26, // 0: falak.capsule.CapsuleSpec.labels:type_name -> falak.capsule.CapsuleSpec.LabelsEntry
+	27, // 0: falak.capsule.CapsuleSpec.labels:type_name -> falak.capsule.CapsuleSpec.LabelsEntry
 	6,  // 1: falak.capsule.CapsuleSpec.resources:type_name -> falak.capsule.ResourceRequirements
 	7,  // 2: falak.capsule.CapsuleSpec.replicas:type_name -> falak.capsule.ReplicaConfig
 	8,  // 3: falak.capsule.CapsuleSpec.scaling_rules:type_name -> falak.capsule.ScalingRule
@@ -2122,9 +2211,9 @@ var file_capsule_proto_depIdxs = []int32{
 	2,  // 9: falak.capsule.MemberSpec.spec:type_name -> falak.capsule.CapsuleSpec
 	1,  // 10: falak.capsule.GroupSpec.colocation:type_name -> falak.capsule.ColocationMode
 	4,  // 11: falak.capsule.GroupSpec.members:type_name -> falak.capsule.MemberSpec
-	27, // 12: falak.capsule.GroupSpec.deps:type_name -> falak.capsule.GroupSpec.DepsEntry
-	28, // 13: falak.capsule.PlacementRule.labels:type_name -> falak.capsule.PlacementRule.LabelsEntry
-	29, // 14: falak.capsule.RuntimeConfig.env:type_name -> falak.capsule.RuntimeConfig.EnvEntry
+	28, // 12: falak.capsule.GroupSpec.deps:type_name -> falak.capsule.GroupSpec.DepsEntry
+	29, // 13: falak.capsule.PlacementRule.labels:type_name -> falak.capsule.PlacementRule.LabelsEntry
+	30, // 14: falak.capsule.RuntimeConfig.env:type_name -> falak.capsule.RuntimeConfig.EnvEntry
 	11, // 15: falak.capsule.RuntimeConfig.network:type_name -> falak.capsule.NetworkConfig
 	13, // 16: falak.capsule.RuntimeConfig.health_check:type_name -> falak.capsule.HealthCheck
 	14, // 17: falak.capsule.RuntimeConfig.failure_policy:type_name -> falak.capsule.FailurePolicy
@@ -2134,22 +2223,23 @@ var file_capsule_proto_depIdxs = []int32{
 	12, // 21: falak.capsule.NetworkConfig.ports:type_name -> falak.capsule.PortMapping
 	2,  // 22: falak.capsule.Capsule.spec:type_name -> falak.capsule.CapsuleSpec
 	20, // 23: falak.capsule.Capsule.replicas:type_name -> falak.capsule.ReplicaState
-	30, // 24: falak.capsule.Capsule.created_at:type_name -> google.protobuf.Timestamp
-	30, // 25: falak.capsule.Capsule.updated_at:type_name -> google.protobuf.Timestamp
-	21, // 26: falak.capsule.Capsule.momentum:type_name -> falak.capsule.MomentumState
-	30, // 27: falak.capsule.ReplicaState.started_at:type_name -> google.protobuf.Timestamp
-	30, // 28: falak.capsule.MomentumState.last_adjusted:type_name -> google.protobuf.Timestamp
-	30, // 29: falak.capsule.OrbitMessage.timestamp:type_name -> google.protobuf.Timestamp
-	19, // 30: falak.capsule.CapsuleAnnouncement.capsule:type_name -> falak.capsule.Capsule
-	20, // 31: falak.capsule.CapsuleStatusUpdate.replicas:type_name -> falak.capsule.ReplicaState
-	21, // 32: falak.capsule.CapsuleStatusUpdate.momentum:type_name -> falak.capsule.MomentumState
-	30, // 33: falak.capsule.CapsuleStatusUpdate.timestamp:type_name -> google.protobuf.Timestamp
-	3,  // 34: falak.capsule.GroupSpec.DepsEntry.value:type_name -> falak.capsule.MemberDeps
-	35, // [35:35] is the sub-list for method output_type
-	35, // [35:35] is the sub-list for method input_type
-	35, // [35:35] is the sub-list for extension type_name
-	35, // [35:35] is the sub-list for extension extendee
-	0,  // [0:35] is the sub-list for field type_name
+	31, // 24: falak.capsule.Capsule.created_at:type_name -> google.protobuf.Timestamp
+	31, // 25: falak.capsule.Capsule.updated_at:type_name -> google.protobuf.Timestamp
+	22, // 26: falak.capsule.Capsule.momentum:type_name -> falak.capsule.MomentumState
+	31, // 27: falak.capsule.ReplicaState.started_at:type_name -> google.protobuf.Timestamp
+	21, // 28: falak.capsule.ReplicaState.ports:type_name -> falak.capsule.PortBinding
+	31, // 29: falak.capsule.MomentumState.last_adjusted:type_name -> google.protobuf.Timestamp
+	31, // 30: falak.capsule.OrbitMessage.timestamp:type_name -> google.protobuf.Timestamp
+	19, // 31: falak.capsule.CapsuleAnnouncement.capsule:type_name -> falak.capsule.Capsule
+	20, // 32: falak.capsule.CapsuleStatusUpdate.replicas:type_name -> falak.capsule.ReplicaState
+	22, // 33: falak.capsule.CapsuleStatusUpdate.momentum:type_name -> falak.capsule.MomentumState
+	31, // 34: falak.capsule.CapsuleStatusUpdate.timestamp:type_name -> google.protobuf.Timestamp
+	3,  // 35: falak.capsule.GroupSpec.DepsEntry.value:type_name -> falak.capsule.MemberDeps
+	36, // [36:36] is the sub-list for method output_type
+	36, // [36:36] is the sub-list for method input_type
+	36, // [36:36] is the sub-list for extension type_name
+	36, // [36:36] is the sub-list for extension extendee
+	0,  // [0:36] is the sub-list for field type_name
 }
 
 func init() { file_capsule_proto_init() }
@@ -2163,7 +2253,7 @@ func file_capsule_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_capsule_proto_rawDesc), len(file_capsule_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   28,
+			NumMessages:   29,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

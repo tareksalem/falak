@@ -177,6 +177,16 @@ type ReplicaView struct {
 	NodeID    string
 	Status    string
 	StartedAt time.Time
+
+	// IP is the replica's resolved container IP (bridge mode; empty for host
+	// network), populated once the replica reaches Running.
+	IP string
+
+	// Ports are the replica's RESOLVED host-port bindings, populated from the
+	// runtime readback. Unlike CapsuleSpecView.Ports (the spec, which is 0 for
+	// auto host ports), these carry the actual host port each replica
+	// published — including auto allocations and restore-republished ports.
+	Ports []PortMapping
 }
 
 // --- Cluster request/response types --------------------------------------

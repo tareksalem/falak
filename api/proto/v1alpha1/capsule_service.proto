@@ -106,6 +106,8 @@ message ReplicaStatus {
     string node_id = 2;
     string status = 3;
     google.protobuf.Timestamp started_at = 4;
+    repeated PortMapping ports = 5;  // RESOLVED host-port bindings (actual host ports, incl. auto allocations)
+    string ip = 6;                   // resolved container IP (bridge mode); empty for host
 }
 
 message CreateCapsuleRequest {

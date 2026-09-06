@@ -377,6 +377,8 @@ type ReplicaStatus struct {
 	NodeId        string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
 	Status        string                 `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"`
 	StartedAt     *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
+	Ports         []*PortMapping         `protobuf:"bytes,5,rep,name=ports,proto3" json:"ports,omitempty"` // RESOLVED host-port bindings (actual host ports, incl. auto allocations)
+	Ip            string                 `protobuf:"bytes,6,opt,name=ip,proto3" json:"ip,omitempty"`       // resolved container IP (bridge mode); empty for host
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -437,6 +439,20 @@ func (x *ReplicaStatus) GetStartedAt() *timestamppb.Timestamp {
 		return x.StartedAt
 	}
 	return nil
+}
+
+func (x *ReplicaStatus) GetPorts() []*PortMapping {
+	if x != nil {
+		return x.Ports
+	}
+	return nil
+}
+
+func (x *ReplicaStatus) GetIp() string {
+	if x != nil {
+		return x.Ip
+	}
+	return ""
 }
 
 type CreateCapsuleRequest struct {
@@ -1176,14 +1192,16 @@ const file_api_proto_v1alpha1_capsule_service_proto_rawDesc = "" +
 	"\bprotocol\x18\x04 \x01(\tR\bprotocol\"f\n" +
 	"\rCapsuleStatus\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12=\n" +
-	"\breplicas\x18\x02 \x03(\v2!.falak.api.v1alpha1.ReplicaStatusR\breplicas\"\x9a\x01\n" +
+	"\breplicas\x18\x02 \x03(\v2!.falak.api.v1alpha1.ReplicaStatusR\breplicas\"\xe1\x01\n" +
 	"\rReplicaStatus\x12\x1d\n" +
 	"\n" +
 	"replica_id\x18\x01 \x01(\tR\treplicaId\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x16\n" +
 	"\x06status\x18\x03 \x01(\tR\x06status\x129\n" +
 	"\n" +
-	"started_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\"\xa6\a\n" +
+	"started_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\x125\n" +
+	"\x05ports\x18\x05 \x03(\v2\x1f.falak.api.v1alpha1.PortMappingR\x05ports\x12\x0e\n" +
+	"\x02ip\x18\x06 \x01(\tR\x02ip\"\xa6\a\n" +
 	"\x14CreateCapsuleRequest\x12\x18\n" +
 	"\acluster\x18\x01 \x01(\tR\acluster\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
@@ -1318,36 +1336,37 @@ var file_api_proto_v1alpha1_capsule_service_proto_depIdxs = []int32{
 	2,  // 4: falak.api.v1alpha1.CapsuleSpec.ports:type_name -> falak.api.v1alpha1.PortMapping
 	4,  // 5: falak.api.v1alpha1.CapsuleStatus.replicas:type_name -> falak.api.v1alpha1.ReplicaStatus
 	21, // 6: falak.api.v1alpha1.ReplicaStatus.started_at:type_name -> google.protobuf.Timestamp
-	15, // 7: falak.api.v1alpha1.CreateCapsuleRequest.labels:type_name -> falak.api.v1alpha1.CreateCapsuleRequest.LabelsEntry
-	16, // 8: falak.api.v1alpha1.CreateCapsuleRequest.env:type_name -> falak.api.v1alpha1.CreateCapsuleRequest.EnvEntry
-	2,  // 9: falak.api.v1alpha1.CreateCapsuleRequest.ports:type_name -> falak.api.v1alpha1.PortMapping
-	17, // 10: falak.api.v1alpha1.ListCapsulesRequest.labels:type_name -> falak.api.v1alpha1.ListCapsulesRequest.LabelsEntry
-	22, // 11: falak.api.v1alpha1.ListCapsulesRequest.pagination:type_name -> falak.api.v1alpha1.Pagination
-	0,  // 12: falak.api.v1alpha1.ListCapsulesResponse.capsules:type_name -> falak.api.v1alpha1.CapsuleResource
-	23, // 13: falak.api.v1alpha1.ListCapsulesResponse.paging:type_name -> falak.api.v1alpha1.PagedResult
-	18, // 14: falak.api.v1alpha1.UpdateCapsuleRequest.env:type_name -> falak.api.v1alpha1.UpdateCapsuleRequest.EnvEntry
-	19, // 15: falak.api.v1alpha1.WatchCapsulesRequest.labels:type_name -> falak.api.v1alpha1.WatchCapsulesRequest.LabelsEntry
-	21, // 16: falak.api.v1alpha1.LogsRequest.since:type_name -> google.protobuf.Timestamp
-	21, // 17: falak.api.v1alpha1.LogEntry.timestamp:type_name -> google.protobuf.Timestamp
-	5,  // 18: falak.api.v1alpha1.CapsuleService.Create:input_type -> falak.api.v1alpha1.CreateCapsuleRequest
-	6,  // 19: falak.api.v1alpha1.CapsuleService.Get:input_type -> falak.api.v1alpha1.GetCapsuleRequest
-	7,  // 20: falak.api.v1alpha1.CapsuleService.List:input_type -> falak.api.v1alpha1.ListCapsulesRequest
-	9,  // 21: falak.api.v1alpha1.CapsuleService.Update:input_type -> falak.api.v1alpha1.UpdateCapsuleRequest
-	10, // 22: falak.api.v1alpha1.CapsuleService.Delete:input_type -> falak.api.v1alpha1.DeleteCapsuleRequest
-	11, // 23: falak.api.v1alpha1.CapsuleService.Watch:input_type -> falak.api.v1alpha1.WatchCapsulesRequest
-	12, // 24: falak.api.v1alpha1.CapsuleService.Logs:input_type -> falak.api.v1alpha1.LogsRequest
-	0,  // 25: falak.api.v1alpha1.CapsuleService.Create:output_type -> falak.api.v1alpha1.CapsuleResource
-	0,  // 26: falak.api.v1alpha1.CapsuleService.Get:output_type -> falak.api.v1alpha1.CapsuleResource
-	8,  // 27: falak.api.v1alpha1.CapsuleService.List:output_type -> falak.api.v1alpha1.ListCapsulesResponse
-	0,  // 28: falak.api.v1alpha1.CapsuleService.Update:output_type -> falak.api.v1alpha1.CapsuleResource
-	24, // 29: falak.api.v1alpha1.CapsuleService.Delete:output_type -> google.protobuf.Empty
-	25, // 30: falak.api.v1alpha1.CapsuleService.Watch:output_type -> falak.api.v1alpha1.WatchEvent
-	13, // 31: falak.api.v1alpha1.CapsuleService.Logs:output_type -> falak.api.v1alpha1.LogEntry
-	25, // [25:32] is the sub-list for method output_type
-	18, // [18:25] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	2,  // 7: falak.api.v1alpha1.ReplicaStatus.ports:type_name -> falak.api.v1alpha1.PortMapping
+	15, // 8: falak.api.v1alpha1.CreateCapsuleRequest.labels:type_name -> falak.api.v1alpha1.CreateCapsuleRequest.LabelsEntry
+	16, // 9: falak.api.v1alpha1.CreateCapsuleRequest.env:type_name -> falak.api.v1alpha1.CreateCapsuleRequest.EnvEntry
+	2,  // 10: falak.api.v1alpha1.CreateCapsuleRequest.ports:type_name -> falak.api.v1alpha1.PortMapping
+	17, // 11: falak.api.v1alpha1.ListCapsulesRequest.labels:type_name -> falak.api.v1alpha1.ListCapsulesRequest.LabelsEntry
+	22, // 12: falak.api.v1alpha1.ListCapsulesRequest.pagination:type_name -> falak.api.v1alpha1.Pagination
+	0,  // 13: falak.api.v1alpha1.ListCapsulesResponse.capsules:type_name -> falak.api.v1alpha1.CapsuleResource
+	23, // 14: falak.api.v1alpha1.ListCapsulesResponse.paging:type_name -> falak.api.v1alpha1.PagedResult
+	18, // 15: falak.api.v1alpha1.UpdateCapsuleRequest.env:type_name -> falak.api.v1alpha1.UpdateCapsuleRequest.EnvEntry
+	19, // 16: falak.api.v1alpha1.WatchCapsulesRequest.labels:type_name -> falak.api.v1alpha1.WatchCapsulesRequest.LabelsEntry
+	21, // 17: falak.api.v1alpha1.LogsRequest.since:type_name -> google.protobuf.Timestamp
+	21, // 18: falak.api.v1alpha1.LogEntry.timestamp:type_name -> google.protobuf.Timestamp
+	5,  // 19: falak.api.v1alpha1.CapsuleService.Create:input_type -> falak.api.v1alpha1.CreateCapsuleRequest
+	6,  // 20: falak.api.v1alpha1.CapsuleService.Get:input_type -> falak.api.v1alpha1.GetCapsuleRequest
+	7,  // 21: falak.api.v1alpha1.CapsuleService.List:input_type -> falak.api.v1alpha1.ListCapsulesRequest
+	9,  // 22: falak.api.v1alpha1.CapsuleService.Update:input_type -> falak.api.v1alpha1.UpdateCapsuleRequest
+	10, // 23: falak.api.v1alpha1.CapsuleService.Delete:input_type -> falak.api.v1alpha1.DeleteCapsuleRequest
+	11, // 24: falak.api.v1alpha1.CapsuleService.Watch:input_type -> falak.api.v1alpha1.WatchCapsulesRequest
+	12, // 25: falak.api.v1alpha1.CapsuleService.Logs:input_type -> falak.api.v1alpha1.LogsRequest
+	0,  // 26: falak.api.v1alpha1.CapsuleService.Create:output_type -> falak.api.v1alpha1.CapsuleResource
+	0,  // 27: falak.api.v1alpha1.CapsuleService.Get:output_type -> falak.api.v1alpha1.CapsuleResource
+	8,  // 28: falak.api.v1alpha1.CapsuleService.List:output_type -> falak.api.v1alpha1.ListCapsulesResponse
+	0,  // 29: falak.api.v1alpha1.CapsuleService.Update:output_type -> falak.api.v1alpha1.CapsuleResource
+	24, // 30: falak.api.v1alpha1.CapsuleService.Delete:output_type -> google.protobuf.Empty
+	25, // 31: falak.api.v1alpha1.CapsuleService.Watch:output_type -> falak.api.v1alpha1.WatchEvent
+	13, // 32: falak.api.v1alpha1.CapsuleService.Logs:output_type -> falak.api.v1alpha1.LogEntry
+	26, // [26:33] is the sub-list for method output_type
+	19, // [19:26] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_v1alpha1_capsule_service_proto_init() }

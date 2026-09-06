@@ -194,6 +194,20 @@ message ReplicaState {
     string node_id = 2;
     string status = 3;                           // "electing", "assigned", "running", "stopping"
     google.protobuf.Timestamp started_at = 4;
+    string ip = 5;                               // resolved container IP (bridge mode); empty for host
+    repeated PortBinding ports = 6;              // resolved host-port bindings (auto ports are runtime allocations)
+}
+
+// PortBinding is a resolved container->host port mapping observed after the
+// container is running. Distinct from the SPEC PortMapping: an auto-assigned
+// host port (spec host_port = 0) becomes a concrete allocation here, and a
+// restored replica re-publishes a fresh host port. Recorded per-replica for
+// observability (external/NodePort access + `capsule get`); the service mesh
+// dials the bridge IP + container port and never uses the host port.
+message PortBinding {
+    string name = 1;                             // human-readable label (e.g. "http")
+    uint32 container_port = 2;
+    uint32 host_port = 3;                        // 0 = unresolved (auto port not yet bound)
 }
 
 message MomentumState {

@@ -2508,6 +2508,8 @@ func protoToCapsule(pb *capsulePb.Capsule) *capsule.Capsule {
 			ReplicaID: capsule.ReplicaID(r.ReplicaId),
 			NodeID:    r.NodeId,
 			Status:    enums.CapsuleStatus(r.Status),
+			IP:        r.Ip,
+			Ports:     portBindingsFromProto(r.Ports),
 		}
 		if r.StartedAt != nil {
 			rs.StartedAt = r.StartedAt.AsTime()
@@ -2516,6 +2518,27 @@ func protoToCapsule(pb *capsulePb.Capsule) *capsule.Capsule {
 	}
 
 	return c
+}
+
+// portBindingsFromProto reconstructs resolved per-replica host-port bindings
+// from the gossip wire so a peer's `capsule get` shows the actual host ports a
+// remote replica published.
+func portBindingsFromProto(in []*capsulePb.PortBinding) []capsule.PortBinding {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]capsule.PortBinding, 0, len(in))
+	for _, b := range in {
+		if b == nil {
+			continue
+		}
+		out = append(out, capsule.PortBinding{
+			Name:          b.Name,
+			ContainerPort: uint16(b.ContainerPort),
+			HostPort:      uint16(b.HostPort),
+		})
+	}
+	return out
 }
 
 func protoToSpec(pb *capsulePb.CapsuleSpec) capsule.CapsuleSpec {
@@ -2546,6 +2569,55 @@ func protoToSpec(pb *capsulePb.CapsuleSpec) capsule.CapsuleSpec {
 
 	if pb.Runtime != nil {
 		spec.Runtime.Env = pb.Runtime.Env
+		spec.Runtime.StatsInterval = time.Duration(pb.Runtime.StatsIntervalSeconds) * time.Second
+		if n := pb.Runtime.Network; n != nil {
+			spec.Runtime.Network.Mode = enums.NetworkMode(n.Mode)
+			for _, p := range n.Ports {
+				spec.Runtime.Network.Ports = append(spec.Runtime.Network.Ports, capsule.PortMapping{
+					Name:          p.Name,
+					ContainerPort: uint16(p.ContainerPort),
+					HostPort:      uint16(p.HostPort),
+					Protocol:      p.Protocol,
+				})
+			}
+		}
+		if hc := pb.Runtime.HealthCheck; hc != nil {
+			spec.Runtime.HealthCheck = &capsule.HealthCheck{
+				Type:         enums.HealthCheckType(hc.Type),
+				Path:         hc.Path,
+				Port:         uint16(hc.Port),
+				Interval:     time.Duration(hc.IntervalSeconds) * time.Second,
+				Timeout:      time.Duration(hc.TimeoutSeconds) * time.Second,
+				Retries:      int(hc.Retries),
+				InitialDelay: time.Duration(hc.InitialDelaySeconds) * time.Second,
+			}
+		}
+		if fp := pb.Runtime.FailurePolicy; fp != nil {
+			spec.Runtime.FailurePolicy = capsule.FailurePolicy{
+				RestartLimit:    int(fp.RestartLimit),
+				MaxNodeAttempts: int(fp.MaxNodeAttempts),
+				GracefulTimeout: time.Duration(fp.GracefulTimeoutSeconds) * time.Second,
+			}
+		}
+		if lr := pb.Runtime.LogRetention; lr != nil {
+			spec.Runtime.LogRetention = capsule.LogRetention{
+				MaxFileSizeMB: int(lr.MaxFileSizeMb),
+				MaxFiles:      int(lr.MaxFiles),
+			}
+		}
+		if sn := pb.Runtime.Snapshot; sn != nil {
+			spec.Runtime.SnapshotConfig = capsule.SnapshotConfig{
+				MaxPerCapsule: int(sn.MaxPerCapsule),
+				TTL:           time.Duration(sn.TtlSeconds) * time.Second,
+			}
+		}
+		if rg := pb.Runtime.Registry; rg != nil {
+			spec.Runtime.Registry = &capsule.RegistryAuth{
+				URL:               rg.Url,
+				UsernameEncrypted: rg.UsernameEncrypted,
+				PasswordEncrypted: rg.PasswordEncrypted,
+			}
+		}
 	}
 
 	if pb.MomentumConfig != nil {

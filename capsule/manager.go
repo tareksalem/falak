@@ -763,6 +763,62 @@ func (m *Manager) UnassignReplica(id CapsuleID, replicaID ReplicaID) error {
 	return nil
 }
 
+// RecordReplicaNetwork stores the resolved container IP and host-port
+// bindings for a replica after its container reaches Running. The runtime
+// handler discovers these via a post-start readback (auto host ports are
+// runtime allocations not present until start; a restored replica re-publishes
+// a fresh host port) and pushes them here through the node-side lifecycle
+// adapter so the gossiped replica state and `capsule get` view reflect the
+// ACTUAL bindings rather than the spec's (which is 0 for auto ports).
+//
+// It is a no-op (returns nil) when the capsule or replica is unknown, so a
+// late readback for a replica the mesh has already reaped does not error.
+// A nil ports slice clears any previously-recorded bindings. Callers invoke
+// this BEFORE announcing Running so the bindings are in place by the time the
+// status update gossips.
+func (m *Manager) RecordReplicaNetwork(id CapsuleID, replicaID ReplicaID, ip string, ports []PortBinding) error {
+	c := m.store.Get(id)
+	if c == nil {
+		return nil
+	}
+
+	m.mu.Lock()
+	idx := -1
+	for i, r := range c.Replicas {
+		if r.ReplicaID == replicaID {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		m.mu.Unlock()
+		return nil
+	}
+
+	c.Replicas[idx].IP = ip
+	if len(ports) == 0 {
+		c.Replicas[idx].Ports = nil
+	} else {
+		c.Replicas[idx].Ports = append([]PortBinding(nil), ports...)
+	}
+	c.UpdatedAt = time.Now()
+	// Hold the manager mutex across the store Update so the store's internal
+	// UpdatedAt write does not race with concurrent Manager.Get snapshot reads
+	// (mirrors AssignReplica's locking discipline).
+	err := m.store.Update(c)
+	m.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("failed to persist replica network: %w", err)
+	}
+
+	m.logger.Debug("capsule replica network recorded",
+		zap.String("id", id.String()),
+		zap.String("replica_id", string(replicaID)),
+		zap.String("ip", ip),
+		zap.Int("count", len(ports)))
+	return nil
+}
+
 // SyncStatus updates a capsule's status to mirror remote state received from
 // the mesh. Unlike Fire, this does NOT validate the transition — it is used
 // only when mirroring state from another node's PubSub announcement.

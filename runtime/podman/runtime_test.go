@@ -5,9 +5,12 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -377,5 +380,144 @@ func TestPodman_InspectEnvAndLabels(t *testing.T) {
 	}
 	if info.Labels["falak.test"] != "true" {
 		t.Errorf("label falak.test = %q, want true", info.Labels["falak.test"])
+	}
+}
+
+// --- O15: Restore forwards published ports as publishPorts --------------
+
+// fakeSocketServer stands up an HTTP server on a throwaway unix socket and
+// records the query values of the first request whose path matches want. It
+// lets the port-publishing tests assert exactly what Restore puts on the wire
+// without a live Podman daemon.
+type fakeSocketServer struct {
+	srv        *http.Server
+	sock       string
+	mu         sync.Mutex
+	lastQuery  url.Values
+	lastPath   string
+	bodyLen    int64
+}
+
+func newFakeSocketServer(t *testing.T, status int) *fakeSocketServer {
+	t.Helper()
+	sock := filepath.Join(t.TempDir(), "fake-podman.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	f := &fakeSocketServer{sock: sock}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := io.Copy(io.Discard, r.Body)
+		f.mu.Lock()
+		f.lastQuery = r.URL.Query()
+		f.lastPath = r.URL.Path
+		f.bodyLen = n
+		f.mu.Unlock()
+		w.WriteHeader(status)
+	})
+	f.srv = &http.Server{Handler: mux}
+	go f.srv.Serve(ln)
+	t.Cleanup(func() { f.srv.Close() })
+	return f
+}
+
+func (f *fakeSocketServer) query() url.Values {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastQuery
+}
+
+// TestFormatPublishPort covers the wire encoding for fixed, auto, and
+// non-tcp protocol variants.
+func TestFormatPublishPort(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   runtime.PortMapping
+		want string
+	}{
+		{"fixed tcp default", runtime.PortMapping{HostPort: 8080, ContainerPort: 80}, "8080:80"},
+		{"fixed explicit tcp", runtime.PortMapping{HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}, "8080:80"},
+		{"fixed udp", runtime.PortMapping{HostPort: 5353, ContainerPort: 53, Protocol: "udp"}, "5353:53/udp"},
+		{"auto tcp", runtime.PortMapping{ContainerPort: 80}, "80"},
+		{"auto udp", runtime.PortMapping{ContainerPort: 53, Protocol: "udp"}, "53/udp"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatPublishPort(tc.in); got != tc.want {
+				t.Fatalf("formatPublishPort(%+v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRestore_ForwardsPublishPorts is the O15 regression: Restore must
+// re-declare published ports on the import path (fixed as host:container,
+// auto as container-only) so a snapshot-restored replica comes up with a
+// host port. Runs against a fake unix socket — no live daemon needed.
+func TestRestore_ForwardsPublishPorts(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeSocketServer(t, http.StatusOK)
+	rt := New(WithSocketPath(f.sock))
+
+	snap := filepath.Join(t.TempDir(), "snap.tar")
+	if err := os.WriteFile(snap, []byte("fake-checkpoint-archive"), 0600); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	ctx := context.Background()
+	err := rt.Restore(ctx, "falak-cap1-0", snap,
+		runtime.WithRestorePortMappings(
+			runtime.PortMapping{Name: "http", HostPort: 8080, ContainerPort: 80},          // fixed
+			runtime.PortMapping{Name: "metrics", ContainerPort: 9090},                     // auto
+			runtime.PortMapping{Name: "dns", ContainerPort: 53, Protocol: "udp"},          // auto/udp
+		),
+	)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	q := f.query()
+	if got := q.Get("import"); got != "true" {
+		t.Errorf("import = %q, want true", got)
+	}
+	if got := q.Get("name"); got != "falak-cap1-0" {
+		t.Errorf("name = %q, want falak-cap1-0", got)
+	}
+	got := q["publishPorts"]
+	want := []string{"8080:80", "9090", "53/udp"}
+	if len(got) != len(want) {
+		t.Fatalf("publishPorts = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("publishPorts[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if f.bodyLen == 0 {
+		t.Error("restore sent empty body; expected the checkpoint archive")
+	}
+}
+
+// TestRestore_NoPortsOmitsPublishPorts confirms a port-free restore keeps
+// the wire minimal (import + name only), unchanged from the pre-O15 shape.
+func TestRestore_NoPortsOmitsPublishPorts(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeSocketServer(t, http.StatusOK)
+	rt := New(WithSocketPath(f.sock))
+
+	snap := filepath.Join(t.TempDir(), "snap.tar")
+	if err := os.WriteFile(snap, []byte("x"), 0600); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	if err := rt.Restore(context.Background(), "falak-cap1-0", snap); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if got := f.query()["publishPorts"]; len(got) != 0 {
+		t.Errorf("publishPorts = %v, want none", got)
 	}
 }

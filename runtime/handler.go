@@ -98,6 +98,19 @@ type LifecycleNotifier interface {
 	MarkStopped(capsuleID string) error
 }
 
+// ReplicaNetworkRecorder is an OPTIONAL capability a LifecycleNotifier may
+// also implement to persist a replica's resolved container IP and host-port
+// bindings, discovered by the handler's post-start readback, BEFORE the
+// capsule is announced Running. The handler probes for it via a type
+// assertion (like StreamingPuller); a notifier that does not implement it
+// simply skips the record step — the container still runs and is
+// mesh-reachable, only the per-replica observability is unavailable.
+type ReplicaNetworkRecorder interface {
+	// RecordReplicaNetwork stores the resolved IP and host-port bindings for
+	// the given replica. Called once per successful start, before MarkRunning.
+	RecordReplicaNetwork(capsuleID, replicaID, ip string, ports []PortBinding) error
+}
+
 // GroupEventEmitter is the narrow interface the runtime handler uses
 // to publish group-aware events onto the node event bus without
 // importing the node-internal events package. Satisfied by an adapter
@@ -212,6 +225,18 @@ type Handler struct {
 	reconcileInterval     time.Duration // periodic reconcile sweep cadence
 	maxInspectErrors      int           // consecutive transient Inspect errors before escalation
 	eventReconnectBackoff time.Duration // base backoff between event-stream reconnect attempts
+
+	// Port/IP readback tuning (O15). After a container starts, the handler
+	// polls Inspect until the container IP is present and every published
+	// spec port is bound to a non-empty host port, up to a bounded budget.
+	// Both configurable; no magic numbers.
+	portReadbackInterval time.Duration // gap between readback Inspect polls
+	portReadbackBudget   time.Duration // total time budget for the readback
+
+	// readbackTicker is an injectable ticker factory for deterministic
+	// readback tests. nil in production → time.NewTicker. Tests supply a
+	// manually-pulsed channel so the poll advances without real sleeps.
+	readbackTicker func(d time.Duration) (<-chan time.Time, func())
 
 	mu      sync.Mutex
 	running map[string]*runningContainer // containerID -> live container bookkeeping
@@ -352,6 +377,17 @@ const (
 	defaultEventReconnectBackoff = 1 * time.Second
 )
 
+// Port/IP readback defaults. A cold-started container's auto host port and a
+// restored container's re-published host port populate in Inspect a short
+// moment after start (the host-port DNAT lands after the IP does), so the
+// handler polls briefly. 20 × 100ms = ~2s covers the observed lag with margin
+// while bounding the wait so a genuinely-unbound fixed port still escalates
+// promptly. Both are overridable via functional options.
+const (
+	defaultPortReadbackInterval = 100 * time.Millisecond
+	defaultPortReadbackBudget   = 2 * time.Second
+)
+
 // ignoreTTL bounds how long an entry in the self-removal ignore set
 // survives. The backend emits died+remove for an intentional teardown
 // within milliseconds, so a few seconds is ample; the cap prevents the
@@ -392,6 +428,43 @@ func WithEventReconnectBackoff(d time.Duration) HandlerOption {
 	}
 }
 
+// WithPortReadbackInterval overrides the gap between post-start readback
+// Inspect polls (default 100ms). Non-positive values are ignored.
+func WithPortReadbackInterval(d time.Duration) HandlerOption {
+	return func(h *Handler) {
+		if d > 0 {
+			h.portReadbackInterval = d
+		}
+	}
+}
+
+// WithPortReadbackBudget overrides the total time budget for the post-start
+// port/IP readback (default 2s). Once the budget is exhausted, a still-unbound
+// FIXED spec port fails the start (→ re-election) while a still-unbound AUTO
+// port logs a warning and the container continues. Non-positive values are
+// ignored.
+func WithPortReadbackBudget(d time.Duration) HandlerOption {
+	return func(h *Handler) {
+		if d > 0 {
+			h.portReadbackBudget = d
+		}
+	}
+}
+
+// WithPortReadbackTicker injects the ticker factory the port/IP readback uses
+// between Inspect polls. Production leaves it unset (a real time.Ticker);
+// deterministic tests supply a factory returning a channel they control (or a
+// closed channel to advance the poll without real sleeps). A nil factory is
+// ignored. Mirrors the test-seam clock injection used elsewhere in the
+// codebase (e.g. the reconnector's WithReconnectClock).
+func WithPortReadbackTicker(fn func(d time.Duration) (<-chan time.Time, func())) HandlerOption {
+	return func(h *Handler) {
+		if fn != nil {
+			h.readbackTicker = fn
+		}
+	}
+}
+
 // NewHandler constructs a runtime handler.
 func NewHandler(rt Runtime, opts ...HandlerOption) *Handler {
 	h := &Handler{
@@ -404,6 +477,8 @@ func NewHandler(rt Runtime, opts ...HandlerOption) *Handler {
 		reconcileInterval:     defaultReconcileInterval,
 		maxInspectErrors:      defaultMaxInspectErrors,
 		eventReconnectBackoff: defaultEventReconnectBackoff,
+		portReadbackInterval:  defaultPortReadbackInterval,
+		portReadbackBudget:    defaultPortReadbackBudget,
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -647,14 +722,14 @@ func (h *Handler) startContainer(event ElectionWon) {
 	// Decision: local snapshot → restore. Pull from peer → restore.
 	// No snapshot → cold start + capture.
 	if h.snapshotStore != nil && h.snapshotStore.HasLocal(capsuleID, tag) {
-		h.restoreFromSnapshot(ctx, cID, capsuleID, tag, spec)
+		h.restoreFromSnapshot(ctx, cID, capsuleID, replicaID, tag, spec)
 		return
 	}
 
 	if puller := h.snapshotPullerRef(); puller != nil {
 		path, pullErr := puller.Pull(ctx, capsuleID, tag)
 		if pullErr == nil && path != "" {
-			h.restoreFromSnapshot(ctx, cID, capsuleID, tag, spec)
+			h.restoreFromSnapshot(ctx, cID, capsuleID, replicaID, tag, spec)
 			return
 		}
 		if pullErr != nil {
@@ -664,11 +739,11 @@ func (h *Handler) startContainer(event ElectionWon) {
 		}
 	}
 
-	h.coldStart(ctx, cID, capsuleID, tag, spec)
+	h.coldStart(ctx, cID, capsuleID, replicaID, tag, spec)
 }
 
 // restoreFromSnapshot restores a container from a local snapshot.
-func (h *Handler) restoreFromSnapshot(ctx context.Context, cID, capsuleID, tag string, spec *CapsuleSpec) {
+func (h *Handler) restoreFromSnapshot(ctx context.Context, cID, capsuleID, replicaID, tag string, spec *CapsuleSpec) {
 	snapPath := h.snapshotStore.SnapshotPath(capsuleID, tag)
 
 	h.logger.Info("runtime: restoring from snapshot",
@@ -684,18 +759,18 @@ func (h *Handler) restoreFromSnapshot(ctx context.Context, cID, capsuleID, tag s
 		h.logger.Error("runtime: restore failed, falling back to cold start",
 			zap.String("capsule_id", capsuleID),
 			zap.Error(err))
-		h.coldStart(ctx, cID, capsuleID, tag, spec)
+		h.coldStart(ctx, cID, capsuleID, replicaID, tag, spec)
 		return
 	}
 
 	h.snapshotStore.MarkInUse(capsuleID, tag, true)
 	h.snapshotStore.TouchAccess(capsuleID, tag)
-	h.onContainerRunning(cID, capsuleID, spec)
+	h.onContainerRunning(cID, capsuleID, replicaID, spec)
 }
 
 // coldStart pulls the image, creates and starts the container from
 // scratch, then captures a snapshot for future fast restarts.
-func (h *Handler) coldStart(ctx context.Context, cID, capsuleID, tag string, spec *CapsuleSpec) {
+func (h *Handler) coldStart(ctx context.Context, cID, capsuleID, replicaID, tag string, spec *CapsuleSpec) {
 	h.logger.Info("runtime: cold starting",
 		zap.String("container_id", cID),
 		zap.String("capsule_id", capsuleID),
@@ -753,7 +828,7 @@ func (h *Handler) coldStart(ctx context.Context, cID, capsuleID, tag string, spe
 		return
 	}
 
-	h.onContainerRunning(cID, capsuleID, spec)
+	h.onContainerRunning(cID, capsuleID, replicaID, spec)
 
 	// Capture snapshot in the background for future fast restarts.
 	if h.snapshotStore != nil {
@@ -853,7 +928,7 @@ func (h *Handler) captureSnapshot(capsuleID, cID, tag string, spec *CapsuleSpec)
 // (either via restore or cold start). It marks the capsule as running,
 // starts a health checker if configured, and starts a background watcher
 // for crashes.
-func (h *Handler) onContainerRunning(cID, capsuleID string, spec *CapsuleSpec) {
+func (h *Handler) onContainerRunning(cID, capsuleID, replicaID string, spec *CapsuleSpec) {
 	// O14c start-vs-stop race backstop. A post-hoc election yield's
 	// StopContainer may have planted an ignore-set entry for this
 	// container AFTER startContainer's top-of-function guard passed but
@@ -893,6 +968,59 @@ func (h *Handler) onContainerRunning(cID, capsuleID string, spec *CapsuleSpec) {
 		return
 	}
 	h.mu.Unlock()
+
+	// --- Port/IP readback (O15) ---------------------------------------
+	// Resolve the container's IP and published host ports before announcing
+	// Running so the replica state (and `capsule get`) reflect the ACTUAL
+	// bindings. An auto host port is a runtime allocation absent from the
+	// spec; a snapshot-restored replica re-publishes a fresh one. The
+	// host-port DNAT lands a moment after the container IP, so the poll keys
+	// on HostPort specifically. Skipped when the capsule publishes no ports
+	// or runs on the host network (no per-container host-port NAT).
+	var resolvedIP string
+	var readbackDone bool
+	if published := publishedSpecPorts(spec); len(published) > 0 {
+		ip, bindings, fixedUnbound, autoUnbound := h.awaitReplicaNetwork(h.ctx, cID, published)
+		resolvedIP = ip
+		readbackDone = true
+		if fixedUnbound {
+			h.logger.Error("runtime: fixed host port never bound within readback budget; failing start",
+				zap.String("container_id", cID),
+				zap.String("capsule_id", capsuleID),
+				zap.String("replica_id", replicaID),
+				zap.Duration("budget", h.portReadbackBudget))
+			// The container is not registered in h.running yet, so its
+			// died/removed events are dropped as "not owned". Tear it down so
+			// it does not linger holding a partial allocation, then fail the
+			// start → re-election (covers a cross-node fixed-port collision).
+			if err := h.runtime.Stop(h.ctx, cID); err != nil {
+				h.logger.Debug("runtime: stop of port-unbound container failed",
+					zap.String("container_id", cID), zap.Error(err))
+			}
+			if err := h.runtime.Remove(h.ctx, cID); err != nil {
+				h.logger.Debug("runtime: remove of port-unbound container failed",
+					zap.String("container_id", cID), zap.Error(err))
+			}
+			h.reportStartFailure(capsuleID,
+				"fixed host port not bound within readback budget",
+				FailureCategoryEnum.NodeAttributable())
+			return
+		}
+		if autoUnbound {
+			// An auto port is observability only — the mesh dials the bridge
+			// IP + container port and never uses the host port. Record what we
+			// have (0 for the unbound auto port) and keep the working
+			// container; do NOT kill it.
+			h.logger.Warn("runtime: auto host port(s) unresolved within readback budget; recording 0 and continuing",
+				zap.String("container_id", cID),
+				zap.String("capsule_id", capsuleID),
+				zap.String("replica_id", replicaID),
+				zap.Duration("budget", h.portReadbackBudget))
+		}
+		// Record resolved network on the replica state BEFORE MarkRunning so
+		// the bindings are in place by the time the status update gossips.
+		h.recordReplicaNetwork(capsuleID, replicaID, ip, bindings)
+	}
 
 	h.logger.Info("runtime: container running",
 		zap.String("container_id", cID),
@@ -959,13 +1087,18 @@ func (h *Handler) onContainerRunning(cID, capsuleID string, spec *CapsuleSpec) {
 	// Start health checker if the capsule spec defines one.
 	if spec != nil && spec.HealthCheck != nil {
 		// Determine the container's address based on network mode.
-		// Host mode: probe on localhost. Bridge mode: query the
-		// container's assigned IP from the runtime.
+		// Host mode: probe on localhost. Bridge mode: use the IP resolved by
+		// the port readback above when it ran (avoids a second Inspect);
+		// otherwise (no published ports) do a single Inspect for the IP.
 		containerAddr := "127.0.0.1"
 		if spec.NetworkMode == NetworkModeEnum.Bridge() {
-			info, err := h.runtime.Inspect(h.ctx, cID)
-			if err == nil && info.IP != "" {
-				containerAddr = info.IP
+			if readbackDone && resolvedIP != "" {
+				containerAddr = resolvedIP
+			} else if !readbackDone {
+				info, err := h.runtime.Inspect(h.ctx, cID)
+				if err == nil && info.IP != "" {
+					containerAddr = info.IP
+				}
 			}
 		}
 
@@ -1012,6 +1145,169 @@ func (h *Handler) onContainerRunning(cID, capsuleID string, spec *CapsuleSpec) {
 				statsMu.Unlock()
 			}
 		}()
+	}
+}
+
+// --- Port/IP readback (O15) ----------------------------------------------
+
+// publishedSpecPorts returns the spec ports that require a post-start
+// host-port readback: the capsule must run in bridge mode (host network has no
+// per-container host-port NAT) and declare at least one port. Returns nil
+// otherwise so the caller skips the readback entirely.
+func publishedSpecPorts(spec *CapsuleSpec) []PortMapping {
+	if spec == nil || len(spec.Ports) == 0 {
+		return nil
+	}
+	if spec.NetworkMode == NetworkModeEnum.Host() {
+		return nil
+	}
+	return spec.Ports
+}
+
+// awaitReplicaNetwork polls Inspect after a container starts until its IP is
+// present AND every published spec port is bound to a non-empty host port, or
+// the readback budget is exhausted. It returns the last-observed IP, the
+// resolved per-port bindings (HostPort 0 for any still-unbound port), and two
+// classification flags: fixedUnbound is true when a user-specified fixed spec
+// port (HostPort>0) never bound; autoUnbound when only auto ports (HostPort==0)
+// remain unbound. Keying on HostPort specifically matters because the IP
+// populates in Inspect before the host-port DNAT does. The ticker is
+// injectable for deterministic tests.
+func (h *Handler) awaitReplicaNetwork(ctx context.Context, cID string, published []PortMapping) (ip string, bindings []PortBinding, fixedUnbound, autoUnbound bool) {
+	interval := h.portReadbackInterval
+	if interval <= 0 {
+		interval = defaultPortReadbackInterval
+	}
+	budget := h.portReadbackBudget
+	if budget <= 0 {
+		budget = defaultPortReadbackBudget
+	}
+	attempts := int(budget / interval)
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var tickCh <-chan time.Time
+	var stop func()
+	if h.readbackTicker != nil {
+		tickCh, stop = h.readbackTicker(interval)
+	} else {
+		tk := time.NewTicker(interval)
+		tickCh, stop = tk.C, tk.Stop
+	}
+	defer stop()
+
+	var lastIP string
+	lastBindings := resolveBindings(published, nil)
+	for attempt := 1; ; attempt++ {
+		info, err := h.runtime.Inspect(ctx, cID)
+		if err != nil {
+			h.logger.Debug("runtime: readback inspect failed (will retry)",
+				zap.String("container_id", cID),
+				zap.Int("attempt", attempt),
+				zap.Error(err))
+		} else {
+			lastIP = info.IP
+			lastBindings = resolveBindings(published, info.Ports)
+			if info.IP != "" && allBound(lastBindings) {
+				return info.IP, lastBindings, false, false
+			}
+		}
+		if attempt >= attempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			// Handler shutting down — return best-effort without escalating.
+			return lastIP, lastBindings, false, false
+		case <-tickCh:
+		}
+	}
+
+	for i, p := range published {
+		if lastBindings[i].HostPort != 0 {
+			continue
+		}
+		if p.HostPort > 0 {
+			fixedUnbound = true
+		} else {
+			autoUnbound = true
+		}
+	}
+	return lastIP, lastBindings, fixedUnbound, autoUnbound
+}
+
+// resolveBindings maps each published spec port to a resolved PortBinding,
+// filling HostPort from the matching entry in the container's actual port list
+// (0 when not yet bound). Order follows published so per-port index alignment
+// is stable across polls.
+func resolveBindings(published, actual []PortMapping) []PortBinding {
+	out := make([]PortBinding, len(published))
+	for i, p := range published {
+		out[i] = PortBinding{
+			Name:          p.Name,
+			ContainerPort: p.ContainerPort,
+			HostPort:      matchHostPort(p, actual),
+		}
+	}
+	return out
+}
+
+// matchHostPort finds the resolved host port for a published spec port within
+// the container's actual port list, matching on container port and protocol
+// (an empty protocol is treated as "tcp", the runtime default). Returns 0 when
+// no matching entry carries a non-zero host port.
+func matchHostPort(p PortMapping, actual []PortMapping) uint16 {
+	want := p.Protocol
+	if want == "" {
+		want = "tcp"
+	}
+	for _, a := range actual {
+		if a.ContainerPort != p.ContainerPort {
+			continue
+		}
+		got := a.Protocol
+		if got == "" {
+			got = "tcp"
+		}
+		if got != want {
+			continue
+		}
+		if a.HostPort != 0 {
+			return a.HostPort
+		}
+	}
+	return 0
+}
+
+// allBound reports whether every binding carries a non-zero host port.
+func allBound(bindings []PortBinding) bool {
+	for _, b := range bindings {
+		if b.HostPort == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// recordReplicaNetwork pushes the resolved IP + host-port bindings onto the
+// replica state via the lifecycle notifier's optional ReplicaNetworkRecorder
+// capability. A notifier that does not implement it (or a nil notifier) is a
+// silent no-op — the container runs regardless; only per-replica observability
+// is skipped.
+func (h *Handler) recordReplicaNetwork(capsuleID, replicaID, ip string, ports []PortBinding) {
+	if h.lifecycle == nil {
+		return
+	}
+	rec, ok := h.lifecycle.(ReplicaNetworkRecorder)
+	if !ok || rec == nil {
+		return
+	}
+	if err := rec.RecordReplicaNetwork(capsuleID, replicaID, ip, ports); err != nil {
+		h.logger.Warn("runtime: record replica network failed",
+			zap.String("capsule_id", capsuleID),
+			zap.String("replica_id", replicaID),
+			zap.Error(err))
 	}
 }
 
@@ -1531,7 +1827,7 @@ func (h *Handler) RollingUpdate(capsuleID, replicaID string, newSpec *CapsuleSpe
 	h.runtime.Remove(ctx, oldCID)
 
 	// Track the new container under the original ID for future watches.
-	h.onContainerRunning(newCID, capsuleID, newSpec)
+	h.onContainerRunning(newCID, capsuleID, replicaID, newSpec)
 
 	h.logger.Info("runtime: rolling update complete",
 		zap.String("capsule_id", capsuleID),

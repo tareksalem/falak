@@ -188,6 +188,35 @@ func translateFailureCategory(c falakrt.FailureCategory) events.FailureCategory 
 	}
 }
 
+// RecordReplicaNetwork satisfies runtime.ReplicaNetworkRecorder. The runtime
+// handler calls it (before MarkRunning) with the resolved container IP and
+// host-port bindings from its post-start readback so the gossiped replica
+// state and `capsule get` view carry the ACTUAL host ports (auto ports and
+// restore-republished ports are absent from the spec). Translates the runtime
+// package's PortBinding into the capsule package's equivalent.
+func (a *runtimeLifecycleAdapter) RecordReplicaNetwork(capsuleID, replicaID, ip string, ports []falakrt.PortBinding) error {
+	id := capsule.CapsuleID(capsuleID)
+	var bindings []capsule.PortBinding
+	if len(ports) > 0 {
+		bindings = make([]capsule.PortBinding, 0, len(ports))
+		for _, p := range ports {
+			bindings = append(bindings, capsule.PortBinding{
+				Name:          p.Name,
+				ContainerPort: p.ContainerPort,
+				HostPort:      p.HostPort,
+			})
+		}
+	}
+	if err := a.manager.RecordReplicaNetwork(id, capsule.ReplicaID(replicaID), ip, bindings); err != nil {
+		a.logger.Debug("RecordReplicaNetwork failed",
+			zap.String("capsule_id", capsuleID),
+			zap.String("replica_id", replicaID),
+			zap.Error(err))
+		return err
+	}
+	return nil
+}
+
 func (a *runtimeLifecycleAdapter) MarkStopped(capsuleID string) error {
 	id := capsule.CapsuleID(capsuleID)
 	if err := a.manager.StopCapsule(id); err != nil {

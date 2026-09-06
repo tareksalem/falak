@@ -353,6 +353,8 @@ func capsuleToResource(c *capsule.Capsule) core.CapsuleResource {
 			NodeID:    r.NodeID,
 			Status:    string(r.Status),
 			StartedAt: r.StartedAt,
+			IP:        r.IP,
+			Ports:     portBindingsToCore(r.Ports),
 		})
 	}
 	return core.CapsuleResource{
@@ -384,6 +386,25 @@ func capsuleToResource(c *capsule.Capsule) core.CapsuleResource {
 			Replicas: replicas,
 		},
 	}
+}
+
+// portBindingsToCore lifts a replica's RESOLVED host-port bindings into the
+// API-layer PortMapping form so `capsule get` surfaces the actual host ports
+// each replica published (auto allocations and restore-republished ports),
+// rather than the spec's host port (0 for auto).
+func portBindingsToCore(in []capsule.PortBinding) []core.PortMapping {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]core.PortMapping, 0, len(in))
+	for _, b := range in {
+		out = append(out, core.PortMapping{
+			Name:      b.Name,
+			Container: int32(b.ContainerPort),
+			Host:      int32(b.HostPort),
+		})
+	}
+	return out
 }
 
 // portMappingsToCore lifts capsule.PortMapping into the API-layer form so

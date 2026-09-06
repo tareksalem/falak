@@ -188,12 +188,36 @@ type MomentumState struct {
 // ReplicaID uniquely identifies a replica of a capsule.
 type ReplicaID string
 
+// PortBinding is a resolved container-to-host port mapping observed after a
+// replica's container is running. It differs from the SPEC PortMapping: an
+// auto-assigned host port (spec HostPort = 0) is a runtime allocation that
+// only exists once the container is started, and a snapshot-restored replica
+// re-publishes a fresh host port. Recorded per-replica for observability
+// (external/NodePort access and `capsule get`); the service mesh dials the
+// bridge IP + container port and never uses the host port.
+type PortBinding struct {
+	Name          string // human-readable label (e.g. "http", "grpc")
+	ContainerPort uint16
+	HostPort      uint16 // 0 = unresolved (auto port not yet bound)
+}
+
 // ReplicaState tracks the state of a single running replica.
 type ReplicaState struct {
 	ReplicaID ReplicaID
 	NodeID    string
 	Status    enums.CapsuleStatus
 	StartedAt time.Time
+
+	// IP is the replica's resolved container IP (bridge mode; empty for host
+	// network). Populated from the runtime readback when the replica reaches
+	// Running.
+	IP string
+
+	// Ports are the replica's resolved host-port bindings, populated from the
+	// runtime readback when the replica reaches Running. Auto host ports show
+	// their concrete allocation here; a still-unbound auto port is recorded
+	// with HostPort 0.
+	Ports []PortBinding
 }
 
 // CapsuleSpec is the user-provided specification for a capsule.

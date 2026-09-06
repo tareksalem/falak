@@ -132,6 +132,24 @@ type PortMapping struct {
 	Protocol string
 }
 
+// PortBinding is a resolved container-to-host port mapping observed after a
+// container is running. Unlike PortMapping (the requested spec), an
+// auto-assigned host port here carries the concrete allocation the runtime
+// chose at start, and a restored container carries its freshly re-published
+// host port. The handler discovers these via a post-start readback and hands
+// them to a ReplicaNetworkRecorder for per-replica observability.
+type PortBinding struct {
+	// Name is the human-readable label carried over from the spec port.
+	Name string
+
+	// ContainerPort is the port inside the container.
+	ContainerPort uint16
+
+	// HostPort is the resolved host port. Zero means unresolved (an auto port
+	// that had not been bound before the readback budget expired).
+	HostPort uint16
+}
+
 // ResourceLimits defines the CPU and memory constraints for a container.
 // Reservation is the guaranteed minimum (used by gravity for scoring).
 // Max is the hard ceiling (CPU throttled, memory OOM-killed).
